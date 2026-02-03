@@ -135,19 +135,13 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         // Check if FTS table is empty
-        let fts_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memories_fts",
-            [],
-            |row| row.get(0),
-        )?;
+        let fts_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memories_fts", [], |row| row.get(0))?;
 
         if fts_count == 0 {
             // Check if there are memories to migrate
-            let memory_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM memories",
-                [],
-                |row| row.get(0),
-            )?;
+            let memory_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
 
             if memory_count > 0 {
                 // Populate FTS from existing memories

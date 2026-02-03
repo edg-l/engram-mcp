@@ -679,25 +679,26 @@ impl ToolHandler {
         };
 
         // Get semantic scores
-        let semantic_scores: std::collections::HashMap<String, f32> =
-            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding) {
-                cached_results.into_iter().collect()
-            } else {
-                let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+        let semantic_scores: std::collections::HashMap<String, f32> = if let Some(cached_results) =
+            self.search_cache.get(&self.project_id, &query_embedding)
+        {
+            cached_results.into_iter().collect()
+        } else {
+            let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
 
-                let scored: Vec<(String, f32)> = embeddings
-                    .iter()
-                    .map(|(id, vec)| {
-                        let similarity = cosine_similarity(&query_embedding, vec);
-                        (id.clone(), similarity)
-                    })
-                    .collect();
+            let scored: Vec<(String, f32)> = embeddings
+                .iter()
+                .map(|(id, vec)| {
+                    let similarity = cosine_similarity(&query_embedding, vec);
+                    (id.clone(), similarity)
+                })
+                .collect();
 
-                // Cache the results
-                self.search_cache
-                    .insert(&self.project_id, &query_embedding, scored.clone());
-                scored.into_iter().collect()
-            };
+            // Cache the results
+            self.search_cache
+                .insert(&self.project_id, &query_embedding, scored.clone());
+            scored.into_iter().collect()
+        };
 
         // Run keyword search (FTS5)
         let keyword_results = self.db.keyword_search(
