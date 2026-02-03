@@ -139,6 +139,43 @@ fn default_import_mode() -> String {
 #[derive(Debug, Deserialize)]
 pub struct MemoryStatsInput {}
 
+#[derive(Debug, Deserialize)]
+pub struct MemoryContextInput {
+    /// The context or conversation to find relevant memories for
+    pub context: String,
+    /// Maximum number of memories to return (default: 5)
+    #[serde(default = "default_context_limit")]
+    pub limit: usize,
+    /// Minimum similarity score (default: 0.3)
+    #[serde(default = "default_context_min_score")]
+    pub min_score: f64,
+    /// Filter by memory types
+    #[serde(default)]
+    pub types: Vec<String>,
+}
+
+fn default_context_limit() -> usize {
+    5
+}
+
+fn default_context_min_score() -> f64 {
+    0.3
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemoryPruneInput {
+    /// Minimum relevance score to keep (memories below this are candidates for deletion)
+    #[serde(default = "default_prune_threshold")]
+    pub threshold: f64,
+    /// If true, actually delete. If false (default), just show what would be deleted.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+fn default_prune_threshold() -> f64 {
+    0.2
+}
+
 #[derive(Debug, Serialize)]
 pub struct MemoryStoreResult {
     pub id: String,
@@ -460,6 +497,56 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "properties": {}
             })),
         ),
+        Tool::new(
+            "memory_context",
+            "Get memories relevant to a conversation context. Use this to automatically retrieve background knowledge before responding to a topic.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "context": {
+                        "type": "string",
+                        "description": "The conversation context or topic to find relevant memories for"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum number of memories to return (default: 5)"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Minimum similarity score threshold (default: 0.3)"
+                    },
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter by memory types (fact, decision, preference, pattern, debug, entity)"
+                    }
+                },
+                "required": ["context"]
+            })),
+        ),
+        Tool::new(
+            "memory_prune",
+            "Remove low-relevance memories that have decayed over time. By default performs a dry run showing what would be deleted.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Relevance threshold - memories below this score are candidates for deletion (default: 0.2)"
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Set to true to actually delete memories. Default false (dry run)."
+                    }
+                }
+            })),
+        ),
     ]
 }
 
@@ -517,6 +604,8 @@ impl ToolHandler {
             "memory_export" => self.memory_export(arguments),
             "memory_import" => self.memory_import(arguments),
             "memory_stats" => self.memory_stats(arguments),
+            "memory_context" => self.memory_context(arguments),
+            "memory_prune" => self.memory_prune(arguments),
             _ => Ok(json!({"error": format!("Unknown tool: {}", name)})),
         }
     }
@@ -1285,5 +1374,152 @@ impl ToolHandler {
             "relationship_count": stats.relationship_count,
             "avg_relevance": stats.avg_relevance
         }))
+    }
+
+    fn memory_context(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryContextInput = serde_json::from_value(arguments)?;
+
+        // Parse type filters
+        let type_filters: Vec<MemoryType> =
+            input.types.iter().filter_map(|t| t.parse().ok()).collect();
+
+        // Generate embedding for the context
+        let context_embedding = if let Some(cached) = self.query_cache.get(&input.context) {
+            cached
+        } else {
+            let embedding = self.embedding.embed(&input.context)?;
+            self.query_cache
+                .insert(input.context.clone(), embedding.clone());
+            embedding
+        };
+
+        // Get all embeddings and calculate similarities
+        let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+
+        let mut scored: Vec<(String, f32)> = embeddings
+            .iter()
+            .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
+            .filter(|(_, score)| *score >= input.min_score as f32)
+            .collect();
+
+        // Sort by similarity descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Fetch memories and build results
+        let mut memories: Vec<Value> = Vec::new();
+        let mut memory_ids: Vec<String> = Vec::new();
+
+        for (id, similarity) in scored.into_iter().take(input.limit * 2) {
+            // Fetch extra to account for type filtering
+            if let Ok(Some(memory)) = self.db.get_memory(&id) {
+                // Apply type filter
+                if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
+                    continue;
+                }
+
+                if memories.len() >= input.limit {
+                    break;
+                }
+
+                memory_ids.push(id);
+                memories.push(json!({
+                    "id": memory.id,
+                    "type": memory.memory_type.as_str(),
+                    "content": memory.content,
+                    "summary": memory.summary,
+                    "tags": memory.tags,
+                    "importance": memory.importance,
+                    "relevance_score": memory.relevance_score,
+                    "similarity": similarity,
+                }));
+            }
+        }
+
+        // Record access for retrieved memories
+        if !memory_ids.is_empty() {
+            let _ = self.db.record_access_batch(&memory_ids);
+        }
+
+        Ok(json!({
+            "context": input.context,
+            "count": memories.len(),
+            "memories": memories,
+        }))
+    }
+
+    fn memory_prune(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryPruneInput = serde_json::from_value(arguments)?;
+
+        // Get all memories and filter by relevance threshold
+        let all_memories = self.db.get_all_memories_for_project(&self.project_id)?;
+        let candidates: Vec<&Memory> = all_memories
+            .iter()
+            .filter(|m| m.relevance_score < input.threshold)
+            .collect();
+
+        if candidates.is_empty() {
+            return Ok(json!({
+                "success": true,
+                "dry_run": !input.confirm,
+                "threshold": input.threshold,
+                "candidates": 0,
+                "deleted": 0,
+                "message": format!("No memories below threshold {:.2}", input.threshold),
+                "memories": []
+            }));
+        }
+
+        // Build list of candidates for display
+        let candidate_info: Vec<Value> = candidates
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "type": m.memory_type.as_str(),
+                    "relevance_score": m.relevance_score,
+                    "importance": m.importance,
+                    "summary": m.summary.clone().unwrap_or_else(|| {
+                        m.content.chars().take(80).collect::<String>()
+                    }),
+                    "created_at": m.created_at,
+                    "last_accessed_at": m.last_accessed_at,
+                })
+            })
+            .collect();
+
+        let candidate_count = candidates.len();
+
+        if input.confirm {
+            // Actually delete
+            let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+            let deleted = self.db.delete_memories_batch(&ids)?;
+
+            // Invalidate cache since we deleted data
+            self.invalidate_search_cache();
+
+            Ok(json!({
+                "success": true,
+                "dry_run": false,
+                "threshold": input.threshold,
+                "candidates": candidate_count,
+                "deleted": deleted,
+                "message": format!("Deleted {} memories below threshold {:.2}", deleted, input.threshold),
+                "memories": candidate_info
+            }))
+        } else {
+            // Dry run - just show what would be deleted
+            Ok(json!({
+                "success": true,
+                "dry_run": true,
+                "threshold": input.threshold,
+                "candidates": candidate_count,
+                "deleted": 0,
+                "message": format!(
+                    "Found {} memories below threshold {:.2}. Set confirm=true to delete.",
+                    candidate_count, input.threshold
+                ),
+                "memories": candidate_info
+            }))
+        }
     }
 }

@@ -6,6 +6,7 @@ mod decay;
 mod embedding;
 mod error;
 mod export;
+mod format;
 mod memory;
 mod summarize;
 mod tools;
@@ -189,10 +190,19 @@ impl ServerHandler for MemoryServer {
                 .handle_tool(&request.name, args)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
+            // Format for human readability, include JSON for LLM parsing
+            let formatted = format::format_tool_result(&request.name, &result);
+            let json_str =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+
+            // Combine: formatted text first for humans, then JSON block for LLM
+            let combined = format!(
+                "{}\n\n<details><summary>JSON</summary>\n\n```json\n{}\n```\n</details>",
+                formatted, json_str
+            );
+
             Ok(CallToolResult {
-                content: vec![Content::text(
-                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
-                )],
+                content: vec![Content::text(combined)],
                 structured_content: None,
                 is_error: Some(false),
                 meta: None,

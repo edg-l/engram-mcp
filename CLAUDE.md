@@ -18,6 +18,7 @@ src/
   embedding.rs - fastembed wrapper (384-dim vectors)
   decay.rs     - relevance decay algorithm
   tools.rs     - MCP tool handlers + contradiction detection
+  format.rs    - human-readable output formatting for MCP results
   summarize.rs - extractive summarization for large content
   export.rs    - import/export JSON format
   error.rs     - MemoryError enum
@@ -42,6 +43,8 @@ src/
 - `memory_export` - export project to JSON (optional embeddings)
 - `memory_import` - import from JSON (merge/replace modes)
 - `memory_stats` - get project statistics
+- `memory_context` - get relevant memories for a conversation context (auto-retrieval)
+- `memory_prune` - remove low-relevance memories (dry run by default)
 
 ### Resources
 - `memory://{project}/{id}` - read individual memories
@@ -72,6 +75,7 @@ engram-cli prune -t 0.2 --confirm  # remove low-relevance
 - Auto-summarization for content > 500 chars
 - Batch operations with transactions
 - Query pagination and empty-query optimization
+- Human-readable formatted output (markdown) + JSON in collapsible block
 
 ## Config (env vars)
 - `ENGRAM_DB` - SQLite path (default: ~/.local/share/engram/memories.db)
