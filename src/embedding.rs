@@ -1,4 +1,5 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::error::MemoryError;
@@ -9,10 +10,18 @@ pub struct EmbeddingService {
     model_version: String,
 }
 
+fn get_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("fastembed")
+}
+
 impl EmbeddingService {
     pub fn new() -> Result<Self, MemoryError> {
-        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-            .map_err(|e| MemoryError::Embedding(e.to_string()))?;
+        let options =
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_cache_dir(get_cache_dir());
+        let model =
+            TextEmbedding::try_new(options).map_err(|e| MemoryError::Embedding(e.to_string()))?;
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
