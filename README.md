@@ -54,6 +54,40 @@ The binary will be at `target/release/engram`.
 claude mcp add -s user engram $(which engram)
 ```
 
+#### Allow All Permissions
+
+By default, Claude Code will ask for permission before using each MCP tool. To allow all Engram tools without prompts, add to your `~/.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__engram__memory_store",
+      "mcp__engram__memory_query",
+      "mcp__engram__memory_update",
+      "mcp__engram__memory_delete",
+      "mcp__engram__memory_link",
+      "mcp__engram__memory_graph",
+      "mcp__engram__memory_store_batch",
+      "mcp__engram__memory_delete_batch",
+      "mcp__engram__memory_export",
+      "mcp__engram__memory_import",
+      "mcp__engram__memory_stats"
+    ]
+  }
+}
+```
+
+Or allow all Engram tools with a single pattern:
+
+```json
+{
+  "permissions": {
+    "allow": ["mcp__engram__*"]
+  }
+}
+```
+
 ### Configure with Claude Desktop
 
 Add to the config file:
