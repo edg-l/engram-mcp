@@ -8,6 +8,7 @@ use crate::memory::Memory;
 /// - Usage boost: frequently accessed memories get a boost
 ///
 /// The final score is clamped between 0.1 and 1.0.
+#[allow(dead_code)] // Reference implementation, tested
 pub fn calculate_relevance(memory: &Memory, now_timestamp: i64, decay_rate: f64) -> f64 {
     let days_since_access = (now_timestamp - memory.last_accessed_at) as f64 / 86400.0;
 
@@ -29,6 +30,7 @@ pub fn calculate_relevance(memory: &Memory, now_timestamp: i64, decay_rate: f64)
 
 /// Reinforce a memory by updating its access count and relevance score.
 /// Returns the updated memory.
+#[allow(dead_code)] // Reference implementation, tested
 pub fn reinforce_memory(mut memory: Memory, now_timestamp: i64) -> Memory {
     memory.access_count += 1;
     memory.last_accessed_at = now_timestamp;

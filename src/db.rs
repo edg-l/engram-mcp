@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::error::MemoryError;
-use crate::memory::{Memory, MemoryType, Project, Relationship, RelationType};
+use crate::memory::{Memory, MemoryType, Project, ProjectStats, RelationType, Relationship};
 
 const SCHEMA: &str = r#"
 -- Core memory storage
@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_relevance ON memories(relevance_score DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_project_type ON memories(project_id, memory_type);
 CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_id);
 "#;
@@ -73,6 +75,7 @@ impl Database {
         Ok(db)
     }
 
+    #[allow(dead_code)] // Used in tests
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -101,7 +104,9 @@ impl Database {
 
     pub fn get_project(&self, id: &str) -> Result<Option<Project>, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, name, root_path, decay_rate, created_at FROM projects WHERE id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, root_path, decay_rate, created_at FROM projects WHERE id = ?1",
+        )?;
         let mut rows = stmt.query(params![id])?;
 
         if let Some(row) = rows.next()? {
@@ -172,7 +177,7 @@ impl Database {
             Ok(Some(Memory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                memory_type: MemoryType::from_str(&memory_type_str).unwrap_or(MemoryType::Fact),
+                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
                 content: row.get(3)?,
                 summary: row.get(4)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
@@ -245,7 +250,7 @@ impl Database {
             Ok(Memory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                memory_type: MemoryType::from_str(&memory_type_str).unwrap_or(MemoryType::Fact),
+                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
                 content: row.get(3)?,
                 summary: row.get(4)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
@@ -267,16 +272,159 @@ impl Database {
 
         // Filter by tags if specified
         if let Some(filter_tags) = tags {
-            memories.retain(|m| {
-                filter_tags.iter().any(|t| m.tags.contains(t))
-            });
+            memories.retain(|m| filter_tags.iter().any(|t| m.tags.contains(t)));
         }
 
         Ok(memories)
     }
 
-    pub fn get_all_memories_for_project(&self, project_id: &str) -> Result<Vec<Memory>, MemoryError> {
+    pub fn get_all_memories_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<Memory>, MemoryError> {
         self.query_memories(project_id, None, None, None, 10000)
+    }
+
+    /// Store multiple memories in a single transaction
+    #[allow(dead_code)] // Used by MCP server tools
+    pub fn store_memories_batch(&self, memories: &[Memory]) -> Result<usize, MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let mut count = 0;
+        for memory in memories {
+            let tags_json = serde_json::to_string(&memory.tags)?;
+            tx.execute(
+                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    memory.id,
+                    memory.project_id,
+                    memory.memory_type.as_str(),
+                    memory.content,
+                    memory.summary,
+                    tags_json,
+                    memory.importance,
+                    memory.relevance_score,
+                    memory.access_count,
+                    memory.created_at,
+                    memory.updated_at,
+                    memory.last_accessed_at,
+                ],
+            )?;
+            count += 1;
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Store multiple embeddings in a single transaction
+    #[allow(dead_code)] // Used by MCP server tools
+    pub fn store_embeddings_batch(
+        &self,
+        embeddings: &[(String, Vec<f32>, String)],
+    ) -> Result<usize, MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let mut count = 0;
+        for (memory_id, vector, model_version) in embeddings {
+            let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT OR REPLACE INTO embeddings (memory_id, vector, model_version) VALUES (?1, ?2, ?3)",
+                params![memory_id, vector_bytes, model_version],
+            )?;
+            count += 1;
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Delete multiple memories by ID in a single transaction
+    pub fn delete_memories_batch(&self, ids: &[String]) -> Result<usize, MemoryError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let mut total_deleted = 0;
+        for id in ids {
+            let rows = tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+            total_deleted += rows;
+        }
+
+        tx.commit()?;
+        Ok(total_deleted)
+    }
+
+    /// Delete all memories and relationships for a project
+    pub fn delete_project_data(&self, project_id: &str) -> Result<usize, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM memories WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(rows)
+    }
+
+    /// Get all relationships for a project
+    pub fn get_all_relationships_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<Relationship>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.source_id, r.target_id, r.relation_type, r.strength, r.created_at
+             FROM relationships r
+             JOIN memories m ON r.source_id = m.id
+             WHERE m.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            let rel_type_str: String = row.get(3)?;
+            Ok(Relationship {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                target_id: row.get(2)?,
+                relation_type: rel_type_str.parse().unwrap_or(RelationType::RelatesTo),
+                strength: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get memory count and stats for a project
+    pub fn get_project_stats(&self, project_id: &str) -> Result<ProjectStats, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+
+        let memory_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+
+        let relationship_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM relationships r JOIN memories m ON r.source_id = m.id WHERE m.project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+
+        let avg_relevance: f64 = conn.query_row(
+            "SELECT COALESCE(AVG(relevance_score), 0.0) FROM memories WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(ProjectStats {
+            memory_count: memory_count as usize,
+            relationship_count: relationship_count as usize,
+            avg_relevance,
+        })
     }
 
     pub fn record_access(&self, id: &str) -> Result<(), MemoryError> {
@@ -290,7 +438,12 @@ impl Database {
     }
 
     // Embedding operations
-    pub fn store_embedding(&self, memory_id: &str, vector: &[f32], model_version: &str) -> Result<(), MemoryError> {
+    pub fn store_embedding(
+        &self,
+        memory_id: &str,
+        vector: &[f32],
+        model_version: &str,
+    ) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
         let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         conn.execute(
@@ -300,6 +453,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)] // Available for export functionality
     pub fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT vector FROM embeddings WHERE memory_id = ?1")?;
@@ -317,12 +471,15 @@ impl Database {
         }
     }
 
-    pub fn get_all_embeddings_for_project(&self, project_id: &str) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+    pub fn get_all_embeddings_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT e.memory_id, e.vector FROM embeddings e
              JOIN memories m ON e.memory_id = m.id
-             WHERE m.project_id = ?1"
+             WHERE m.project_id = ?1",
         )?;
         let rows = stmt.query_map(params![project_id], |row| {
             let memory_id: String = row.get(0)?;
@@ -355,7 +512,10 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_relationships_from(&self, source_id: &str) -> Result<Vec<Relationship>, MemoryError> {
+    pub fn get_relationships_from(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<Relationship>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source_id, target_id, relation_type, strength, created_at FROM relationships WHERE source_id = ?1"
@@ -366,7 +526,7 @@ impl Database {
                 id: row.get(0)?,
                 source_id: row.get(1)?,
                 target_id: row.get(2)?,
-                relation_type: RelationType::from_str(&rel_type_str).unwrap_or(RelationType::RelatesTo),
+                relation_type: rel_type_str.parse().unwrap_or(RelationType::RelatesTo),
                 strength: row.get(4)?,
                 created_at: row.get(5)?,
             })
@@ -386,7 +546,7 @@ impl Database {
                 id: row.get(0)?,
                 source_id: row.get(1)?,
                 target_id: row.get(2)?,
-                relation_type: RelationType::from_str(&rel_type_str).unwrap_or(RelationType::RelatesTo),
+                relation_type: rel_type_str.parse().unwrap_or(RelationType::RelatesTo),
                 strength: row.get(4)?,
                 created_at: row.get(5)?,
             })
@@ -395,14 +555,12 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn delete_relationship(&self, id: &str) -> Result<bool, MemoryError> {
-        let conn = self.conn.lock().unwrap();
-        let rows_affected = conn.execute("DELETE FROM relationships WHERE id = ?1", params![id])?;
-        Ok(rows_affected > 0)
-    }
-
     // Decay operations
-    pub fn update_relevance_scores(&self, project_id: &str, decay_rate: f64) -> Result<usize, MemoryError> {
+    pub fn update_relevance_scores(
+        &self,
+        project_id: &str,
+        decay_rate: f64,
+    ) -> Result<usize, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
 

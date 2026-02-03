@@ -40,12 +40,17 @@ impl EmbeddingService {
             .ok_or_else(|| MemoryError::Embedding("No embedding generated".to_string()))
     }
 
-    pub fn embed_memory(&self, memory_type: MemoryType, content: &str) -> Result<Vec<f32>, MemoryError> {
+    pub fn embed_memory(
+        &self,
+        memory_type: MemoryType,
+        content: &str,
+    ) -> Result<Vec<f32>, MemoryError> {
         // Concatenate type with content for better context
         let text = format!("{}: {}", memory_type.as_str(), content);
         self.embed(&text)
     }
 
+    #[allow(dead_code)] // Used by MCP server batch tools
     pub fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MemoryError> {
         let mut model = self
             .model

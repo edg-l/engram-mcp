@@ -25,9 +25,9 @@ fn test_full_memory_lifecycle() {
     let (db_path, _dir) = test_helpers::create_test_db();
 
     // Import the modules we need
-    use agent_memory::db::Database;
-    use agent_memory::embedding::EmbeddingService;
-    use agent_memory::memory::{Memory, MemoryType};
+    use engram::db::Database;
+    use engram::embedding::EmbeddingService;
+    use engram::memory::{Memory, MemoryType};
 
     // 1. Create database
     let db = Database::open(&db_path).expect("Failed to open database");
@@ -61,7 +61,10 @@ fn test_full_memory_lifecycle() {
         .get_memory("mem_test_1")
         .expect("Failed to get memory")
         .expect("Memory not found");
-    assert_eq!(retrieved.content, "The API uses JWT tokens for authentication");
+    assert_eq!(
+        retrieved.content,
+        "The API uses JWT tokens for authentication"
+    );
     assert_eq!(retrieved.memory_type, MemoryType::Fact);
     assert_eq!(retrieved.tags, vec!["auth", "api"]);
 
@@ -110,7 +113,7 @@ fn test_full_memory_lifecycle() {
     assert_eq!(all_embeddings.len(), 2);
 
     // Calculate similarities
-    use agent_memory::embedding::cosine_similarity;
+    use engram::embedding::cosine_similarity;
     let mut similarities: Vec<(String, f32)> = all_embeddings
         .iter()
         .map(|(id, vec)| (id.clone(), cosine_similarity(&query_embedding, vec)))
@@ -129,8 +132,8 @@ fn test_full_memory_lifecycle() {
 fn test_relationship_graph() {
     let (db_path, _dir) = test_helpers::create_test_db();
 
-    use agent_memory::db::Database;
-    use agent_memory::memory::{Memory, MemoryType, Relationship, RelationType};
+    use engram::db::Database;
+    use engram::memory::{Memory, MemoryType, RelationType, Relationship};
 
     let db = Database::open(&db_path).expect("Failed to open database");
     db.get_or_create_project("test-project", "Test")
@@ -231,8 +234,8 @@ fn test_relationship_graph() {
 fn test_memory_access_tracking() {
     let (db_path, _dir) = test_helpers::create_test_db();
 
-    use agent_memory::db::Database;
-    use agent_memory::memory::{Memory, MemoryType};
+    use engram::db::Database;
+    use engram::memory::{Memory, MemoryType};
 
     let db = Database::open(&db_path).expect("Failed to open database");
     db.get_or_create_project("test-project", "Test")

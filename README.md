@@ -67,6 +67,15 @@ Configuration is done via environment variables:
 | `ENGRAM_DB` | Path to SQLite database file | `~/.local/share/engram/memories.db` |
 | `ENGRAM_PROJECT` | Project identifier for scoping memories | Current directory name |
 
+### Tip: Add a CLAUDE.md hint
+
+Claude discovers Engram tools automatically via MCP, but adding a brief hint to your project's `CLAUDE.md` encourages proactive use:
+
+```markdown
+## Memory
+Engram MCP available. Store decisions/patterns, query before architectural changes.
+```
+
 ## MCP Tools
 
 ### memory_store

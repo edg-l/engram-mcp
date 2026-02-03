@@ -1,4 +1,4 @@
-# Agent Memory MCP - Design Document
+# Engram - Design Document
 
 A persistent memory system for AI agents, providing project-scoped knowledge storage with semantic search, memory decay, and relationship graphs.
 
@@ -47,31 +47,39 @@ Memories can link to other memories:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     MCP Server                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
-│  │   Tools     │  │  Resources  │  │    Prompts      │  │
-│  │             │  │             │  │                 │  │
-│  │ memory_store│  │ /memories/* │  │ recall_context  │  │
-│  │ memory_query│  │             │  │                 │  │
-│  │ memory_update│ │             │  │                 │  │
-│  │ memory_delete│ │             │  │                 │  │
-│  │ memory_link │  │             │  │                 │  │
-│  └──────┬──────┘  └──────┬──────┘  └────────┬────────┘  │
-│         │                │                   │          │
-│  ┌──────┴────────────────┴───────────────────┴───────┐  │
-│  │                  Core Engine                       │  │
-│  │  ┌────────────┐  ┌────────────┐  ┌─────────────┐  │  │
-│  │  │ Embedding  │  │   Decay    │  │   Graph     │  │  │
-│  │  │  Service   │  │  Manager   │  │  Resolver   │  │  │
-│  │  └────────────┘  └────────────┘  └─────────────┘  │  │
-│  └───────────────────────┬───────────────────────────┘  │
-│                          │                              │
-│  ┌───────────────────────┴───────────────────────────┐  │
-│  │                 SQLite Database                    │  │
-│  │  memories | embeddings | relationships | config    │  │
-│  └────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         MCP Server                              │
+│  ┌──────────────────┐  ┌─────────────┐  ┌─────────────────┐     │
+│  │      Tools       │  │  Resources  │  │    Prompts      │     │
+│  │                  │  │             │  │                 │     │
+│  │ memory_store     │  │ /memories/* │  │ recall_context  │     │
+│  │ memory_query     │  │             │  │                 │     │
+│  │ memory_update    │  │             │  │                 │     │
+│  │ memory_delete    │  │             │  │                 │     │
+│  │ memory_link      │  │             │  │                 │     │
+│  │ memory_graph     │  │             │  │                 │     │
+│  │ memory_store_batch│ │             │  │                 │     │
+│  │ memory_delete_batch││             │  │                 │     │
+│  │ memory_export    │  │             │  │                 │     │
+│  │ memory_import    │  │             │  │                 │     │
+│  │ memory_stats     │  │             │  │                 │     │
+│  └────────┬─────────┘  └──────┬──────┘  └────────┬───────┘     │
+│           │                   │                   │             │
+│  ┌────────┴───────────────────┴───────────────────┴──────────┐  │
+│  │                      Core Engine                          │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌─────────────────────┐  │  │
+│  │  │ Embedding  │  │   Decay    │  │   Graph / Export    │  │  │
+│  │  │  Service   │  │  Manager   │  │   Summarization     │  │  │
+│  │  └────────────┘  └────────────┘  └─────────────────────┘  │  │
+│  └───────────────────────────┬───────────────────────────────┘  │
+│                              │                                  │
+│  ┌───────────────────────────┴───────────────────────────────┐  │
+│  │                     SQLite Database                        │  │
+│  │    memories | embeddings | relationships | projects        │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+
+CLI: engram-cli (query, list, show, store, delete, update, link, export, import, stats, decay, prune)
 ```
 
 ## Data Model (SQLite Schema)
@@ -201,6 +209,55 @@ Retrieve a memory with its related memories (graph traversal).
 }
 ```
 
+### `memory_store_batch`
+Store multiple memories atomically (max 100 per batch).
+
+```json
+{
+    "memories": [
+        {"content": "First memory", "type": "fact"},
+        {"content": "Second memory", "type": "decision", "importance": 0.8}
+    ]
+}
+```
+
+### `memory_delete_batch`
+Delete multiple memories by ID.
+
+```json
+{
+    "ids": ["mem_abc123", "mem_def456"]
+}
+```
+
+### `memory_export`
+Export all project memories to JSON.
+
+```json
+{
+    "include_embeddings": true  // optional, increases size
+}
+```
+
+### `memory_import`
+Import memories from JSON export.
+
+```json
+{
+    "data": { /* export data object */ },
+    "mode": "merge"  // or "replace"
+}
+```
+
+### `memory_stats`
+Get project statistics.
+
+```json
+{}
+```
+
+Returns: `{project_id, memory_count, relationship_count, avg_relevance}`
+
 ## Embedding Strategy
 
 ### Local Model
@@ -251,36 +308,36 @@ When a memory is accessed:
 
 ## Roadmap
 
-### Phase 1: Foundation
-- [ ] SQLite database setup with schema
-- [ ] Basic CRUD operations for memories
-- [ ] MCP server with `memory_store` and `memory_query` (text search)
-- [ ] Project scoping
+### Phase 1: Foundation ✅
+- [x] SQLite database setup with schema
+- [x] Basic CRUD operations for memories
+- [x] MCP server with `memory_store` and `memory_query` (text search)
+- [x] Project scoping
 
-### Phase 2: Semantic Search
-- [ ] Integrate local embedding model
-- [ ] Vector storage and retrieval
-- [ ] Similarity-based search
-- [ ] Hybrid search (semantic + filters)
+### Phase 2: Semantic Search ✅
+- [x] Integrate local embedding model
+- [x] Vector storage and retrieval
+- [x] Similarity-based search
+- [x] Hybrid search (semantic + filters)
 
-### Phase 3: Relevance & Decay
-- [ ] Implement decay algorithm
-- [ ] Automatic relevance updates
-- [ ] Access tracking and reinforcement
-- [ ] Background decay job
+### Phase 3: Relevance & Decay ✅
+- [x] Implement decay algorithm
+- [x] Automatic relevance updates
+- [x] Access tracking and reinforcement
+- [x] Background decay job
 
-### Phase 4: Relationships
-- [ ] Relationship table and operations
-- [ ] `memory_link` tool
-- [ ] Graph traversal queries
-- [ ] Contradiction detection
+### Phase 4: Relationships ✅
+- [x] Relationship table and operations
+- [x] `memory_link` tool
+- [x] Graph traversal queries
+- [x] Contradiction detection
 
-### Phase 5: Polish & Optimization
-- [ ] Memory summarization for large content
-- [ ] Batch operations
-- [ ] Import/export functionality
-- [ ] Performance optimization for large memory stores
-- [ ] CLI for manual memory management
+### Phase 5: Polish & Optimization ✅
+- [x] Memory summarization for large content (auto-generated for >500 chars)
+- [x] Batch operations (`memory_store_batch`, `memory_delete_batch`)
+- [x] Import/export functionality (JSON with optional embeddings)
+- [x] Performance optimization (new indexes, empty query optimization, pagination)
+- [x] CLI for manual memory management (`engram-cli`)
 
 ## Future Considerations
 
@@ -297,18 +354,22 @@ When a memory is accessed:
 - For larger scale: consider pgvector or dedicated vector DB
 - Memory pruning: archive memories below threshold
 
-## Dependencies (Planned)
+## Dependencies
 
 ```toml
 [dependencies]
-rmcp = { version = "0.14", features = ["server"] }
-tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
-fastembed = "4"  # local ONNX-based embeddings
-thiserror = "1"
+rmcp = { version = "0.14", features = ["server", "transport-io"] }
+tokio = { version = "1.49", features = ["full"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.20", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+fastembed = "5"           # local ONNX-based embeddings (all-MiniLM-L6-v2)
+thiserror = "2.0"
+dirs = "6.0"              # XDG paths
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"           # embedding export encoding
+clap = { version = "4", features = ["derive"] }  # CLI
 ```
