@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod db;
 pub mod decay;
 pub mod embedding;

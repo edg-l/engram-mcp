@@ -1,4 +1,5 @@
 use rusqlite::{Connection, params};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -57,6 +58,14 @@ CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_project_type ON memories(project_id, memory_type);
 CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_id);
+
+-- Compound indexes for performance optimization
+CREATE INDEX IF NOT EXISTS idx_memories_project_relevance
+    ON memories(project_id, relevance_score DESC);
+CREATE INDEX IF NOT EXISTS idx_relationships_source_type
+    ON relationships(source_id, relation_type);
+CREATE INDEX IF NOT EXISTS idx_relationships_target_type
+    ON relationships(target_id, relation_type);
 "#;
 
 #[derive(Clone)]
@@ -512,6 +521,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)] // Used by CLI binary
     pub fn get_relationships_from(
         &self,
         source_id: &str,
@@ -535,6 +545,7 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    #[allow(dead_code)] // Used by CLI binary
     pub fn get_relationships_to(&self, target_id: &str) -> Result<Vec<Relationship>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -579,6 +590,191 @@ impl Database {
         )?;
 
         Ok(rows_affected)
+    }
+
+    // ============================================
+    // Batch operations for performance optimization
+    // ============================================
+
+    /// Fetch multiple memories by ID in a single query.
+    /// Returns a HashMap for O(1) lookups.
+    pub fn get_memories_batch(&self, ids: &[String]) -> Result<HashMap<String, Memory>, MemoryError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Build query with placeholders
+        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at
+             FROM memories WHERE id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        // Convert ids to params
+        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let memory_type_str: String = row.get(2)?;
+            let tags_json: String = row.get(5)?;
+            Ok(Memory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
+                content: row.get(3)?,
+                summary: row.get(4)?,
+                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                importance: row.get(6)?,
+                relevance_score: row.get(7)?,
+                access_count: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                last_accessed_at: row.get(11)?,
+            })
+        })?;
+
+        let mut result = HashMap::new();
+        for memory in rows.flatten() {
+            result.insert(memory.id.clone(), memory);
+        }
+
+        Ok(result)
+    }
+
+    /// Record access for multiple memories in a single transaction.
+    pub fn record_access_batch(&self, ids: &[String]) -> Result<usize, MemoryError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+
+        let mut count = 0;
+        for id in ids {
+            let rows = tx.execute(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1, relevance_score = MIN(1.0, relevance_score + 0.1) WHERE id = ?2",
+                params![now, id],
+            )?;
+            count += rows;
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Check which memory IDs exist in the database.
+    /// Returns a HashSet of existing IDs.
+    #[allow(dead_code)] // Available for import optimization
+    pub fn memories_exist_batch(&self, ids: &[String]) -> Result<HashSet<String>, MemoryError> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT id FROM memories WHERE id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            Ok(id)
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get relationships from multiple source IDs in a single query.
+    /// Returns a HashMap from source_id to Vec<Relationship>.
+    pub fn get_relationships_from_batch(
+        &self,
+        source_ids: &[String],
+    ) -> Result<HashMap<String, Vec<Relationship>>, MemoryError> {
+        if source_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let placeholders: Vec<&str> = source_ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT id, source_id, target_id, relation_type, strength, created_at FROM relationships WHERE source_id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = source_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let rel_type_str: String = row.get(3)?;
+            Ok(Relationship {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                target_id: row.get(2)?,
+                relation_type: rel_type_str.parse().unwrap_or(RelationType::RelatesTo),
+                strength: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+
+        let mut result: HashMap<String, Vec<Relationship>> = HashMap::new();
+        for rel in rows.flatten() {
+            result.entry(rel.source_id.clone()).or_default().push(rel);
+        }
+
+        Ok(result)
+    }
+
+    /// Get relationships to multiple target IDs in a single query.
+    /// Returns a HashMap from target_id to Vec<Relationship>.
+    pub fn get_relationships_to_batch(
+        &self,
+        target_ids: &[String],
+    ) -> Result<HashMap<String, Vec<Relationship>>, MemoryError> {
+        if target_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let placeholders: Vec<&str> = target_ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT id, source_id, target_id, relation_type, strength, created_at FROM relationships WHERE target_id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = target_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let rel_type_str: String = row.get(3)?;
+            Ok(Relationship {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                target_id: row.get(2)?,
+                relation_type: rel_type_str.parse().unwrap_or(RelationType::RelatesTo),
+                strength: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+
+        let mut result: HashMap<String, Vec<Relationship>> = HashMap::new();
+        for rel in rows.flatten() {
+            result.entry(rel.target_id.clone()).or_default().push(rel);
+        }
+
+        Ok(result)
     }
 }
 

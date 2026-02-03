@@ -1,5 +1,6 @@
 #![allow(clippy::manual_async_fn)]
 
+mod cache;
 mod db;
 mod decay;
 mod embedding;
@@ -340,14 +341,18 @@ impl ServerHandler for MemoryServer {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| McpError::invalid_params("Missing 'context' argument", None))?;
 
-            // Initialize embedding service and database
-            let db = Database::open(&self.db_path)
-                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
+            // Ensure initialized (reuses existing ToolHandler with its EmbeddingService)
+            self.ensure_initialized().await?;
 
-            let embedding_service = EmbeddingService::new()
-                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
+            let handler = self.tool_handler.read().await;
+            let handler = handler
+                .as_ref()
+                .ok_or_else(|| McpError::internal_error("Server not initialized", None))?;
 
-            // Generate query embedding
+            let db = handler.database();
+            let embedding_service = handler.embedding_service();
+
+            // Generate query embedding (reuses initialized EmbeddingService)
             let query_embedding = embedding_service
                 .embed(context)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;

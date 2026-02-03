@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod cache;
 mod db;
 mod decay;
 mod embedding;
@@ -168,6 +169,14 @@ fn get_project_id(cli_project: Option<String>) -> String {
         })
 }
 
+/// Check if command needs embedding service (lazy initialization).
+fn needs_embedding_service(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Query { .. } | Commands::Store { .. } | Commands::Update { .. } | Commands::Import { .. }
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -182,6 +191,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(&db_path)?;
     db.get_or_create_project(&project_id, &project_id)?;
 
+    // Initialize embedding service once, only if needed (saves ~500ms for commands that don't need it)
+    let embedding_service = if needs_embedding_service(&cli.command) {
+        Some(EmbeddingService::new()?)
+    } else {
+        None
+    };
+
     match cli.command {
         Commands::Query {
             query,
@@ -189,7 +205,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_relevance,
             types,
         } => {
-            cmd_query(&db, &project_id, &query, limit, min_relevance, &types)?;
+            cmd_query(
+                &db,
+                &project_id,
+                embedding_service.as_ref().unwrap(),
+                &query,
+                limit,
+                min_relevance,
+                &types,
+            )?;
         }
         Commands::List { r#type, limit } => {
             cmd_list(&db, &project_id, r#type.as_deref(), limit)?;
@@ -207,6 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cmd_store(
                 &db,
                 &project_id,
+                embedding_service.as_ref().unwrap(),
                 &content,
                 &r#type,
                 tags.as_deref(),
@@ -224,7 +249,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tags,
             summary,
         } => {
-            cmd_update(&db, &id, content, importance, tags, summary)?;
+            cmd_update(
+                &db,
+                embedding_service.as_ref().unwrap(),
+                &id,
+                content,
+                importance,
+                tags,
+                summary,
+            )?;
         }
         Commands::Link {
             source,
@@ -238,7 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cmd_export(&db, &project_id, output, embeddings)?;
         }
         Commands::Import { file, mode } => {
-            cmd_import(&db, &project_id, &file, &mode)?;
+            cmd_import(&db, &project_id, embedding_service.as_ref().unwrap(), &file, &mode)?;
         }
         Commands::Stats => {
             cmd_stats(&db, &project_id)?;
@@ -257,12 +290,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_query(
     db: &Database,
     project_id: &str,
+    embedding_service: &EmbeddingService,
     query: &str,
     limit: usize,
     min_relevance: f64,
     types: &[String],
 ) -> Result<(), MemoryError> {
-    let embedding_service = EmbeddingService::new()?;
     let query_embedding = embedding_service.embed(query)?;
 
     let embeddings = db.get_all_embeddings_for_project(project_id)?;
@@ -402,9 +435,11 @@ fn cmd_show(db: &Database, id: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_store(
     db: &Database,
     project_id: &str,
+    embedding_service: &EmbeddingService,
     content: &str,
     type_str: &str,
     tags: Option<&str>,
@@ -446,7 +481,6 @@ fn cmd_store(
     db.store_memory(&memory)?;
 
     // Generate and store embedding
-    let embedding_service = EmbeddingService::new()?;
     let embedding = embedding_service.embed_memory(memory_type, content)?;
     db.store_embedding(&id, &embedding, embedding_service.model_version())?;
 
@@ -466,6 +500,7 @@ fn cmd_delete(db: &Database, id: &str) -> Result<(), MemoryError> {
 
 fn cmd_update(
     db: &Database,
+    embedding_service: &EmbeddingService,
     id: &str,
     content: Option<String>,
     importance: Option<f64>,
@@ -481,7 +516,6 @@ fn cmd_update(
     if let Some(new_content) = content {
         memory.content = new_content.clone();
         // Re-embed
-        let embedding_service = EmbeddingService::new()?;
         let embedding = embedding_service.embed_memory(memory.memory_type, &new_content)?;
         db.store_embedding(id, &embedding, embedding_service.model_version())?;
 
@@ -576,6 +610,7 @@ fn cmd_export(
 fn cmd_import(
     db: &Database,
     project_id: &str,
+    embedding_service: &EmbeddingService,
     file: &PathBuf,
     mode: &str,
 ) -> Result<(), MemoryError> {
@@ -591,7 +626,6 @@ fn cmd_import(
         println!("Cleared existing data.");
     }
 
-    let embedding_service = EmbeddingService::new()?;
     let now = chrono::Utc::now().timestamp();
     let mut imported = 0;
     let mut skipped = 0;

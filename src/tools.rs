@@ -7,8 +7,10 @@
 use rmcp::model::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::cache::{QueryEmbeddingCache, SearchResultCache};
 use crate::db::Database;
 use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
@@ -451,6 +453,10 @@ pub struct ToolHandler {
     db: Database,
     embedding: EmbeddingService,
     project_id: String,
+    /// Cache for query embeddings to avoid recomputation
+    query_cache: QueryEmbeddingCache,
+    /// Cache for search results to avoid repeated similarity computations
+    search_cache: SearchResultCache,
 }
 
 impl ToolHandler {
@@ -459,7 +465,29 @@ impl ToolHandler {
             db,
             embedding,
             project_id,
+            query_cache: QueryEmbeddingCache::new(),
+            search_cache: SearchResultCache::new(),
         }
+    }
+
+    /// Get a reference to the embedding service for reuse.
+    pub fn embedding_service(&self) -> &EmbeddingService {
+        &self.embedding
+    }
+
+    /// Get a reference to the database for reuse.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
+    /// Get the project ID.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Invalidate search result cache (call after memory modifications).
+    fn invalidate_search_cache(&self) {
+        self.search_cache.invalidate_project(&self.project_id);
     }
 
     pub fn handle_tool(&self, name: &str, arguments: Value) -> Result<Value, MemoryError> {
@@ -556,6 +584,9 @@ impl ToolHandler {
             self.db.create_relationship(&rel)?;
         }
 
+        // Invalidate search cache since we added new data
+        self.invalidate_search_cache();
+
         let message = if potential_contradictions.is_empty() {
             "Memory stored successfully".to_string()
         } else {
@@ -602,97 +633,156 @@ impl ToolHandler {
                 .map(|m| (m.id, m.relevance_score as f32))
                 .collect()
         } else {
-            // Semantic search path
-            let query_embedding = self.embedding.embed(&input.query)?;
-            let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+            // Semantic search path with caching
+            // Try to get embedding from cache first
+            let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
+                cached
+            } else {
+                let embedding = self.embedding.embed(&input.query)?;
+                self.query_cache.insert(input.query.clone(), embedding.clone());
+                embedding
+            };
 
-            let mut scored: Vec<(String, f32)> = embeddings
-                .iter()
-                .map(|(id, vec)| {
-                    let similarity = cosine_similarity(&query_embedding, vec);
-                    (id.clone(), similarity)
-                })
-                .collect();
+            // Try to get search results from cache
+            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding) {
+                cached_results
+            } else {
+                let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
 
-            // Sort by similarity descending
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored
+                let mut scored: Vec<(String, f32)> = embeddings
+                    .iter()
+                    .map(|(id, vec)| {
+                        let similarity = cosine_similarity(&query_embedding, vec);
+                        (id.clone(), similarity)
+                    })
+                    .collect();
+
+                // Sort by similarity descending
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Cache the results
+                self.search_cache.insert(&self.project_id, &query_embedding, scored.clone());
+                scored
+            }
         };
 
-        // Fetch memories and calculate final scores
+        // Collect IDs that pass initial similarity threshold for batch fetch
+        // We need to fetch more than limit to account for filtering
+        let candidate_ids: Vec<String> = scored_ids
+            .iter()
+            .take(input.limit * 3 + input.offset) // Fetch extra for filtering
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // Batch fetch all candidate memories (1 query instead of N)
+        let memories_map = self.db.get_memories_batch(&candidate_ids)?;
+
+        // Filter and calculate final scores
         let mut results: Vec<MemoryWithScore> = Vec::new();
         let mut result_ids: Vec<String> = Vec::new();
         let mut skipped = 0;
 
-        for (id, similarity) in scored_ids {
+        for (id, similarity) in &scored_ids {
             if results.len() >= input.limit {
                 break;
             }
 
-            if let Some(mut memory) = self.db.get_memory(&id)? {
-                // Filter by types (only for semantic path, DB path already filtered)
-                if !input.query.trim().is_empty() {
-                    if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
-                        continue;
-                    }
-
-                    // Filter by tags
-                    if !input.tags.is_empty() && !input.tags.iter().any(|t| memory.tags.contains(t))
-                    {
-                        continue;
-                    }
-                }
-
-                // Calculate final score: similarity * relevance
-                let score = (similarity as f64) * memory.relevance_score;
-
-                if score < input.min_relevance {
-                    continue;
-                }
-
-                // Apply offset (pagination)
-                if skipped < input.offset {
-                    skipped += 1;
-                    continue;
-                }
-
-                // Record access (reinforcement)
-                self.db.record_access(&id)?;
-                memory.access_count += 1;
-
-                result_ids.push(id);
-                results.push(MemoryWithScore { memory, score });
-            }
-        }
-
-        // Check for contradiction relationships among returned memories
-        let mut contradiction_warnings: Vec<ContradictionWarning> = Vec::new();
-        for id in &result_ids {
-            // Check outgoing contradicts relationships
-            let Ok(rels) = self.db.get_relationships_from(id) else {
+            let Some(memory) = memories_map.get(id) else {
                 continue;
             };
-            for rel in rels {
-                if rel.relation_type != RelationType::Contradicts
-                    || !result_ids.contains(&rel.target_id)
-                {
+
+            // Filter by types (only for semantic path, DB path already filtered)
+            if !input.query.trim().is_empty() {
+                if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
                     continue;
                 }
-                if let Ok(Some(target)) = self.db.get_memory(&rel.target_id) {
-                    contradiction_warnings.push(ContradictionWarning {
-                        memory_id: id.clone(),
-                        contradicts_id: rel.target_id.clone(),
-                        content_preview: target.content.chars().take(100).collect(),
-                    });
+
+                // Filter by tags
+                if !input.tags.is_empty() && !input.tags.iter().any(|t| memory.tags.contains(t)) {
+                    continue;
                 }
             }
+
+            // Calculate final score: similarity * relevance
+            let score = (*similarity as f64) * memory.relevance_score;
+
+            if score < input.min_relevance {
+                continue;
+            }
+
+            // Apply offset (pagination)
+            if skipped < input.offset {
+                skipped += 1;
+                continue;
+            }
+
+            result_ids.push(id.clone());
+            let mut memory_clone = memory.clone();
+            memory_clone.access_count += 1;
+            results.push(MemoryWithScore { memory: memory_clone, score });
         }
+
+        // Batch record access for all result memories (1 query instead of N)
+        if !result_ids.is_empty() {
+            let _ = self.db.record_access_batch(&result_ids);
+        }
+
+        // Batch check for contradiction relationships among returned memories
+        let contradiction_warnings = self.check_contradictions_batch(&result_ids)?;
 
         Ok(json!(MemoryQueryResult {
             count: results.len(),
             memories: results,
             contradiction_warnings,
         }))
+    }
+
+    /// Check for contradiction relationships among a set of memory IDs using batch operations.
+    fn check_contradictions_batch(&self, result_ids: &[String]) -> Result<Vec<ContradictionWarning>, MemoryError> {
+        if result_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result_id_set: HashSet<&String> = result_ids.iter().collect();
+
+        // Batch fetch all outgoing relationships (1 query instead of N)
+        let relationships_map = self.db.get_relationships_from_batch(result_ids)?;
+
+        // Collect IDs of targets that are contradicted AND in our result set
+        let mut target_ids_to_fetch: Vec<String> = Vec::new();
+        let mut contradiction_pairs: Vec<(String, String)> = Vec::new();
+
+        for (source_id, rels) in &relationships_map {
+            for rel in rels {
+                if rel.relation_type == RelationType::Contradicts
+                    && result_id_set.contains(&rel.target_id)
+                {
+                    target_ids_to_fetch.push(rel.target_id.clone());
+                    contradiction_pairs.push((source_id.clone(), rel.target_id.clone()));
+                }
+            }
+        }
+
+        if contradiction_pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Batch fetch target memories for content preview (1 query instead of M)
+        let targets_map = self.db.get_memories_batch(&target_ids_to_fetch)?;
+
+        // Build warnings
+        let mut warnings: Vec<ContradictionWarning> = Vec::new();
+        for (source_id, target_id) in contradiction_pairs {
+            if let Some(target) = targets_map.get(&target_id) {
+                warnings.push(ContradictionWarning {
+                    memory_id: source_id,
+                    contradicts_id: target_id,
+                    content_preview: target.content.chars().take(100).collect(),
+                });
+            }
+        }
+
+        Ok(warnings)
     }
 
     fn memory_update(&self, arguments: Value) -> Result<Value, MemoryError> {
@@ -734,6 +824,9 @@ impl ToolHandler {
 
         self.db.update_memory(&memory)?;
 
+        // Invalidate search cache since we updated data
+        self.invalidate_search_cache();
+
         Ok(json!({"success": true, "message": "Memory updated successfully"}))
     }
 
@@ -743,6 +836,8 @@ impl ToolHandler {
         let deleted = self.db.delete_memory(&input.id)?;
 
         if deleted {
+            // Invalidate search cache since we deleted data
+            self.invalidate_search_cache();
             Ok(json!({"success": true, "message": "Memory deleted successfully"}))
         } else {
             Ok(json!({"success": false, "message": "Memory not found"}))
@@ -793,18 +888,9 @@ impl ToolHandler {
             .filter_map(|r| r.parse().ok())
             .collect();
 
-        let mut related: Vec<RelatedMemory> = Vec::new();
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        visited.insert(input.id.clone());
-
-        self.traverse_graph(
-            &input.id,
-            1,
-            input.depth,
-            &relation_filters,
-            &mut visited,
-            &mut related,
-        )?;
+        // BFS traversal with batch operations
+        // O(depth * 3) queries instead of O(nodes * 3)
+        let related = self.traverse_graph_bfs(&input.id, input.depth, &relation_filters)?;
 
         // Record access to root memory
         self.db.record_access(&input.id)?;
@@ -812,80 +898,102 @@ impl ToolHandler {
         Ok(json!(MemoryGraphResult { root, related }))
     }
 
-    fn traverse_graph(
+    /// BFS-based graph traversal using batch operations for efficiency.
+    /// Processes nodes level by level, batching relationship and memory fetches.
+    fn traverse_graph_bfs(
         &self,
-        memory_id: &str,
-        current_depth: usize,
+        start_id: &str,
         max_depth: usize,
         relation_filters: &[RelationType],
-        visited: &mut std::collections::HashSet<String>,
-        results: &mut Vec<RelatedMemory>,
-    ) -> Result<(), MemoryError> {
-        if current_depth > max_depth {
-            return Ok(());
+    ) -> Result<Vec<RelatedMemory>, MemoryError> {
+        let mut results: Vec<RelatedMemory> = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(start_id.to_string());
+
+        // Queue holds (memory_id, depth)
+        let mut current_level: Vec<String> = vec![start_id.to_string()];
+
+        for current_depth in 1..=max_depth {
+            if current_level.is_empty() {
+                break;
+            }
+
+            // Batch fetch outgoing relationships for entire level
+            let outgoing_map = self.db.get_relationships_from_batch(&current_level)?;
+            // Batch fetch incoming relationships for entire level
+            let incoming_map = self.db.get_relationships_to_batch(&current_level)?;
+
+            // Collect all new neighbor IDs and their relationship info
+            // (neighbor_id, relation_type_str, direction, from_id)
+            let mut neighbors_info: Vec<(String, String, String)> = Vec::new();
+            let mut neighbor_ids: Vec<String> = Vec::new();
+
+            // Process outgoing
+            for rels in outgoing_map.values() {
+                for rel in rels {
+                    if visited.contains(&rel.target_id) {
+                        continue;
+                    }
+                    if !relation_filters.is_empty() && !relation_filters.contains(&rel.relation_type) {
+                        continue;
+                    }
+                    if !visited.contains(&rel.target_id) {
+                        visited.insert(rel.target_id.clone());
+                        neighbor_ids.push(rel.target_id.clone());
+                        neighbors_info.push((
+                            rel.target_id.clone(),
+                            rel.relation_type.as_str().to_string(),
+                            "outgoing".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // Process incoming
+            for rels in incoming_map.values() {
+                for rel in rels {
+                    if visited.contains(&rel.source_id) {
+                        continue;
+                    }
+                    if !relation_filters.is_empty() && !relation_filters.contains(&rel.relation_type) {
+                        continue;
+                    }
+                    if !visited.contains(&rel.source_id) {
+                        visited.insert(rel.source_id.clone());
+                        neighbor_ids.push(rel.source_id.clone());
+                        neighbors_info.push((
+                            rel.source_id.clone(),
+                            rel.relation_type.as_str().to_string(),
+                            "incoming".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if neighbor_ids.is_empty() {
+                break;
+            }
+
+            // Batch fetch all neighbor memories
+            let memories_map = self.db.get_memories_batch(&neighbor_ids)?;
+
+            // Build results for this level
+            for (neighbor_id, relation, direction) in neighbors_info {
+                if let Some(memory) = memories_map.get(&neighbor_id) {
+                    results.push(RelatedMemory {
+                        memory: memory.clone(),
+                        relation,
+                        direction,
+                        depth: current_depth,
+                    });
+                }
+            }
+
+            // Next level: all neighbors found at this level
+            current_level = neighbor_ids;
         }
 
-        // Get outgoing relationships
-        let outgoing = self.db.get_relationships_from(memory_id)?;
-        for rel in outgoing {
-            if visited.contains(&rel.target_id) {
-                continue;
-            }
-            if !relation_filters.is_empty() && !relation_filters.contains(&rel.relation_type) {
-                continue;
-            }
-
-            if let Some(memory) = self.db.get_memory(&rel.target_id)? {
-                visited.insert(rel.target_id.clone());
-                results.push(RelatedMemory {
-                    memory: memory.clone(),
-                    relation: rel.relation_type.as_str().to_string(),
-                    direction: "outgoing".to_string(),
-                    depth: current_depth,
-                });
-
-                self.traverse_graph(
-                    &rel.target_id,
-                    current_depth + 1,
-                    max_depth,
-                    relation_filters,
-                    visited,
-                    results,
-                )?;
-            }
-        }
-
-        // Get incoming relationships
-        let incoming = self.db.get_relationships_to(memory_id)?;
-        for rel in incoming {
-            if visited.contains(&rel.source_id) {
-                continue;
-            }
-            if !relation_filters.is_empty() && !relation_filters.contains(&rel.relation_type) {
-                continue;
-            }
-
-            if let Some(memory) = self.db.get_memory(&rel.source_id)? {
-                visited.insert(rel.source_id.clone());
-                results.push(RelatedMemory {
-                    memory: memory.clone(),
-                    relation: rel.relation_type.as_str().to_string(),
-                    direction: "incoming".to_string(),
-                    depth: current_depth,
-                });
-
-                self.traverse_graph(
-                    &rel.source_id,
-                    current_depth + 1,
-                    max_depth,
-                    relation_filters,
-                    visited,
-                    results,
-                )?;
-            }
-        }
-
-        Ok(())
+        Ok(results)
     }
 
     fn memory_store_batch(&self, arguments: Value) -> Result<Value, MemoryError> {
@@ -957,6 +1065,11 @@ impl ToolHandler {
         let stored = self.db.store_memories_batch(&memories)?;
         self.db.store_embeddings_batch(&embeddings)?;
 
+        // Invalidate search cache since we added new data
+        if stored > 0 {
+            self.invalidate_search_cache();
+        }
+
         Ok(json!({
             "success": true,
             "count": stored,
@@ -969,6 +1082,11 @@ impl ToolHandler {
         let input: MemoryDeleteBatchInput = serde_json::from_value(arguments)?;
 
         let deleted = self.db.delete_memories_batch(&input.ids)?;
+
+        if deleted > 0 {
+            // Invalidate search cache since we deleted data
+            self.invalidate_search_cache();
+        }
 
         Ok(json!({
             "success": true,
@@ -1066,6 +1184,11 @@ impl ToolHandler {
             } else {
                 stats.relationships_skipped += 1;
             }
+        }
+
+        // Invalidate search cache since we imported data
+        if stats.memories_imported > 0 {
+            self.invalidate_search_cache();
         }
 
         Ok(json!({
