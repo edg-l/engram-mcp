@@ -48,6 +48,9 @@ enum Commands {
         /// Filter by type(s)
         #[arg(short, long)]
         types: Vec<String>,
+        /// Branch mode: "current" (global + current branch), "all", "global", or specific branch name
+        #[arg(short, long, default_value = "current")]
+        branch_mode: String,
     },
     /// List all memories
     List {
@@ -57,6 +60,9 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Filter by branch (default: show all)
+        #[arg(short, long)]
+        branch: Option<String>,
     },
     /// Show a specific memory
     Show {
@@ -79,6 +85,9 @@ enum Commands {
         /// Summary
         #[arg(short, long)]
         summary: Option<String>,
+        /// Branch: omit for global, "auto" for current branch, or explicit branch name
+        #[arg(short, long)]
+        branch: Option<String>,
     },
     /// Delete a memory
     Delete {
@@ -145,6 +154,11 @@ enum Commands {
         #[arg(long)]
         confirm: bool,
     },
+    /// Promote a branch-local memory to global
+    Promote {
+        /// Memory ID to promote
+        id: String,
+    },
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -196,6 +210,62 @@ fn get_project_id(cli_project: Option<String>) -> String {
     "default".to_string()
 }
 
+/// Detect the current git branch.
+/// Returns None if not in a git repository or on error.
+/// Priority: ENGRAM_BRANCH env var > git detection
+fn get_current_branch() -> Option<String> {
+    // Check environment variable override first
+    if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
+        && !branch.is_empty()
+    {
+        return Some(branch);
+    }
+
+    // Find git root
+    let git_root = find_git_root()?;
+    let git_dir = git_root.join(".git");
+
+    // Try reading .git/HEAD directly (faster than spawning git process)
+    if let Ok(head_content) = std::fs::read_to_string(git_dir.join("HEAD")) {
+        let head = head_content.trim();
+        if let Some(branch_ref) = head.strip_prefix("ref: refs/heads/") {
+            return Some(branch_ref.to_string());
+        }
+        // Detached HEAD - use short SHA
+        if head.len() >= 7 {
+            return Some(format!("detached-{}", &head[..7]));
+        }
+    }
+
+    // Fallback: try git command
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&git_root)
+        .output()
+        && output.status.success()
+    {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch == "HEAD" {
+            // Detached HEAD - get short SHA
+            if let Ok(sha_output) = std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .current_dir(&git_root)
+                .output()
+                && sha_output.status.success()
+            {
+                let sha = String::from_utf8_lossy(&sha_output.stdout)
+                    .trim()
+                    .to_string();
+                return Some(format!("detached-{}", sha));
+            }
+        } else {
+            return Some(branch);
+        }
+    }
+
+    None
+}
+
 /// Check if command needs embedding service (lazy initialization).
 fn needs_embedding_service(cmd: &Commands) -> bool {
     matches!(
@@ -228,12 +298,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Detect current branch once for commands that need it
+    let current_branch = get_current_branch();
+
     match cli.command {
         Commands::Query {
             query,
             limit,
             min_relevance,
             types,
+            branch_mode,
         } => {
             cmd_query(
                 &db,
@@ -243,10 +317,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 limit,
                 min_relevance,
                 &types,
+                &branch_mode,
+                current_branch.as_deref(),
             )?;
         }
-        Commands::List { r#type, limit } => {
-            cmd_list(&db, &project_id, r#type.as_deref(), limit)?;
+        Commands::List {
+            r#type,
+            limit,
+            branch,
+        } => {
+            cmd_list(
+                &db,
+                &project_id,
+                r#type.as_deref(),
+                limit,
+                branch.as_deref(),
+            )?;
         }
         Commands::Show { id } => {
             cmd_show(&db, &id)?;
@@ -257,6 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tags,
             importance,
             summary,
+            branch,
         } => {
             cmd_store(
                 &db,
@@ -267,6 +354,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tags.as_deref(),
                 importance,
                 summary,
+                branch.as_deref(),
+                current_branch.as_deref(),
             )?;
         }
         Commands::Delete { id } => {
@@ -318,11 +407,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Prune { threshold, confirm } => {
             cmd_prune(&db, &project_id, threshold, confirm)?;
         }
+        Commands::Promote { id } => {
+            cmd_promote(&db, &id)?;
+        }
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_query(
     db: &Database,
     project_id: &str,
@@ -331,8 +424,18 @@ fn cmd_query(
     limit: usize,
     min_relevance: f64,
     types: &[String],
+    branch_mode: &str,
+    current_branch: Option<&str>,
 ) -> Result<(), MemoryError> {
     use std::collections::{HashMap, HashSet};
+
+    // Resolve branch filter based on mode
+    let branch_filter = match branch_mode {
+        "all" => None,                     // All memories
+        "global" => Some(None),            // Global only
+        "current" => Some(current_branch), // Global + current branch
+        specific => Some(Some(specific)),  // Specific branch
+    };
 
     // Hybrid search: combine semantic (70%) and keyword (30%) scores
     const SEMANTIC_WEIGHT: f64 = 0.7;
@@ -391,6 +494,26 @@ fn cmd_query(
                 continue;
             }
 
+            // Apply branch filter
+            match branch_filter {
+                None => {} // All branches - no filter
+                Some(None) => {
+                    // Global only
+                    if memory.branch.is_some() {
+                        continue;
+                    }
+                }
+                Some(Some(branch)) => {
+                    // Global + specific branch
+                    if let Some(ref mem_branch) = memory.branch
+                        && mem_branch != branch
+                    {
+                        continue;
+                    }
+                    // Global (branch = None) is always included
+                }
+            }
+
             let final_score = hybrid_score * memory.relevance_score;
             if final_score >= min_relevance {
                 scored_results.push((id, final_score, semantic_score, keyword_score));
@@ -406,9 +529,14 @@ fn cmd_query(
         if let Some(memory) = db.get_memory(&id)? {
             println!("─────────────────────────────────────────");
             println!("ID: {}", memory.id);
+            let branch_str = memory
+                .branch
+                .as_ref()
+                .map(|b| format!(" | Branch: {}", b))
+                .unwrap_or_default();
             println!(
-                "Type: {:?} | Score: {:.3} | Importance: {:.2}",
-                memory.memory_type, score, memory.importance
+                "Type: {:?} | Score: {:.3} | Importance: {:.2}{}",
+                memory.memory_type, score, memory.importance, branch_str
             );
             println!(
                 "Semantic: {:.3} | Keyword: {:.3}",
@@ -440,11 +568,22 @@ fn cmd_list(
     project_id: &str,
     type_filter: Option<&str>,
     limit: usize,
+    branch_filter: Option<&str>,
 ) -> Result<(), MemoryError> {
     let type_filters: Option<Vec<MemoryType>> =
         type_filter.and_then(|t| t.parse().ok()).map(|t| vec![t]);
 
-    let memories = db.query_memories(project_id, type_filters.as_deref(), None, None, limit)?;
+    // Convert branch filter for query
+    let branch_query = branch_filter.map(Some);
+
+    let memories = db.query_memories_with_branch(
+        project_id,
+        type_filters.as_deref(),
+        None,
+        None,
+        limit,
+        branch_query,
+    )?;
 
     if memories.is_empty() {
         println!("No memories found.");
@@ -456,9 +595,14 @@ fn cmd_list(
             .summary
             .as_deref()
             .unwrap_or_else(|| &memory.content[..memory.content.len().min(60)]);
+        let branch_info = memory
+            .branch
+            .as_ref()
+            .map(|b| format!(" [{}]", b))
+            .unwrap_or_default();
         println!(
-            "{} [{:?}] {:.2} - {}",
-            memory.id, memory.memory_type, memory.relevance_score, summary
+            "{} [{:?}]{} {:.2} - {}",
+            memory.id, memory.memory_type, branch_info, memory.relevance_score, summary
         );
     }
     println!("\nTotal: {} memories", memories.len());
@@ -474,6 +618,7 @@ fn cmd_show(db: &Database, id: &str) -> Result<(), MemoryError> {
     println!("ID: {}", memory.id);
     println!("Project: {}", memory.project_id);
     println!("Type: {:?}", memory.memory_type);
+    println!("Branch: {}", memory.branch.as_deref().unwrap_or("(global)"));
     println!("Importance: {:.2}", memory.importance);
     println!("Relevance: {:.2}", memory.relevance_score);
     println!("Access count: {}", memory.access_count);
@@ -526,6 +671,8 @@ fn cmd_store(
     tags: Option<&str>,
     importance: f64,
     summary: Option<String>,
+    branch_arg: Option<&str>,
+    current_branch: Option<&str>,
 ) -> Result<(), MemoryError> {
     let memory_type: MemoryType = type_str
         .parse()
@@ -544,6 +691,13 @@ fn cmd_store(
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_default();
 
+    // Resolve branch: omit for global, "auto" for current branch, else explicit
+    let branch = match branch_arg {
+        None | Some("") => None, // Global
+        Some("auto") => current_branch.map(String::from),
+        Some(explicit) => Some(explicit.to_string()),
+    };
+
     let memory = Memory {
         id: id.clone(),
         project_id: project_id.to_string(),
@@ -557,6 +711,7 @@ fn cmd_store(
         created_at: now,
         updated_at: now,
         last_accessed_at: now,
+        branch: branch.clone(),
     };
 
     db.store_memory(&memory)?;
@@ -565,7 +720,11 @@ fn cmd_store(
     let embedding = embedding_service.embed_memory(memory_type, content)?;
     db.store_embedding(&id, &embedding, embedding_service.model_version())?;
 
-    println!("Memory stored: {}", id);
+    if let Some(ref b) = branch {
+        println!("Memory stored: {} (branch: {})", id, b);
+    } else {
+        println!("Memory stored: {} (global)", id);
+    }
 
     Ok(())
 }
@@ -816,6 +975,36 @@ fn cmd_prune(
         println!("Deleted {} memories", deleted);
     } else {
         println!("\nRun with --confirm to delete these memories.");
+    }
+
+    Ok(())
+}
+
+fn cmd_promote(db: &Database, id: &str) -> Result<(), MemoryError> {
+    // Get the memory first to verify it exists and get its current state
+    let memory = db
+        .get_memory(id)?
+        .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+
+    // Check if already global
+    if memory.branch.is_none() {
+        println!("Memory {} is already global", id);
+        return Ok(());
+    }
+
+    let was_branch = memory.branch.clone();
+
+    // Promote to global
+    let promoted = db.promote_memory(id)?;
+
+    if promoted {
+        println!(
+            "Promoted memory {} from branch '{}' to global",
+            id,
+            was_branch.as_deref().unwrap_or("?")
+        );
+    } else {
+        println!("Failed to promote memory {}", id);
     }
 
     Ok(())

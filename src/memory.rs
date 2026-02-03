@@ -112,6 +112,9 @@ pub struct Memory {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_accessed_at: i64,
+    /// Git branch this memory belongs to. NULL means global (visible on all branches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -126,7 +126,34 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)?;
         drop(conn);
+        self.migrate_branch_column()?;
         self.migrate_fts()?;
+        Ok(())
+    }
+
+    /// Add branch column to memories table if it doesn't exist.
+    fn migrate_branch_column(&self) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+
+        // Check if branch column already exists
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+        let has_branch = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                Ok(name)
+            })?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "branch");
+
+        if !has_branch {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE memories ADD COLUMN branch TEXT;
+                CREATE INDEX IF NOT EXISTS idx_memories_project_branch ON memories(project_id, branch);
+                "#,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -207,8 +234,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let tags_json = serde_json::to_string(&memory.tags)?;
         conn.execute(
-            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 memory.id,
                 memory.project_id,
@@ -222,6 +249,7 @@ impl Database {
                 memory.created_at,
                 memory.updated_at,
                 memory.last_accessed_at,
+                memory.branch,
             ],
         )?;
         Ok(())
@@ -230,7 +258,7 @@ impl Database {
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch
              FROM memories WHERE id = ?1"
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -251,6 +279,7 @@ impl Database {
                 created_at: row.get(9)?,
                 updated_at: row.get(10)?,
                 last_accessed_at: row.get(11)?,
+                branch: row.get(12)?,
             }))
         } else {
             Ok(None)
@@ -292,12 +321,43 @@ impl Database {
         min_relevance: Option<f64>,
         limit: usize,
     ) -> Result<Vec<Memory>, MemoryError> {
+        self.query_memories_with_branch(project_id, types, tags, min_relevance, limit, None)
+    }
+
+    /// Query memories with optional branch filtering.
+    /// - `branch_filter = None`: return all memories (global + all branches)
+    /// - `branch_filter = Some(None)`: return only global memories (branch IS NULL)
+    /// - `branch_filter = Some(Some(branch))`: return global + specific branch memories
+    pub fn query_memories_with_branch(
+        &self,
+        project_id: &str,
+        types: Option<&[MemoryType]>,
+        tags: Option<&[String]>,
+        min_relevance: Option<f64>,
+        limit: usize,
+        branch_filter: Option<Option<&str>>,
+    ) -> Result<Vec<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
 
         let mut sql = String::from(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch
              FROM memories WHERE project_id = ?1"
         );
+
+        // Apply branch filter
+        match branch_filter {
+            None => {
+                // All memories (no branch filter)
+            }
+            Some(None) => {
+                // Global only
+                sql.push_str(" AND branch IS NULL");
+            }
+            Some(Some(_)) => {
+                // Global + specific branch
+                sql.push_str(" AND (branch IS NULL OR branch = ?4)");
+            }
+        }
 
         if min_relevance.is_some() {
             sql.push_str(" AND relevance_score >= ?2");
@@ -308,7 +368,9 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
 
         let min_rel = min_relevance.unwrap_or(0.0);
-        let rows = stmt.query_map(params![project_id, min_rel, limit as i64], |row| {
+
+        // Helper to parse a row into Memory
+        fn parse_row(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
             let memory_type_str: String = row.get(2)?;
             let tags_json: String = row.get(5)?;
             Ok(Memory {
@@ -324,10 +386,23 @@ impl Database {
                 created_at: row.get(9)?,
                 updated_at: row.get(10)?,
                 last_accessed_at: row.get(11)?,
+                branch: row.get(12)?,
             })
-        })?;
+        }
 
-        let mut memories: Vec<Memory> = rows.filter_map(|r| r.ok()).collect();
+        let mut memories: Vec<Memory> = match branch_filter {
+            Some(Some(branch)) => stmt
+                .query_map(
+                    params![project_id, min_rel, limit as i64, branch],
+                    parse_row,
+                )?
+                .filter_map(|r| r.ok())
+                .collect(),
+            _ => stmt
+                .query_map(params![project_id, min_rel, limit as i64], parse_row)?
+                .filter_map(|r| r.ok())
+                .collect(),
+        };
 
         // Filter by types if specified
         if let Some(types) = types {
@@ -349,6 +424,26 @@ impl Database {
         self.query_memories(project_id, None, None, None, 10000)
     }
 
+    /// Get all memories for a project filtered by branch.
+    #[allow(dead_code)] // Available for future use by CLI and MCP tools
+    pub fn get_all_memories_for_project_with_branch(
+        &self,
+        project_id: &str,
+        branch_filter: Option<Option<&str>>,
+    ) -> Result<Vec<Memory>, MemoryError> {
+        self.query_memories_with_branch(project_id, None, None, None, 10000, branch_filter)
+    }
+
+    /// Promote a memory from branch-local to global.
+    pub fn promote_memory(&self, id: &str) -> Result<bool, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let rows_affected = conn.execute(
+            "UPDATE memories SET branch = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(rows_affected > 0)
+    }
+
     /// Store multiple memories in a single transaction
     #[allow(dead_code)] // Used by MCP server tools
     pub fn store_memories_batch(&self, memories: &[Memory]) -> Result<usize, MemoryError> {
@@ -359,8 +454,8 @@ impl Database {
         for memory in memories {
             let tags_json = serde_json::to_string(&memory.tags)?;
             tx.execute(
-                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     memory.id,
                     memory.project_id,
@@ -374,6 +469,7 @@ impl Database {
                     memory.created_at,
                     memory.updated_at,
                     memory.last_accessed_at,
+                    memory.branch,
                 ],
             )?;
             count += 1;
@@ -489,6 +585,27 @@ impl Database {
             relationship_count: relationship_count as usize,
             avg_relevance,
         })
+    }
+
+    /// Get branch statistics for a project (count of memories per branch).
+    /// Returns a map of branch name to count, where None represents global memories.
+    #[allow(dead_code)] // Available for future use by CLI and MCP tools
+    pub fn get_branch_stats(
+        &self,
+        project_id: &str,
+    ) -> Result<HashMap<Option<String>, usize>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT branch, COUNT(*) FROM memories WHERE project_id = ?1 GROUP BY branch",
+        )?;
+
+        let rows = stmt.query_map(params![project_id], |row| {
+            let branch: Option<String> = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((branch, count as usize))
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn record_access(&self, id: &str) -> Result<(), MemoryError> {
@@ -731,7 +848,7 @@ impl Database {
         // Build query with placeholders
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch
              FROM memories WHERE id IN ({})",
             placeholders.join(",")
         );
@@ -758,6 +875,7 @@ impl Database {
                 created_at: row.get(9)?,
                 updated_at: row.get(10)?,
                 last_accessed_at: row.get(11)?,
+                branch: row.get(12)?,
             })
         })?;
 
@@ -942,6 +1060,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
+            branch: None,
         };
         db.store_memory(&memory).unwrap();
 

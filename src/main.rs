@@ -49,6 +49,62 @@ fn find_git_root() -> Option<PathBuf> {
     }
 }
 
+/// Detect the current git branch.
+/// Returns None if not in a git repository or on error.
+/// Priority: ENGRAM_BRANCH env var > git detection
+fn get_current_branch() -> Option<String> {
+    // Check environment variable override first
+    if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
+        && !branch.is_empty()
+    {
+        return Some(branch);
+    }
+
+    // Find git root
+    let git_root = find_git_root()?;
+    let git_dir = git_root.join(".git");
+
+    // Try reading .git/HEAD directly (faster than spawning git process)
+    if let Ok(head_content) = std::fs::read_to_string(git_dir.join("HEAD")) {
+        let head = head_content.trim();
+        if let Some(branch_ref) = head.strip_prefix("ref: refs/heads/") {
+            return Some(branch_ref.to_string());
+        }
+        // Detached HEAD - use short SHA
+        if head.len() >= 7 {
+            return Some(format!("detached-{}", &head[..7]));
+        }
+    }
+
+    // Fallback: try git command
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&git_root)
+        .output()
+        && output.status.success()
+    {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch == "HEAD" {
+            // Detached HEAD - get short SHA
+            if let Ok(sha_output) = std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .current_dir(&git_root)
+                .output()
+                && sha_output.status.success()
+            {
+                let sha = String::from_utf8_lossy(&sha_output.stdout)
+                    .trim()
+                    .to_string();
+                return Some(format!("detached-{}", sha));
+            }
+        } else {
+            return Some(branch);
+        }
+    }
+
+    None
+}
+
 /// Default decay interval: 1 hour
 const DECAY_INTERVAL_SECS: u64 = 3600;
 
@@ -96,14 +152,16 @@ struct MemoryServer {
     tool_handler: Arc<RwLock<Option<ToolHandler>>>,
     db_path: PathBuf,
     project_id: String,
+    current_branch: Option<String>,
 }
 
 impl MemoryServer {
-    fn new(db_path: PathBuf, project_id: String) -> Self {
+    fn new(db_path: PathBuf, project_id: String, current_branch: Option<String>) -> Self {
         Self {
             tool_handler: Arc::new(RwLock::new(None)),
             db_path,
             project_id,
+            current_branch,
         }
     }
 
@@ -120,7 +178,12 @@ impl MemoryServer {
             let embedding = EmbeddingService::new()
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            *handler = Some(ToolHandler::new(db, embedding, self.project_id.clone()));
+            *handler = Some(ToolHandler::new(
+                db,
+                embedding,
+                self.project_id.clone(),
+                self.current_branch.clone(),
+            ));
         }
         Ok(())
     }
@@ -461,9 +524,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Detect current git branch
+    let current_branch = get_current_branch();
+
     tracing::info!("Starting Engram MCP server");
     tracing::info!("Database: {}", db_path.display());
     tracing::info!("Project: {}", project_id);
+    if let Some(ref branch) = current_branch {
+        tracing::info!("Branch: {}", branch);
+    }
 
     // Spawn background decay job
     let decay_db_path = db_path.clone();
@@ -472,7 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_decay_job(decay_db_path, decay_project_id).await;
     });
 
-    let server = MemoryServer::new(db_path, project_id);
+    let server = MemoryServer::new(db_path, project_id, current_branch);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

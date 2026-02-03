@@ -53,6 +53,7 @@ fn test_full_memory_lifecycle() {
         created_at: now,
         updated_at: now,
         last_accessed_at: now,
+        branch: None,
     };
     db.store_memory(&memory).expect("Failed to store memory");
 
@@ -93,6 +94,7 @@ fn test_full_memory_lifecycle() {
         created_at: now,
         updated_at: now,
         last_accessed_at: now,
+        branch: None,
     };
     db.store_memory(&memory2).expect("Failed to store memory 2");
 
@@ -156,6 +158,7 @@ fn test_relationship_graph() {
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
+            branch: None,
         },
         Memory {
             id: "mem_2".to_string(),
@@ -170,6 +173,7 @@ fn test_relationship_graph() {
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
+            branch: None,
         },
         Memory {
             id: "mem_3".to_string(),
@@ -184,6 +188,7 @@ fn test_relationship_graph() {
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
+            branch: None,
         },
     ];
 
@@ -255,6 +260,7 @@ fn test_memory_access_tracking() {
         created_at: now,
         updated_at: now,
         last_accessed_at: now - 1000,
+        branch: None,
     };
     db.store_memory(&memory).expect("Failed to store memory");
 

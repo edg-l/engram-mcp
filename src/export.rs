@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::memory::{Memory, Relationship};
 
 /// Current export format version
-pub const EXPORT_VERSION: &str = "1.0";
+pub const EXPORT_VERSION: &str = "1.1";
+
+/// Previous export version (for backward compatibility)
+pub const EXPORT_VERSION_1_0: &str = "1.0";
 
 /// Export format for memories
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,11 +123,11 @@ pub fn create_export(
 
 /// Validate import data version compatibility
 pub fn validate_import(data: &ExportData) -> Result<(), String> {
-    // For now, we only support version 1.0
-    if data.version != EXPORT_VERSION {
+    // Support both 1.0 (pre-branch) and 1.1 (with branch)
+    if data.version != EXPORT_VERSION && data.version != EXPORT_VERSION_1_0 {
         return Err(format!(
-            "Unsupported export version: {}. Expected: {}",
-            data.version, EXPORT_VERSION
+            "Unsupported export version: {}. Expected: {} or {}",
+            data.version, EXPORT_VERSION, EXPORT_VERSION_1_0
         ));
     }
     Ok(())
@@ -160,9 +163,22 @@ mod tests {
         };
         assert!(validate_import(&valid).is_ok());
 
+        // Also accept version 1.0 (backward compat)
+        let valid_v1 = ExportData {
+            version: EXPORT_VERSION_1_0.to_string(),
+            project_id: "test".to_string(),
+            memories: vec![],
+            relationships: vec![],
+            exported_at: 0,
+        };
+        assert!(validate_import(&valid_v1).is_ok());
+
         let invalid = ExportData {
             version: "0.1".to_string(),
-            ..valid
+            project_id: "test".to_string(),
+            memories: vec![],
+            relationships: vec![],
+            exported_at: 0,
         };
         assert!(validate_import(&invalid).is_err());
     }

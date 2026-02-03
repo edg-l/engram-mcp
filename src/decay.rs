@@ -59,6 +59,7 @@ mod tests {
             created_at: now - (days_ago * 86400),
             updated_at: now - (days_ago * 86400),
             last_accessed_at: now - (days_ago * 86400),
+            branch: None,
         }
     }
 

@@ -32,6 +32,9 @@ pub struct MemoryStoreInput {
     pub summary: Option<String>,
     #[serde(default)]
     pub related_to: Vec<String>,
+    /// Branch for this memory: null/omitted = global, "auto" = current branch, "branch-name" = explicit
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 fn default_importance() -> f64 {
@@ -55,6 +58,14 @@ pub struct MemoryQueryInput {
     /// Default 0.7 means 70% semantic, 30% keyword.
     #[serde(default = "default_semantic_weight")]
     pub semantic_weight: f64,
+    /// Branch mode: "current" (default) = global + current branch,
+    /// "all" = all branches, "global" = global only, or "branch-name" = specific branch
+    #[serde(default = "default_branch_mode")]
+    pub branch_mode: String,
+}
+
+fn default_branch_mode() -> String {
+    "current".to_string()
 }
 
 fn default_semantic_weight() -> f64 {
@@ -176,10 +187,18 @@ fn default_prune_threshold() -> f64 {
     0.2
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MemoryPromoteInput {
+    /// ID of the memory to promote from branch-local to global
+    pub id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MemoryStoreResult {
     pub id: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub potential_contradictions: Vec<PotentialContradiction>,
 }
@@ -231,194 +250,93 @@ pub fn get_tool_definitions() -> Vec<Tool> {
     vec![
         Tool::new(
             "memory_store",
-            "Store a new memory. Use this to save facts, decisions, preferences, patterns, debug info, or entities about the project.",
+            "Store a memory (fact/decision/preference/pattern/debug/entity).",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The content of the memory to store"
-                    },
-                    "type": {
-                        "type": "string",
-                        "enum": ["fact", "decision", "preference", "pattern", "debug", "entity"],
-                        "description": "The type of memory"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Tags for categorizing the memory"
-                    },
-                    "importance": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Importance score (0.0-1.0), affects decay rate"
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "Short summary for listings"
-                    },
-                    "related_to": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "IDs of related memories to link to"
-                    }
+                    "content": {"type": "string"},
+                    "type": {"type": "string", "enum": ["fact", "decision", "preference", "pattern", "debug", "entity"]},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "summary": {"type": "string"},
+                    "related_to": {"type": "array", "items": {"type": "string"}, "description": "IDs to link"},
+                    "branch": {"type": "string", "description": "Branch for this memory: null/omitted = global, 'auto' = current branch, or explicit branch name"}
                 },
                 "required": ["content", "type"]
             })),
         ),
         Tool::new(
             "memory_query",
-            "Search for relevant memories using hybrid semantic + keyword search. Returns memories ranked by combined similarity score.",
+            "Search memories (hybrid semantic + keyword).",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Maximum number of results to return"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Number of results to skip (for pagination)"
-                    },
-                    "min_relevance": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Minimum relevance score threshold"
-                    },
-                    "types": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Filter by memory types"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Filter by tags"
-                    },
-                    "semantic_weight": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Weight for semantic search (0.0-1.0). Keyword weight = 1 - semantic_weight. Default 0.7."
-                    }
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "min_relevance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "types": {"type": "array", "items": {"type": "string"}},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "semantic_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "0-1, default 0.7"},
+                    "branch_mode": {"type": "string", "description": "'current' (default) = global + current branch, 'all' = all branches, 'global' = global only, or specific branch name"}
                 },
                 "required": ["query"]
             })),
         ),
         Tool::new(
             "memory_update",
-            "Update an existing memory's content, importance, tags, or summary.",
+            "Update a memory.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "The memory ID to update"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "New content for the memory"
-                    },
-                    "importance": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "New importance score"
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "New tags (replaces existing)"
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "New summary"
-                    }
+                    "id": {"type": "string"},
+                    "content": {"type": "string"},
+                    "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "summary": {"type": "string"}
                 },
                 "required": ["id"]
             })),
         ),
         Tool::new(
             "memory_delete",
-            "Delete a memory and its relationships.",
+            "Delete a memory.",
             make_input_schema(json!({
                 "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "The memory ID to delete"
-                    }
-                },
+                "properties": {"id": {"type": "string"}},
                 "required": ["id"]
             })),
         ),
         Tool::new(
             "memory_link",
-            "Create a relationship between two memories.",
+            "Link two memories.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "source_id": {
-                        "type": "string",
-                        "description": "Source memory ID"
-                    },
-                    "target_id": {
-                        "type": "string",
-                        "description": "Target memory ID"
-                    },
-                    "relation": {
-                        "type": "string",
-                        "enum": ["relates_to", "supersedes", "derived_from", "contradicts"],
-                        "description": "Type of relationship"
-                    },
-                    "strength": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Relationship strength"
-                    }
+                    "source_id": {"type": "string"},
+                    "target_id": {"type": "string"},
+                    "relation": {"type": "string", "enum": ["relates_to", "supersedes", "derived_from", "contradicts"]},
+                    "strength": {"type": "number", "minimum": 0.0, "maximum": 1.0}
                 },
                 "required": ["source_id", "target_id", "relation"]
             })),
         ),
         Tool::new(
             "memory_graph",
-            "Retrieve a memory with its related memories (graph traversal).",
+            "Get memory with related memories.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "The root memory ID"
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 5,
-                        "description": "Maximum traversal depth"
-                    },
-                    "relation_types": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Filter by relationship types"
-                    }
+                    "id": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "relation_types": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": ["id"]
             })),
         ),
         Tool::new(
             "memory_store_batch",
-            "Store multiple memories atomically in a single transaction. Maximum 100 memories per batch.",
+            "Store multiple memories (max 100).",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -435,8 +353,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                             },
                             "required": ["content", "type"]
                         },
-                        "maxItems": 100,
-                        "description": "Array of memories to store"
+                        "maxItems": 100
                     }
                 },
                 "required": ["memories"]
@@ -444,107 +361,72 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_delete_batch",
-            "Delete multiple memories by ID in a single transaction.",
+            "Delete multiple memories.",
             make_input_schema(json!({
                 "type": "object",
-                "properties": {
-                    "ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of memory IDs to delete"
-                    }
-                },
+                "properties": {"ids": {"type": "array", "items": {"type": "string"}}},
                 "required": ["ids"]
             })),
         ),
         Tool::new(
             "memory_export",
-            "Export all project memories to JSON format.",
+            "Export memories to JSON.",
             make_input_schema(json!({
                 "type": "object",
-                "properties": {
-                    "include_embeddings": {
-                        "type": "boolean",
-                        "description": "Include embeddings in export (increases size)"
-                    }
-                }
+                "properties": {"include_embeddings": {"type": "boolean"}}
             })),
         ),
         Tool::new(
             "memory_import",
-            "Import memories from JSON export format.",
+            "Import memories from JSON.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "data": {
-                        "type": "object",
-                        "description": "The export data object to import"
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["merge", "replace"],
-                        "description": "Import mode: merge (skip duplicates) or replace (clear existing)"
-                    }
+                    "data": {"type": "object"},
+                    "mode": {"type": "string", "enum": ["merge", "replace"]}
                 },
                 "required": ["data"]
             })),
         ),
         Tool::new(
             "memory_stats",
-            "Get statistics about the project's memory store.",
-            make_input_schema(json!({
-                "type": "object",
-                "properties": {}
-            })),
+            "Get memory statistics.",
+            make_input_schema(json!({"type": "object", "properties": {}})),
         ),
         Tool::new(
             "memory_context",
-            "Get memories relevant to a conversation context. Use this to automatically retrieve background knowledge before responding to a topic.",
+            "Get memories relevant to context.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "context": {
-                        "type": "string",
-                        "description": "The conversation context or topic to find relevant memories for"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20,
-                        "description": "Maximum number of memories to return (default: 5)"
-                    },
-                    "min_score": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Minimum similarity score threshold (default: 0.3)"
-                    },
-                    "types": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Filter by memory types (fact, decision, preference, pattern, debug, entity)"
-                    }
+                    "context": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "types": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": ["context"]
             })),
         ),
         Tool::new(
             "memory_prune",
-            "Remove low-relevance memories that have decayed over time. By default performs a dry run showing what would be deleted.",
+            "Remove decayed memories (dry run by default).",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "threshold": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Relevance threshold - memories below this score are candidates for deletion (default: 0.2)"
-                    },
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "Set to true to actually delete memories. Default false (dry run)."
-                    }
+                    "threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "confirm": {"type": "boolean"}
                 }
+            })),
+        ),
+        Tool::new(
+            "memory_promote",
+            "Promote a branch-local memory to global visibility.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID to promote"}
+                },
+                "required": ["id"]
             })),
         ),
     ]
@@ -554,6 +436,8 @@ pub struct ToolHandler {
     db: Database,
     embedding: EmbeddingService,
     project_id: String,
+    /// Current git branch (None if not in git repo)
+    current_branch: Option<String>,
     /// Cache for query embeddings to avoid recomputation
     query_cache: QueryEmbeddingCache,
     /// Cache for search results to avoid repeated similarity computations
@@ -561,14 +445,25 @@ pub struct ToolHandler {
 }
 
 impl ToolHandler {
-    pub fn new(db: Database, embedding: EmbeddingService, project_id: String) -> Self {
+    pub fn new(
+        db: Database,
+        embedding: EmbeddingService,
+        project_id: String,
+        current_branch: Option<String>,
+    ) -> Self {
         Self {
             db,
             embedding,
             project_id,
+            current_branch,
             query_cache: QueryEmbeddingCache::new(),
             search_cache: SearchResultCache::new(),
         }
+    }
+
+    /// Get the current branch.
+    pub fn current_branch(&self) -> Option<&str> {
+        self.current_branch.as_deref()
     }
 
     /// Get a reference to the embedding service for reuse.
@@ -606,6 +501,7 @@ impl ToolHandler {
             "memory_stats" => self.memory_stats(arguments),
             "memory_context" => self.memory_context(arguments),
             "memory_prune" => self.memory_prune(arguments),
+            "memory_promote" => self.memory_promote(arguments),
             _ => Ok(json!({"error": format!("Unknown tool: {}", name)})),
         }
     }
@@ -628,6 +524,13 @@ impl ToolHandler {
             input.summary
         };
 
+        // Resolve branch: null/omitted = global (None), "auto" = current branch, else explicit
+        let branch = match input.branch.as_deref() {
+            None | Some("") => None, // Global
+            Some("auto") => self.current_branch.clone(),
+            Some(explicit) => Some(explicit.to_string()),
+        };
+
         let memory = Memory {
             id: id.clone(),
             project_id: self.project_id.clone(),
@@ -641,6 +544,7 @@ impl ToolHandler {
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
+            branch: branch.clone(),
         };
 
         // Generate embedding first to check for potential contradictions
@@ -702,6 +606,7 @@ impl ToolHandler {
         Ok(json!(MemoryStoreResult {
             id,
             message,
+            branch,
             potential_contradictions,
         }))
     }
@@ -1199,6 +1104,13 @@ impl ToolHandler {
                 mem_input.summary
             };
 
+            // Resolve branch: null/omitted = global (None), "auto" = current branch, else explicit
+            let branch = match mem_input.branch.as_deref() {
+                None | Some("") => None, // Global
+                Some("auto") => self.current_branch.clone(),
+                Some(explicit) => Some(explicit.to_string()),
+            };
+
             let memory = Memory {
                 id: id.clone(),
                 project_id: self.project_id.clone(),
@@ -1212,6 +1124,7 @@ impl ToolHandler {
                 created_at: now,
                 updated_at: now,
                 last_accessed_at: now,
+                branch,
             };
 
             embeddings.push((
@@ -1519,6 +1432,49 @@ impl ToolHandler {
                     candidate_count, input.threshold
                 ),
                 "memories": candidate_info
+            }))
+        }
+    }
+
+    fn memory_promote(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryPromoteInput = serde_json::from_value(arguments)?;
+
+        // Get the memory first to verify it exists and get its current state
+        let memory = self
+            .db
+            .get_memory(&input.id)?
+            .ok_or_else(|| MemoryError::NotFound(input.id.clone()))?;
+
+        // Check if already global
+        if memory.branch.is_none() {
+            return Ok(json!({
+                "success": true,
+                "id": input.id,
+                "message": "Memory is already global",
+                "was_branch": null
+            }));
+        }
+
+        let was_branch = memory.branch.clone();
+
+        // Promote to global
+        let promoted = self.db.promote_memory(&input.id)?;
+
+        if promoted {
+            // Invalidate search cache since we changed data
+            self.invalidate_search_cache();
+
+            Ok(json!({
+                "success": true,
+                "id": input.id,
+                "message": format!("Memory promoted from branch '{}' to global", was_branch.as_deref().unwrap_or("?")),
+                "was_branch": was_branch
+            }))
+        } else {
+            Ok(json!({
+                "success": false,
+                "id": input.id,
+                "message": "Failed to promote memory"
             }))
         }
     }
