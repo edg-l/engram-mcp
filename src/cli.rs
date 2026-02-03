@@ -332,11 +332,17 @@ fn cmd_query(
     min_relevance: f64,
     types: &[String],
 ) -> Result<(), MemoryError> {
-    let query_embedding = embedding_service.embed(query)?;
+    use std::collections::{HashMap, HashSet};
 
+    // Hybrid search: combine semantic (70%) and keyword (30%) scores
+    const SEMANTIC_WEIGHT: f64 = 0.7;
+    const KEYWORD_WEIGHT: f64 = 0.3;
+
+    // Run semantic search
+    let query_embedding = embedding_service.embed(query)?;
     let embeddings = db.get_all_embeddings_for_project(project_id)?;
 
-    let mut scored: Vec<(String, f32)> = embeddings
+    let semantic_scores: HashMap<String, f32> = embeddings
         .iter()
         .map(|(id, vec)| {
             (
@@ -345,29 +351,68 @@ fn cmd_query(
             )
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Run keyword search (FTS5)
+    let keyword_results = db.keyword_search(project_id, query, limit * 5)?;
+
+    // Normalize keyword scores
+    let max_keyword_score = keyword_results
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(0.0_f64, f64::max);
+
+    let keyword_scores: HashMap<String, f64> = if max_keyword_score > 0.0 {
+        keyword_results
+            .into_iter()
+            .map(|(id, score)| (id, score / max_keyword_score))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    // Collect all candidate IDs
+    let mut candidate_ids: HashSet<String> = semantic_scores.keys().cloned().collect();
+    candidate_ids.extend(keyword_scores.keys().cloned());
 
     let type_filters: Vec<MemoryType> = types.iter().filter_map(|t| t.parse().ok()).collect();
 
-    let mut count = 0;
-    for (id, similarity) in scored {
-        if count >= limit {
-            break;
-        }
+    // Calculate hybrid scores
+    let mut scored_results: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, combined, semantic, keyword)
+
+    for id in candidate_ids {
+        let semantic_score = *semantic_scores.get(&id).unwrap_or(&0.0) as f64;
+        let keyword_score = *keyword_scores.get(&id).unwrap_or(&0.0);
+
+        // Hybrid score
+        let hybrid_score = SEMANTIC_WEIGHT * semantic_score + KEYWORD_WEIGHT * keyword_score;
+
         if let Some(memory) = db.get_memory(&id)? {
             if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
                 continue;
             }
-            let score = (similarity as f64) * memory.relevance_score;
-            if score < min_relevance {
-                continue;
-            }
 
+            let final_score = hybrid_score * memory.relevance_score;
+            if final_score >= min_relevance {
+                scored_results.push((id, final_score, semantic_score, keyword_score));
+            }
+        }
+    }
+
+    // Sort by combined score descending
+    scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut count = 0;
+    for (id, score, semantic_score, keyword_score) in scored_results.into_iter().take(limit) {
+        if let Some(memory) = db.get_memory(&id)? {
             println!("─────────────────────────────────────────");
             println!("ID: {}", memory.id);
             println!(
                 "Type: {:?} | Score: {:.3} | Importance: {:.2}",
                 memory.memory_type, score, memory.importance
+            );
+            println!(
+                "Semantic: {:.3} | Keyword: {:.3}",
+                semantic_score, keyword_score
             );
             if let Some(summary) = &memory.summary {
                 println!("Summary: {}", summary);

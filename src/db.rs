@@ -66,6 +66,33 @@ CREATE INDEX IF NOT EXISTS idx_relationships_source_type
     ON relationships(source_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_relationships_target_type
     ON relationships(target_id, relation_type);
+
+-- FTS5 full-text search index
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content,
+    summary,
+    tags,
+    content=memories,
+    content_rowid=rowid
+);
+
+-- Triggers to keep FTS index in sync
+CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content, summary, tags)
+    VALUES (NEW.rowid, NEW.content, NEW.summary, NEW.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, summary, tags)
+    VALUES ('delete', OLD.rowid, OLD.content, OLD.summary, OLD.tags);
+    INSERT INTO memories_fts(rowid, content, summary, tags)
+    VALUES (NEW.rowid, NEW.content, NEW.summary, NEW.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, summary, tags)
+    VALUES ('delete', OLD.rowid, OLD.content, OLD.summary, OLD.tags);
+END;
 "#;
 
 #[derive(Clone)]
@@ -98,6 +125,40 @@ impl Database {
     fn initialize(&self) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)?;
+        drop(conn);
+        self.migrate_fts()?;
+        Ok(())
+    }
+
+    /// Migrate existing memories to FTS index if empty.
+    fn migrate_fts(&self) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+
+        // Check if FTS table is empty
+        let fts_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories_fts",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if fts_count == 0 {
+            // Check if there are memories to migrate
+            let memory_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories",
+                [],
+                |row| row.get(0),
+            )?;
+
+            if memory_count > 0 {
+                // Populate FTS from existing memories
+                conn.execute(
+                    "INSERT INTO memories_fts(rowid, content, summary, tags)
+                     SELECT rowid, content, summary, tags FROM memories",
+                    [],
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -501,6 +562,71 @@ impl Database {
         })?;
 
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Full-text search using FTS5 with BM25 scoring.
+    /// Returns (memory_id, bm25_score) pairs sorted by relevance.
+    /// The BM25 score is negated (SQLite returns negative values, we flip to positive).
+    pub fn keyword_search(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, MemoryError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Escape special FTS5 characters and build match expression
+        let escaped_query = Self::escape_fts_query(query);
+        if escaped_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // FTS5 bm25() returns negative scores (more negative = more relevant)
+        // We negate to get positive scores where higher = more relevant
+        let mut stmt = conn.prepare(
+            "SELECT m.id, -bm25(memories_fts) as score
+             FROM memories_fts
+             JOIN memories m ON memories_fts.rowid = m.rowid
+             WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+             ORDER BY score DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![escaped_query, project_id, limit as i64], |row| {
+            let id: String = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            Ok((id, score))
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Escape special FTS5 query characters for safe searching.
+    fn escape_fts_query(query: &str) -> String {
+        // Split into words and wrap each in quotes for exact matching
+        // This prevents FTS5 syntax errors from special characters
+        query
+            .split_whitespace()
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                // Remove any existing quotes and special chars that could break FTS
+                let cleaned: String = word
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if cleaned.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{}\"", cleaned)
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" OR ")
     }
 
     // Relationship operations

@@ -24,6 +24,10 @@ Memories are stored locally in SQLite, embedded using a local model (all-MiniLM-
 - **Local Embeddings**: Uses fastembed with all-MiniLM-L6-v2 (384 dimensions, runs locally)
 - **Memory Decay**: Relevance scores decay over time, with reinforcement on access
 - **Relationship Graphs**: Link memories with typed relationships (supersedes, relates_to, derived_from, contradicts)
+- **Contradiction Detection**: Automatically flags potential contradictions (similarity > 0.85)
+- **Auto-Summarization**: Long content (> 500 chars) is automatically summarized
+- **Batch Operations**: Store or delete up to 100 memories atomically
+- **Import/Export**: Backup and restore memories in JSON format
 - **Project Scoping**: Memories are isolated per project
 - **MCP Protocol**: Standard interface for AI assistant integration
 
@@ -46,16 +50,21 @@ The binary will be at `target/release/engram`.
 
 ### Configure with Claude Code
 
-Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or similar):
+```bash
+claude mcp add -s user engram $(which engram)
+```
+
+### Configure with Claude Desktop
+
+Add to the config file:
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
     "engram": {
-      "command": "/path/to/engram",
-      "env": {
-        "ENGRAM_PROJECT": "my-project"
-      }
+      "command": "/path/to/engram"
     }
   }
 }
@@ -69,8 +78,11 @@ Configuration is done via environment variables:
 |----------|-------------|---------|
 | `ENGRAM_DB` | Path to SQLite database file | `~/.local/share/engram/memories.db` |
 | `ENGRAM_PROJECT` | Project identifier for scoping memories | Git root path (or current directory if not in a git repo) |
+| `ENGRAM_DECAY_INTERVAL` | Background decay job interval in seconds | `3600` (1 hour) |
 
 **Project Detection:** Engram automatically detects the git repository root, so running from any subdirectory uses the same project scope.
+
+**Background Decay:** The MCP server runs a background job that periodically applies decay to all memories based on time since last access.
 
 ### Tip: Add a CLAUDE.md hint
 
@@ -238,6 +250,97 @@ Retrieve a memory with its related memories via graph traversal.
 }
 ```
 
+### memory_store_batch
+
+Store multiple memories atomically (up to 100).
+
+```json
+{
+  "memories": [
+    {
+      "content": "First memory content",
+      "type": "fact",
+      "tags": ["tag1"]
+    },
+    {
+      "content": "Second memory content",
+      "type": "decision",
+      "importance": 0.9
+    }
+  ]
+}
+```
+
+### memory_delete_batch
+
+Delete multiple memories by ID.
+
+```json
+{
+  "ids": ["mem_abc123", "mem_def456", "mem_ghi789"]
+}
+```
+
+### memory_export
+
+Export all project memories to JSON.
+
+```json
+{
+  "include_embeddings": false
+}
+```
+
+**Parameters:**
+- `include_embeddings`: Include embedding vectors in export (default: false, increases size significantly)
+
+### memory_import
+
+Import memories from JSON.
+
+```json
+{
+  "data": { ... },
+  "mode": "merge"
+}
+```
+
+**Parameters:**
+- `data` (required): JSON data from memory_export
+- `mode`: `merge` (add new, skip existing) or `replace` (clear and import all)
+
+### memory_stats
+
+Get statistics for the current project.
+
+**Returns:**
+```json
+{
+  "total_memories": 42,
+  "by_type": {
+    "fact": 20,
+    "decision": 10,
+    "pattern": 12
+  },
+  "avg_relevance": 0.75,
+  "total_relationships": 15
+}
+```
+
+## MCP Resources
+
+Access individual memories via URI:
+
+```
+memory://{project}/{id}
+```
+
+## MCP Prompts
+
+### recall_context
+
+Retrieve relevant memories for a given context. Useful for pre-loading context at the start of a conversation.
+
 ## Memory Types
 
 | Type | Description | Example |
@@ -338,6 +441,48 @@ CREATE TABLE projects (
 );
 ```
 
+## CLI
+
+Engram includes a CLI tool (`engram-cli`) for direct interaction with the memory database.
+
+```bash
+# Semantic search
+engram-cli query "how does authentication work"
+
+# List all memories
+engram-cli list
+
+# Show a specific memory
+engram-cli show mem_abc123
+
+# Store a new memory
+engram-cli store "The API uses rate limiting" -t fact --tags api,security
+
+# Update a memory
+engram-cli update mem_abc123 -c "Updated content" --importance 0.9
+
+# Delete a memory
+engram-cli delete mem_abc123
+
+# Link two memories
+engram-cli link mem_abc123 mem_def456 -r relates_to
+
+# Export to file
+engram-cli export -o backup.json
+
+# Import from file
+engram-cli import backup.json
+
+# Show project statistics
+engram-cli stats
+
+# Run decay manually
+engram-cli decay
+
+# Prune low-relevance memories
+engram-cli prune -t 0.2 --confirm
+```
+
 ## Development
 
 ### Running Tests
@@ -354,14 +499,17 @@ cargo test -- --nocapture
 
 ```
 src/
-├── main.rs        # MCP server entry point
+├── main.rs        # MCP server entry point, stdio transport, resources, prompts
+├── cli.rs         # CLI binary (engram-cli)
 ├── lib.rs         # Library exports
-├── db.rs          # SQLite operations
-├── memory.rs      # Memory types and structs
-├── embedding.rs   # Local embedding service
+├── db.rs          # SQLite operations (memories, embeddings, relationships, batch ops)
+├── memory.rs      # Memory, MemoryType, Relationship, RelationType, ProjectStats
+├── embedding.rs   # fastembed wrapper (384-dim vectors)
 ├── decay.rs       # Relevance decay algorithm
-├── tools.rs       # MCP tool handlers
-└── error.rs       # Error types
+├── tools.rs       # MCP tool handlers + contradiction detection
+├── summarize.rs   # Extractive summarization for large content
+├── export.rs      # Import/export JSON format
+└── error.rs       # MemoryError enum
 
 tests/
 └── integration.rs # Integration tests

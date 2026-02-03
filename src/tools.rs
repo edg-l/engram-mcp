@@ -51,6 +51,14 @@ pub struct MemoryQueryInput {
     pub types: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Weight for semantic search (0.0-1.0). Keyword weight = 1 - semantic_weight.
+    /// Default 0.7 means 70% semantic, 30% keyword.
+    #[serde(default = "default_semantic_weight")]
+    pub semantic_weight: f64,
+}
+
+fn default_semantic_weight() -> f64 {
+    0.7
 }
 
 fn default_limit() -> usize {
@@ -58,7 +66,7 @@ fn default_limit() -> usize {
 }
 
 fn default_min_relevance() -> f64 {
-    0.3
+    0.1
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,7 +233,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_query",
-            "Search for relevant memories using semantic search. Returns memories ranked by similarity and relevance.",
+            "Search for relevant memories using hybrid semantic + keyword search. Returns memories ranked by combined similarity score.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -259,6 +267,12 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Filter by tags"
+                    },
+                    "semantic_weight": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Weight for semantic search (0.0-1.0). Keyword weight = 1 - semantic_weight. Default 0.7."
                     }
                 },
                 "required": ["query"]
@@ -610,9 +624,12 @@ impl ToolHandler {
         let type_filters: Vec<MemoryType> =
             input.types.iter().filter_map(|t| t.parse().ok()).collect();
 
-        // Optimization: if query is empty, skip embedding search and use filter-only path
-        let scored_ids: Vec<(String, f32)> = if input.query.trim().is_empty() {
-            // Filter-only path: get memories directly from DB
+        // Clamp semantic_weight to valid range
+        let semantic_weight = input.semantic_weight.clamp(0.0, 1.0);
+        let keyword_weight = 1.0 - semantic_weight;
+
+        // Optimization: if query is empty, skip search and use filter-only path
+        if input.query.trim().is_empty() {
             let memories = self.db.query_memories(
                 &self.project_id,
                 if type_filters.is_empty() {
@@ -628,30 +645,47 @@ impl ToolHandler {
                 Some(input.min_relevance),
                 input.limit + input.offset,
             )?;
-            memories
-                .into_iter()
-                .map(|m| (m.id, m.relevance_score as f32))
-                .collect()
-        } else {
-            // Semantic search path with caching
-            // Try to get embedding from cache first
-            let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
-                cached
-            } else {
-                let embedding = self.embedding.embed(&input.query)?;
-                self.query_cache
-                    .insert(input.query.clone(), embedding.clone());
-                embedding
-            };
 
-            // Try to get search results from cache
-            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding)
-            {
-                cached_results
+            let results: Vec<MemoryWithScore> = memories
+                .into_iter()
+                .skip(input.offset)
+                .take(input.limit)
+                .map(|m| {
+                    let score = m.relevance_score;
+                    MemoryWithScore {
+                        memory: m,
+                        score,
+                        semantic_score: 0.0,
+                        keyword_score: 0.0,
+                    }
+                })
+                .collect();
+
+            return Ok(json!(MemoryQueryResult {
+                count: results.len(),
+                memories: results,
+                contradiction_warnings: vec![],
+            }));
+        }
+
+        // Run semantic search
+        let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
+            cached
+        } else {
+            let embedding = self.embedding.embed(&input.query)?;
+            self.query_cache
+                .insert(input.query.clone(), embedding.clone());
+            embedding
+        };
+
+        // Get semantic scores
+        let semantic_scores: std::collections::HashMap<String, f32> =
+            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding) {
+                cached_results.into_iter().collect()
             } else {
                 let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
 
-                let mut scored: Vec<(String, f32)> = embeddings
+                let scored: Vec<(String, f32)> = embeddings
                     .iter()
                     .map(|(id, vec)| {
                         let similarity = cosine_similarity(&query_embedding, vec);
@@ -659,76 +693,101 @@ impl ToolHandler {
                     })
                     .collect();
 
-                // Sort by similarity descending
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
                 // Cache the results
                 self.search_cache
                     .insert(&self.project_id, &query_embedding, scored.clone());
-                scored
-            }
+                scored.into_iter().collect()
+            };
+
+        // Run keyword search (FTS5)
+        let keyword_results = self.db.keyword_search(
+            &self.project_id,
+            &input.query,
+            input.limit * 5, // Get more to ensure we have enough after filtering
+        )?;
+
+        // Normalize keyword scores (BM25 scores can vary widely)
+        // Find max keyword score for normalization
+        let max_keyword_score = keyword_results
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(0.0_f64, f64::max);
+
+        let keyword_scores: std::collections::HashMap<String, f64> = if max_keyword_score > 0.0 {
+            keyword_results
+                .into_iter()
+                .map(|(id, score)| (id, score / max_keyword_score))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
         };
 
-        // Collect IDs that pass initial similarity threshold for batch fetch
-        // We need to fetch more than limit to account for filtering
-        let candidate_ids: Vec<String> = scored_ids
-            .iter()
-            .take(input.limit * 3 + input.offset) // Fetch extra for filtering
-            .map(|(id, _)| id.clone())
-            .collect();
+        // Collect all candidate IDs from both searches
+        let mut candidate_ids: HashSet<String> = semantic_scores.keys().cloned().collect();
+        candidate_ids.extend(keyword_scores.keys().cloned());
 
-        // Batch fetch all candidate memories (1 query instead of N)
-        let memories_map = self.db.get_memories_batch(&candidate_ids)?;
+        // Batch fetch all candidate memories
+        let candidate_ids_vec: Vec<String> = candidate_ids.into_iter().collect();
+        let memories_map = self.db.get_memories_batch(&candidate_ids_vec)?;
 
-        // Filter and calculate final scores
-        let mut results: Vec<MemoryWithScore> = Vec::new();
-        let mut result_ids: Vec<String> = Vec::new();
-        let mut skipped = 0;
+        // Calculate hybrid scores and build results
+        let mut scored_results: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, combined, semantic, keyword)
 
-        for (id, similarity) in &scored_ids {
-            if results.len() >= input.limit {
-                break;
-            }
-
+        for id in candidate_ids_vec.iter() {
             let Some(memory) = memories_map.get(id) else {
                 continue;
             };
 
-            // Filter by types (only for semantic path, DB path already filtered)
-            if !input.query.trim().is_empty() {
-                if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
-                    continue;
-                }
-
-                // Filter by tags
-                if !input.tags.is_empty() && !input.tags.iter().any(|t| memory.tags.contains(t)) {
-                    continue;
-                }
-            }
-
-            // Calculate final score: similarity * relevance
-            let score = (*similarity as f64) * memory.relevance_score;
-
-            if score < input.min_relevance {
+            // Filter by types
+            if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
                 continue;
             }
 
-            // Apply offset (pagination)
-            if skipped < input.offset {
-                skipped += 1;
+            // Filter by tags
+            if !input.tags.is_empty() && !input.tags.iter().any(|t| memory.tags.contains(t)) {
                 continue;
             }
 
-            result_ids.push(id.clone());
-            let mut memory_clone = memory.clone();
-            memory_clone.access_count += 1;
-            results.push(MemoryWithScore {
-                memory: memory_clone,
-                score,
-            });
+            let semantic_score = *semantic_scores.get(id).unwrap_or(&0.0) as f64;
+            let keyword_score = *keyword_scores.get(id).unwrap_or(&0.0);
+
+            // Hybrid score: weighted combination of semantic and keyword scores
+            let hybrid_score = semantic_weight * semantic_score + keyword_weight * keyword_score;
+
+            // Apply relevance decay
+            let final_score = hybrid_score * memory.relevance_score;
+
+            if final_score >= input.min_relevance {
+                scored_results.push((id.clone(), final_score, semantic_score, keyword_score));
+            }
         }
 
-        // Batch record access for all result memories (1 query instead of N)
+        // Sort by combined score descending
+        scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply pagination and build final results
+        let mut results: Vec<MemoryWithScore> = Vec::new();
+        let mut result_ids: Vec<String> = Vec::new();
+
+        for (id, score, semantic_score, keyword_score) in scored_results
+            .into_iter()
+            .skip(input.offset)
+            .take(input.limit)
+        {
+            if let Some(memory) = memories_map.get(&id) {
+                result_ids.push(id);
+                let mut memory_clone = memory.clone();
+                memory_clone.access_count += 1;
+                results.push(MemoryWithScore {
+                    memory: memory_clone,
+                    score,
+                    semantic_score,
+                    keyword_score,
+                });
+            }
+        }
+
+        // Batch record access for all result memories
         if !result_ids.is_empty() {
             let _ = self.db.record_access_batch(&result_ids);
         }
