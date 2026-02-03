@@ -158,22 +158,52 @@ fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
         })
 }
 
+/// Find the git repository root by walking up from current directory.
+/// Returns None if not in a git repository.
+fn find_git_root() -> Option<PathBuf> {
+    let mut current = std::env::current_dir().ok()?;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Determine project ID from git root path or current directory.
 fn get_project_id(cli_project: Option<String>) -> String {
-    cli_project
-        .or_else(|| std::env::var("ENGRAM_PROJECT").ok())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-                .unwrap_or_else(|| "default".to_string())
-        })
+    // 1. Explicit override via CLI or env var
+    if let Some(project) = cli_project {
+        return project;
+    }
+    if let Ok(project) = std::env::var("ENGRAM_PROJECT") {
+        return project;
+    }
+
+    // 2. Try git root path
+    if let Some(git_root) = find_git_root() {
+        return git_root.to_string_lossy().to_string();
+    }
+
+    // 3. Fall back to current directory path
+    if let Ok(cwd) = std::env::current_dir() {
+        return cwd.to_string_lossy().to_string();
+    }
+
+    // 4. Ultimate fallback
+    "default".to_string()
 }
 
 /// Check if command needs embedding service (lazy initialization).
 fn needs_embedding_service(cmd: &Commands) -> bool {
     matches!(
         cmd,
-        Commands::Query { .. } | Commands::Store { .. } | Commands::Update { .. } | Commands::Import { .. }
+        Commands::Query { .. }
+            | Commands::Store { .. }
+            | Commands::Update { .. }
+            | Commands::Import { .. }
     )
 }
 
@@ -271,7 +301,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cmd_export(&db, &project_id, output, embeddings)?;
         }
         Commands::Import { file, mode } => {
-            cmd_import(&db, &project_id, embedding_service.as_ref().unwrap(), &file, &mode)?;
+            cmd_import(
+                &db,
+                &project_id,
+                embedding_service.as_ref().unwrap(),
+                &file,
+                &mode,
+            )?;
         }
         Commands::Stats => {
             cmd_stats(&db, &project_id)?;

@@ -139,7 +139,7 @@ impl Database {
         let project = Project {
             id: id.to_string(),
             name: name.to_string(),
-            root_path: None,
+            root_path: Some(id.to_string()),
             decay_rate: 0.01,
             created_at: chrono::Utc::now().timestamp(),
         };
@@ -598,7 +598,10 @@ impl Database {
 
     /// Fetch multiple memories by ID in a single query.
     /// Returns a HashMap for O(1) lookups.
-    pub fn get_memories_batch(&self, ids: &[String]) -> Result<HashMap<String, Memory>, MemoryError> {
+    pub fn get_memories_batch(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Memory>, MemoryError> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -616,7 +619,8 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
 
         // Convert ids to params
-        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| {
             let memory_type_str: String = row.get(2)?;
@@ -685,7 +689,8 @@ impl Database {
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| {
             let id: String = row.get(0)?;
@@ -714,7 +719,10 @@ impl Database {
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = source_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = source_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| {
             let rel_type_str: String = row.get(3)?;
@@ -755,7 +763,10 @@ impl Database {
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = target_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = target_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| {
             let rel_type_str: String = row.get(3)?;

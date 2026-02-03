@@ -34,6 +34,20 @@ use crate::embedding::EmbeddingService;
 use crate::error::MemoryError;
 use crate::tools::{ToolHandler, get_tool_definitions};
 
+/// Find the git repository root by walking up from current directory.
+/// Returns None if not in a git repository.
+fn find_git_root() -> Option<PathBuf> {
+    let mut current = std::env::current_dir().ok()?;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 /// Default decay interval: 1 hour
 const DECAY_INTERVAL_SECS: u64 = 3600;
 
@@ -427,12 +441,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Determine project ID (from env or current directory)
+    // Determine project ID (from env, git root, or current directory)
     let project_id = std::env::var("ENGRAM_PROJECT").unwrap_or_else(|_| {
-        std::env::current_dir()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "default".to_string())
+        if let Some(git_root) = find_git_root() {
+            git_root.to_string_lossy().to_string()
+        } else {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "default".to_string())
+        }
     });
 
     tracing::info!("Starting Engram MCP server");

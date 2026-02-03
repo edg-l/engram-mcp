@@ -639,12 +639,14 @@ impl ToolHandler {
                 cached
             } else {
                 let embedding = self.embedding.embed(&input.query)?;
-                self.query_cache.insert(input.query.clone(), embedding.clone());
+                self.query_cache
+                    .insert(input.query.clone(), embedding.clone());
                 embedding
             };
 
             // Try to get search results from cache
-            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding) {
+            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding)
+            {
                 cached_results
             } else {
                 let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
@@ -661,7 +663,8 @@ impl ToolHandler {
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Cache the results
-                self.search_cache.insert(&self.project_id, &query_embedding, scored.clone());
+                self.search_cache
+                    .insert(&self.project_id, &query_embedding, scored.clone());
                 scored
             }
         };
@@ -719,7 +722,10 @@ impl ToolHandler {
             result_ids.push(id.clone());
             let mut memory_clone = memory.clone();
             memory_clone.access_count += 1;
-            results.push(MemoryWithScore { memory: memory_clone, score });
+            results.push(MemoryWithScore {
+                memory: memory_clone,
+                score,
+            });
         }
 
         // Batch record access for all result memories (1 query instead of N)
@@ -738,7 +744,10 @@ impl ToolHandler {
     }
 
     /// Check for contradiction relationships among a set of memory IDs using batch operations.
-    fn check_contradictions_batch(&self, result_ids: &[String]) -> Result<Vec<ContradictionWarning>, MemoryError> {
+    fn check_contradictions_batch(
+        &self,
+        result_ids: &[String],
+    ) -> Result<Vec<ContradictionWarning>, MemoryError> {
         if result_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -934,7 +943,9 @@ impl ToolHandler {
                     if visited.contains(&rel.target_id) {
                         continue;
                     }
-                    if !relation_filters.is_empty() && !relation_filters.contains(&rel.relation_type) {
+                    if !relation_filters.is_empty()
+                        && !relation_filters.contains(&rel.relation_type)
+                    {
                         continue;
                     }
                     if !visited.contains(&rel.target_id) {
@@ -955,7 +966,9 @@ impl ToolHandler {
                     if visited.contains(&rel.source_id) {
                         continue;
                     }
-                    if !relation_filters.is_empty() && !relation_filters.contains(&rel.relation_type) {
+                    if !relation_filters.is_empty()
+                        && !relation_filters.contains(&rel.relation_type)
+                    {
                         continue;
                     }
                     if !visited.contains(&rel.source_id) {
