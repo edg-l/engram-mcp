@@ -1,6 +1,6 @@
-# Engram
+# Engram MCP
 
-MCP server for AI agent persistent memory. SQLite + local embeddings (fastembed/all-MiniLM-L6-v2).
+MCP server for AI agent persistent memory. Crate name: `engram_mcp` (binaries: `engram`, `engram-cli`). SQLite + local embeddings (fastembed/all-MiniLM-L6-v2).
 
 ## Development Rules
 - **Always run `cargo clippy` before committing and fix all warnings**

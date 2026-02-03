@@ -25,9 +25,9 @@ fn test_full_memory_lifecycle() {
     let (db_path, _dir) = test_helpers::create_test_db();
 
     // Import the modules we need
-    use engram::db::Database;
-    use engram::embedding::EmbeddingService;
-    use engram::memory::{Memory, MemoryType};
+    use engram_mcp::db::Database;
+    use engram_mcp::embedding::EmbeddingService;
+    use engram_mcp::memory::{Memory, MemoryType};
 
     // 1. Create database
     let db = Database::open(&db_path).expect("Failed to open database");
@@ -113,7 +113,7 @@ fn test_full_memory_lifecycle() {
     assert_eq!(all_embeddings.len(), 2);
 
     // Calculate similarities
-    use engram::embedding::cosine_similarity;
+    use engram_mcp::embedding::cosine_similarity;
     let mut similarities: Vec<(String, f32)> = all_embeddings
         .iter()
         .map(|(id, vec)| (id.clone(), cosine_similarity(&query_embedding, vec)))
@@ -132,8 +132,8 @@ fn test_full_memory_lifecycle() {
 fn test_relationship_graph() {
     let (db_path, _dir) = test_helpers::create_test_db();
 
-    use engram::db::Database;
-    use engram::memory::{Memory, MemoryType, RelationType, Relationship};
+    use engram_mcp::db::Database;
+    use engram_mcp::memory::{Memory, MemoryType, RelationType, Relationship};
 
     let db = Database::open(&db_path).expect("Failed to open database");
     db.get_or_create_project("test-project", "Test")
@@ -234,8 +234,8 @@ fn test_relationship_graph() {
 fn test_memory_access_tracking() {
     let (db_path, _dir) = test_helpers::create_test_db();
 
-    use engram::db::Database;
-    use engram::memory::{Memory, MemoryType};
+    use engram_mcp::db::Database;
+    use engram_mcp::memory::{Memory, MemoryType};
 
     let db = Database::open(&db_path).expect("Failed to open database");
     db.get_or_create_project("test-project", "Test")
