@@ -1,10 +1,10 @@
-# Agent Memory MCP Server
+# Engram
 
 A persistent memory system for AI agents built as an MCP (Model Context Protocol) server. Provides project-scoped knowledge storage with semantic search, memory decay, and relationship graphs.
 
 ## Overview
 
-Agent Memory enables AI agents to maintain long-term memory across sessions, remembering:
+Engram enables AI agents to maintain long-term memory across sessions, remembering:
 
 - **Facts** about the codebase and project
 - **Decisions** and their rationale
@@ -34,12 +34,12 @@ Memories are stored locally in SQLite, embedded using a local model (all-MiniLM-
 ### Build from Source
 
 ```bash
-git clone <repository-url>
-cd agent-memory
+git clone https://github.com/edg-l/engram-mcp.git
+cd engram-mcp
 cargo build --release
 ```
 
-The binary will be at `target/release/agent-memory`.
+The binary will be at `target/release/engram`.
 
 ### Configure with Claude Code
 
@@ -48,10 +48,10 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or 
 ```json
 {
   "mcpServers": {
-    "agent-memory": {
-      "command": "/path/to/agent-memory",
+    "engram": {
+      "command": "/path/to/engram",
       "env": {
-        "AGENT_MEMORY_PROJECT": "my-project"
+        "ENGRAM_PROJECT": "my-project"
       }
     }
   }
@@ -64,8 +64,8 @@ Configuration is done via environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AGENT_MEMORY_DB` | Path to SQLite database file | `~/.local/share/agent-memory/memories.db` |
-| `AGENT_MEMORY_PROJECT` | Project identifier for scoping memories | Current directory name |
+| `ENGRAM_DB` | Path to SQLite database file | `~/.local/share/engram/memories.db` |
+| `ENGRAM_PROJECT` | Project identifier for scoping memories | Current directory name |
 
 ## MCP Tools
 
