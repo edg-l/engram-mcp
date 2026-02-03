@@ -1,0 +1,21 @@
+[package]
+name = "agent-memory"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rmcp = { version = "0.14.0", features = ["server", "transport-io"] }
+tokio = { version = "1.49", features = ["full"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.20", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+fastembed = "5"
+thiserror = "2.0"
+dirs = "6.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.24"
