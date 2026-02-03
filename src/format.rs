@@ -32,17 +32,24 @@ fn format_store_result(result: &Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("Stored");
 
-    let mut out = format!("**Stored** `{}`\n{}", id, message);
+    let mut out = format!("✓ Stored: {}\n  {}", id, message);
 
-    if let Some(contradictions) = result.get("potential_contradictions").and_then(|v| v.as_array())
+    if let Some(contradictions) = result
+        .get("potential_contradictions")
+        .and_then(|v| v.as_array())
         && !contradictions.is_empty()
     {
-        out.push_str("\n\n⚠️ **Potential contradictions:**\n");
+        out.push_str("\n\n⚠️ Potential contradictions:\n");
         for c in contradictions {
             let mem_id = c.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
             let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             let sim = c.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            out.push_str(&format!("- `{}` ({:.0}%): {}\n", mem_id, sim * 100.0, summary));
+            out.push_str(&format!(
+                "  • {} ({:.0}%): {}\n",
+                mem_id,
+                sim * 100.0,
+                summary
+            ));
         }
     }
 
@@ -57,7 +64,11 @@ fn format_query_result(result: &Value) -> String {
         return "No memories found.".to_string();
     }
 
-    let mut out = format!("**Found {} memor{}:**\n", count, if count == 1 { "y" } else { "ies" });
+    let mut out = format!(
+        "Found {} memor{}:\n",
+        count,
+        if count == 1 { "y" } else { "ies" }
+    );
 
     if let Some(memories) = memories {
         for mem in memories {
@@ -97,14 +108,17 @@ fn format_query_result(result: &Value) -> String {
             };
 
             out.push_str(&format!(
-                "\n{} **{}** `{}` (score: {:.2}, importance: {:.1})\n",
+                "\n{} [{}] {} (score: {:.2}, importance: {:.1})\n",
                 icon, mem_type, id, score, importance
             ));
 
             // Show summary or truncated content
             let display_content = summary.unwrap_or(content);
             let truncated = if display_content.len() > 200 {
-                format!("{}...", &display_content.chars().take(200).collect::<String>())
+                format!(
+                    "{}...",
+                    &display_content.chars().take(200).collect::<String>()
+                )
             } else {
                 display_content.to_string()
             };
@@ -122,11 +136,14 @@ fn format_query_result(result: &Value) -> String {
         .and_then(|v| v.as_array())
         && !warnings.is_empty()
     {
-        out.push_str("\n⚠️ **Contradiction warnings:**\n");
+        out.push_str("\n⚠️ Contradiction warnings:\n");
         for w in warnings {
             let mem_id = w.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
-            let contra_id = w.get("contradicts_id").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("- `{}` contradicts `{}`\n", mem_id, contra_id));
+            let contra_id = w
+                .get("contradicts_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!("  • {} contradicts {}\n", mem_id, contra_id));
         }
     }
 
@@ -134,7 +151,10 @@ fn format_query_result(result: &Value) -> String {
 }
 
 fn format_simple_result(result: &Value) -> String {
-    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = result
         .get("message")
         .and_then(|v| v.as_str())
@@ -148,15 +168,15 @@ fn format_simple_result(result: &Value) -> String {
 }
 
 fn format_link_result(result: &Value) -> String {
-    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-    let message = result
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let message = result.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
     if success {
-        format!("✓ Link created `{}`\n{}", id, message)
+        format!("✓ Link created: {}\n  {}", id, message)
     } else {
         format!("✗ {}", message)
     }
@@ -177,7 +197,7 @@ fn format_graph_result(result: &Value) -> String {
         let content = root.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let summary = root.get("summary").and_then(|v| v.as_str());
 
-        out.push_str(&format!("**Root:** [{}] `{}`\n", mem_type, id));
+        out.push_str(&format!("Root: [{}] {}\n", mem_type, id));
         let display = summary.unwrap_or(content);
         let truncated = if display.len() > 150 {
             format!("{}...", &display.chars().take(150).collect::<String>())
@@ -191,7 +211,7 @@ fn format_graph_result(result: &Value) -> String {
         if related.is_empty() {
             out.push_str("\nNo related memories.");
         } else {
-            out.push_str(&format!("\n**Related ({}):**\n", related.len()));
+            out.push_str(&format!("\nRelated ({}):\n", related.len()));
             for rel in related {
                 let memory = rel.get("memory").unwrap_or(rel);
                 let id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -205,9 +225,13 @@ fn format_graph_result(result: &Value) -> String {
                 let summary = memory.get("summary").and_then(|v| v.as_str());
                 let content = memory.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
-                let arrow = if direction == "outgoing" { "→" } else { "←" };
+                let arrow = if direction == "outgoing" {
+                    "→"
+                } else {
+                    "←"
+                };
                 out.push_str(&format!(
-                    "  {} [{}] `{}` ({}, depth {})\n",
+                    "  {} [{}] {} ({}, depth {})\n",
                     arrow, mem_type, id, relation, depth
                 ));
 
@@ -228,7 +252,10 @@ fn format_graph_result(result: &Value) -> String {
 }
 
 fn format_batch_store_result(result: &Value) -> String {
-    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     let ids = result.get("ids").and_then(|v| v.as_array());
 
@@ -249,7 +276,10 @@ fn format_batch_store_result(result: &Value) -> String {
         }
         out
     } else {
-        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+        let error = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown error");
         format!("✗ Batch store failed: {}", error)
     }
 }
@@ -278,10 +308,10 @@ fn format_stats_result(result: &Value) -> String {
         .unwrap_or(0.0);
 
     format!(
-        "**Project:** {}\n\
-         **Memories:** {}\n\
-         **Relationships:** {}\n\
-         **Avg relevance:** {:.2}",
+        "Project: {}\n\
+         Memories: {}\n\
+         Relationships: {}\n\
+         Avg relevance: {:.2}",
         project, mem_count, rel_count, avg_rel
     )
 }
@@ -305,7 +335,10 @@ fn format_export_result(result: &Value) -> String {
 }
 
 fn format_import_result(result: &Value) -> String {
-    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = result.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
     if let Some(stats) = result.get("stats") {
@@ -323,7 +356,7 @@ fn format_import_result(result: &Value) -> String {
             .unwrap_or(0);
 
         format!(
-            "✓ **Import complete**\n\
+            "✓ Import complete\n\
              Memories: {} imported, {} skipped\n\
              Relationships: {} imported",
             mem_imported, mem_skipped, rel_imported
@@ -345,13 +378,13 @@ fn format_context_result(result: &Value) -> String {
 
     if count == 0 {
         return format!(
-            "**Context:** \"{}\"\n\nNo relevant memories found.",
+            "Context: \"{}\"\n\nNo relevant memories found.",
             truncate_str(context, 80)
         );
     }
 
     let mut out = format!(
-        "**Context:** \"{}\"\n**Found {} relevant memor{}:**\n",
+        "Context: \"{}\"\nFound {} relevant memor{}:\n",
         truncate_str(context, 80),
         count,
         if count == 1 { "y" } else { "ies" }
@@ -363,8 +396,14 @@ fn format_context_result(result: &Value) -> String {
             let mem_type = mem.get("type").and_then(|v| v.as_str()).unwrap_or("?");
             let content = mem.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let summary = mem.get("summary").and_then(|v| v.as_str());
-            let similarity = mem.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let importance = mem.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let similarity = mem
+                .get("similarity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let importance = mem
+                .get("importance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5);
             let tags = mem
                 .get("tags")
                 .and_then(|v| v.as_array())
@@ -387,7 +426,7 @@ fn format_context_result(result: &Value) -> String {
             };
 
             out.push_str(&format!(
-                "\n{} **{}** `{}` (similarity: {:.0}%, importance: {:.1})\n",
+                "\n{} [{}] {} (similarity: {:.0}%, importance: {:.1})\n",
                 icon,
                 mem_type,
                 id,
@@ -409,7 +448,10 @@ fn format_context_result(result: &Value) -> String {
 }
 
 fn format_prune_result(result: &Value) -> String {
-    let dry_run = result.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+    let dry_run = result
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let threshold = result
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -430,14 +472,14 @@ fn format_prune_result(result: &Value) -> String {
 
     let mut out = if dry_run {
         format!(
-            "🔍 **Dry run** - Found {} memor{} below threshold {:.2}:\n",
+            "🔍 Dry run - Found {} memor{} below threshold {:.2}:\n",
             candidates,
             if candidates == 1 { "y" } else { "ies" },
             threshold
         )
     } else {
         format!(
-            "🗑️ **Pruned {} memor{}** below threshold {:.2}:\n",
+            "🗑️ Pruned {} memor{} below threshold {:.2}:\n",
             deleted,
             if deleted == 1 { "y" } else { "ies" },
             threshold
@@ -455,7 +497,7 @@ fn format_prune_result(result: &Value) -> String {
             let summary = mem.get("summary").and_then(|v| v.as_str()).unwrap_or("?");
 
             out.push_str(&format!(
-                "\n- `{}` [{}] (relevance: {:.2})\n  {}\n",
+                "\n  • {} [{}] (relevance: {:.2})\n    {}\n",
                 id,
                 mem_type,
                 relevance,
@@ -469,7 +511,7 @@ fn format_prune_result(result: &Value) -> String {
     }
 
     if dry_run {
-        out.push_str("\n⚠️ Set `confirm: true` to actually delete these memories.");
+        out.push_str("\n⚠️ Set confirm=true to actually delete these memories.");
     }
 
     out
