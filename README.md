@@ -5,6 +5,7 @@
 <h1 align="center">Engram</h1>
 
 <p align="center">
+  <a href="https://crates.io/crates/engram_mcp"><img src="https://img.shields.io/crates/v/engram_mcp.svg" alt="Crates.io"></a>
   <a href="https://github.com/edg-l/engram-mcp/actions/workflows/ci.yml"><img src="https://github.com/edg-l/engram-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/edg-l/engram-mcp/actions/workflows/release.yml"><img src="https://github.com/edg-l/engram-mcp/actions/workflows/release.yml/badge.svg" alt="Release"></a>
 </p>
