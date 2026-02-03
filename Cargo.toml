@@ -2,6 +2,10 @@
 name = "engram_mcp"
 version = "0.1.0"
 edition = "2024"
+description = "MCP server for AI agent persistent memory with SQLite and local embeddings"
+license = "MIT"
+repository = "https://github.com/edg-l/engram-mcp"
+homepage = "https://github.com/edg-l/engram-mcp"
 
 [[bin]]
 name = "engram"
