@@ -1,5 +1,8 @@
 # Engram
 
+[![CI](https://github.com/edg-l/engram-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/edg-l/engram-mcp/actions/workflows/ci.yml)
+[![Release](https://github.com/edg-l/engram-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/edg-l/engram-mcp/actions/workflows/release.yml)
+
 A persistent memory system for AI agents built as an MCP (Model Context Protocol) server. Provides project-scoped knowledge storage with semantic search, memory decay, and relationship graphs.
 
 ## Overview
@@ -65,7 +68,9 @@ Configuration is done via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ENGRAM_DB` | Path to SQLite database file | `~/.local/share/engram/memories.db` |
-| `ENGRAM_PROJECT` | Project identifier for scoping memories | Current directory name |
+| `ENGRAM_PROJECT` | Project identifier for scoping memories | Git root path (or current directory if not in a git repo) |
+
+**Project Detection:** Engram automatically detects the git repository root, so running from any subdirectory uses the same project scope.
 
 ### Tip: Add a CLAUDE.md hint
 
