@@ -44,6 +44,14 @@ Memories are stored locally in SQLite, embedded using a local model (all-MiniLM-
 - Rust 1.70+ (uses edition 2024)
 - SQLite (bundled with rusqlite)
 
+### Install from crates.io
+
+```bash
+cargo install engram_mcp
+```
+
+This installs both `engram` (MCP server) and `engram-cli` (command-line tool).
+
 ### Build from Source
 
 ```bash

@@ -84,3 +84,6 @@ cargo build --release    # binaries: target/release/engram, target/release/engra
 cargo test               # run all tests
 cargo clippy             # lint (must pass with no warnings)
 ```
+
+## Memory
+Engram MCP available. Store decisions/patterns, query before architectural changes.
