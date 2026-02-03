@@ -17,7 +17,7 @@ use rmcp::model::{
     GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
     PromptMessage, PromptMessageRole, PromptsCapability, RawResource, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ResourcesCapability,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ResourcesCapability, Role,
     ServerCapabilities, ServerInfo, ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
@@ -190,19 +190,18 @@ impl ServerHandler for MemoryServer {
                 .handle_tool(&request.name, args)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            // Format for human readability, include JSON for LLM parsing
+            // Human-readable format (not sent to LLM)
             let formatted = format::format_tool_result(&request.name, &result);
-            let json_str =
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
-
-            // Combine: formatted text first for humans, then JSON block for LLM
-            let combined = format!(
-                "{}\n\n<details><summary>JSON</summary>\n\n```json\n{}\n```\n</details>",
-                formatted, json_str
-            );
+            // Compact JSON for LLM consumption
+            let compact_json = format::compact_tool_result(&request.name, &result);
 
             Ok(CallToolResult {
-                content: vec![Content::text(combined)],
+                content: vec![
+                    // Human-readable: audience=User means NOT sent to LLM
+                    Content::text(formatted).with_audience(vec![Role::User]),
+                    // Compact JSON: audience=Assistant means sent to LLM only
+                    Content::text(compact_json).with_audience(vec![Role::Assistant]),
+                ],
                 structured_content: None,
                 is_error: Some(false),
                 meta: None,

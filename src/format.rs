@@ -1,9 +1,9 @@
 //! Human-readable formatting for MCP tool results.
 //!
 //! Converts JSON tool results into markdown-formatted text for display,
-//! while preserving the original JSON for structured LLM consumption.
+//! and compact JSON for token-efficient LLM consumption.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Format a tool result as human-readable markdown.
 pub fn format_tool_result(tool_name: &str, result: &Value) -> String {
@@ -542,6 +542,207 @@ fn format_fallback(result: &Value) -> String {
     serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())
 }
 
+/// Produce compact JSON for LLM consumption.
+/// Uses short field names and omits unnecessary data.
+pub fn compact_tool_result(tool_name: &str, result: &Value) -> String {
+    let compact = match tool_name {
+        "memory_query" => compact_query_result(result),
+        "memory_context" => compact_context_result(result),
+        "memory_store" => compact_store_result(result),
+        "memory_graph" => compact_graph_result(result),
+        "memory_store_batch" => compact_batch_store_result(result),
+        "memory_prune" => compact_prune_result(result),
+        // Simple ops: just pass through (already small)
+        _ => result.clone(),
+    };
+    serde_json::to_string(&compact).unwrap_or_else(|_| result.to_string())
+}
+
+fn compact_store_result(result: &Value) -> Value {
+    let id = result.get("id").cloned().unwrap_or(json!("?"));
+    let contradictions = result
+        .get("potential_contradictions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|c| {
+                    json!({
+                        "i": c.get("memory_id"),
+                        "s": c.get("similarity")
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+
+    match contradictions {
+        Some(c) => json!({"i": id, "c": c}),
+        None => json!({"i": id}),
+    }
+}
+
+fn compact_query_result(result: &Value) -> Value {
+    let memories = result
+        .get("memories")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|mem| {
+                    let memory = mem.get("memory").unwrap_or(mem);
+                    let id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let mem_type = memory
+                        .get("memory_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let summary = memory
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| memory.get("content").and_then(|v| v.as_str()))
+                        .map(|s| truncate_str(s, 150))
+                        .unwrap_or_default();
+                    let score = mem.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let tags = memory
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .filter(|t| !t.is_empty())
+                        .cloned();
+
+                    let mut obj = json!({
+                        "i": id,
+                        "t": mem_type,
+                        "s": summary,
+                        "r": (score * 100.0).round() / 100.0
+                    });
+                    if let Some(t) = tags {
+                        obj["g"] = json!(t);
+                    }
+                    obj
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let count = memories.len();
+
+    // Include contradiction warnings if present
+    let warnings = result
+        .get("contradiction_warnings")
+        .and_then(|v| v.as_array())
+        .filter(|w| !w.is_empty())
+        .map(|arr| {
+            arr.iter()
+                .map(|w| {
+                    json!({
+                        "a": w.get("memory_id"),
+                        "b": w.get("contradicts_id")
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+
+    match warnings {
+        Some(w) => json!({"n": count, "m": memories, "w": w}),
+        None => json!({"n": count, "m": memories}),
+    }
+}
+
+fn compact_context_result(result: &Value) -> Value {
+    let memories = result
+        .get("memories")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|mem| {
+                    let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let mem_type = mem.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                    let summary = mem
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| mem.get("content").and_then(|v| v.as_str()))
+                        .map(|s| truncate_str(s, 150))
+                        .unwrap_or_default();
+                    let sim = mem
+                        .get("similarity")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let tags = mem
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .filter(|t| !t.is_empty())
+                        .cloned();
+
+                    let mut obj = json!({
+                        "i": id,
+                        "t": mem_type,
+                        "s": summary,
+                        "r": (sim * 100.0).round() / 100.0
+                    });
+                    if let Some(t) = tags {
+                        obj["g"] = json!(t);
+                    }
+                    obj
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({"n": memories.len(), "m": memories})
+}
+
+fn compact_graph_result(result: &Value) -> Value {
+    let root_id = result
+        .get("root")
+        .and_then(|r| r.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    let related = result
+        .get("related")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|rel| {
+                    let memory = rel.get("memory").unwrap_or(rel);
+                    let id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let relation = rel.get("relation").and_then(|v| v.as_str()).unwrap_or("?");
+                    let depth = rel.get("depth").and_then(|v| v.as_u64()).unwrap_or(0);
+                    json!({"i": id, "rel": relation, "d": depth})
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({"root": root_id, "rel": related})
+}
+
+fn compact_batch_store_result(result: &Value) -> Value {
+    let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ids = result
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    json!({"n": count, "ids": ids})
+}
+
+fn compact_prune_result(result: &Value) -> Value {
+    let dry_run = result
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let candidates = result
+        .get("candidates")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let deleted = result.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if dry_run {
+        json!({"dry": true, "n": candidates})
+    } else {
+        json!({"del": deleted})
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +778,117 @@ mod tests {
         assert!(formatted.contains("test-project"));
         assert!(formatted.contains("42"));
         assert!(formatted.contains("0.85"));
+    }
+
+    #[test]
+    fn test_compact_query_result() {
+        let result = json!({
+            "count": 2,
+            "memories": [
+                {
+                    "memory": {
+                        "id": "mem_123",
+                        "memory_type": "fact",
+                        "content": "This is a test memory",
+                        "summary": "Test memory",
+                        "tags": ["test"],
+                        "importance": 0.8
+                    },
+                    "score": 0.95,
+                    "semantic_score": 0.9,
+                    "keyword_score": 0.5
+                },
+                {
+                    "memory": {
+                        "id": "mem_456",
+                        "memory_type": "decision",
+                        "content": "Another memory",
+                        "tags": [],
+                        "importance": 0.5
+                    },
+                    "score": 0.75,
+                    "semantic_score": 0.7,
+                    "keyword_score": 0.3
+                }
+            ],
+            "contradiction_warnings": []
+        });
+
+        let compact = compact_tool_result("memory_query", &result);
+        let parsed: Value = serde_json::from_str(&compact).unwrap();
+
+        // Should have count as "n"
+        assert_eq!(parsed["n"], 2);
+        // Should have memories as "m"
+        assert!(parsed["m"].is_array());
+        assert_eq!(parsed["m"].as_array().unwrap().len(), 2);
+        // First memory should use short field names
+        assert_eq!(parsed["m"][0]["i"], "mem_123");
+        assert_eq!(parsed["m"][0]["t"], "fact");
+        assert_eq!(parsed["m"][0]["s"], "Test memory");
+        assert!(parsed["m"][0]["r"].as_f64().unwrap() > 0.9);
+        // Tags present for first, absent for second (empty)
+        assert!(parsed["m"][0]["g"].is_array());
+        assert!(parsed["m"][1].get("g").is_none());
+        // No contradiction warnings field when empty
+        assert!(parsed.get("w").is_none());
+    }
+
+    #[test]
+    fn test_compact_store_result() {
+        let result = json!({
+            "id": "mem_789",
+            "message": "Memory stored successfully",
+            "potential_contradictions": []
+        });
+
+        let compact = compact_tool_result("memory_store", &result);
+        let parsed: Value = serde_json::from_str(&compact).unwrap();
+
+        // Should just have id
+        assert_eq!(parsed["i"], "mem_789");
+        // No contradictions field when empty
+        assert!(parsed.get("c").is_none());
+    }
+
+    #[test]
+    fn test_compact_vs_full_size() {
+        // Simulate a typical query result
+        let full_result = json!({
+            "count": 3,
+            "memories": [
+                {
+                    "memory": {
+                        "id": "mem_001",
+                        "project_id": "test-project",
+                        "memory_type": "fact",
+                        "content": "The project uses Rust for the backend implementation",
+                        "summary": "Backend is Rust",
+                        "tags": ["architecture", "rust"],
+                        "importance": 0.8,
+                        "relevance_score": 0.95,
+                        "access_count": 5,
+                        "created_at": 1700000000,
+                        "updated_at": 1700000000,
+                        "last_accessed_at": 1700001000
+                    },
+                    "score": 0.92,
+                    "semantic_score": 0.88,
+                    "keyword_score": 0.45
+                }
+            ],
+            "contradiction_warnings": []
+        });
+
+        let full_json = serde_json::to_string(&full_result).unwrap();
+        let compact_json = compact_tool_result("memory_query", &full_result);
+
+        // Compact should be significantly smaller
+        assert!(
+            compact_json.len() < full_json.len() / 2,
+            "Compact ({}) should be less than half of full ({})",
+            compact_json.len(),
+            full_json.len()
+        );
     }
 }
