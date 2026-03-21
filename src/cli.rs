@@ -853,7 +853,7 @@ fn cmd_export(
         None
     };
 
-    let export_data = export::create_export(project_id, memories, relationships, embeddings);
+    let export_data = export::create_export(project_id, memories, relationships, embeddings, None);
 
     let json = serde_json::to_string_pretty(&export_data)?;
 

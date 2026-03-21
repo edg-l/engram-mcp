@@ -994,6 +994,7 @@ impl Database {
     /// Full-text search using FTS5 with BM25 scoring.
     /// Returns (memory_id, bm25_score) pairs sorted by relevance.
     /// The BM25 score is negated (SQLite returns negative values, we flip to positive).
+    #[allow(dead_code)]
     pub fn keyword_search(
         &self,
         project_id: &str,
@@ -1030,6 +1031,82 @@ impl Database {
         })?;
 
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Full-text search with branch filtering.
+    pub fn keyword_search_with_branch(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        branch_filter: Option<Option<&str>>,
+    ) -> Result<Vec<(String, f64)>, MemoryError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let escaped_query = Self::escape_fts_query(query);
+        if escaped_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(String, f64)> = match branch_filter {
+            None => {
+                // No branch filter
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, -bm25(memories_fts) as score
+                     FROM memories_fts
+                     JOIN memories m ON memories_fts.rowid = m.rowid
+                     WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                     ORDER BY score DESC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(params![escaped_query, project_id, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+            Some(None) => {
+                // Global only: branch IS NULL
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, -bm25(memories_fts) as score
+                     FROM memories_fts
+                     JOIN memories m ON memories_fts.rowid = m.rowid
+                     WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                       AND m.branch IS NULL
+                     ORDER BY score DESC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(params![escaped_query, project_id, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+            Some(Some(branch)) => {
+                // Global + specific branch
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, -bm25(memories_fts) as score
+                     FROM memories_fts
+                     JOIN memories m ON memories_fts.rowid = m.rowid
+                     WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                       AND (m.branch IS NULL OR m.branch = ?4)
+                     ORDER BY score DESC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(
+                    params![escaped_query, project_id, limit as i64, branch],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+                )?
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+        };
+
+        Ok(rows)
     }
 
     /// Escape special FTS5 query characters for safe searching.

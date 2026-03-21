@@ -29,6 +29,9 @@ pub struct ExportData {
     pub relationships: Vec<Relationship>,
     /// Export timestamp
     pub exported_at: i64,
+    /// Embedding model that produced the stored vectors
+    #[serde(default)]
+    pub model_version: Option<String>,
 }
 
 /// A memory with optional embedding data
@@ -100,6 +103,7 @@ pub fn create_export(
     memories: Vec<Memory>,
     relationships: Vec<Relationship>,
     embeddings: Option<Vec<(String, Vec<f32>)>>,
+    model_version: Option<String>,
 ) -> ExportData {
     let embedding_map: std::collections::HashMap<String, Vec<f32>> =
         embeddings.unwrap_or_default().into_iter().collect();
@@ -118,6 +122,7 @@ pub fn create_export(
         memories: exported_memories,
         relationships,
         exported_at: chrono::Utc::now().timestamp(),
+        model_version,
     }
 }
 
@@ -160,6 +165,7 @@ mod tests {
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
+            model_version: None,
         };
         assert!(validate_import(&valid).is_ok());
 
@@ -170,6 +176,7 @@ mod tests {
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
+            model_version: None,
         };
         assert!(validate_import(&valid_v1).is_ok());
 
@@ -179,6 +186,7 @@ mod tests {
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
+            model_version: None,
         };
         assert!(validate_import(&invalid).is_err());
     }

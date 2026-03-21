@@ -10,6 +10,9 @@ use crate::memory::MemoryType;
 /// Target embedding dimension (MRL truncation from 1024)
 const EMBED_DIM: usize = 256;
 
+const QUERY_PREFIX: &str = "search_query: ";
+const DOCUMENT_PREFIX: &str = "search_document: ";
+
 pub struct EmbeddingService {
     model: Arc<Mutex<TextEmbedding>>,
     model_version: String,
@@ -111,7 +114,8 @@ impl EmbeddingService {
         &self.model_version
     }
 
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
+    /// Embed raw text without any prefix.
+    fn embed_raw(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
         let mut model = self
             .model
             .lock()
@@ -130,24 +134,36 @@ impl EmbeddingService {
         Ok(embedding)
     }
 
+    /// Embed a search query (adds query prefix for asymmetric retrieval).
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
+        let prefixed = format!("{}{}", QUERY_PREFIX, text);
+        self.embed_raw(&prefixed)
+    }
+
+    /// Embed a memory for storage (adds document prefix for asymmetric retrieval).
     pub fn embed_memory(
         &self,
         memory_type: MemoryType,
         content: &str,
     ) -> Result<Vec<f32>, MemoryError> {
-        let text = format!("{}: {}", memory_type.as_str(), content);
-        self.embed(&text)
+        let text = format!("{}{}: {}", DOCUMENT_PREFIX, memory_type.as_str(), content);
+        self.embed_raw(&text)
     }
 
     #[allow(dead_code)] // Used by MCP server batch tools
     pub fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MemoryError> {
+        let prefixed: Vec<String> = texts
+            .into_iter()
+            .map(|t| format!("{}{}", DOCUMENT_PREFIX, t))
+            .collect();
+
         let mut model = self
             .model
             .lock()
             .map_err(|e| MemoryError::Embedding(format!("Failed to acquire lock: {}", e)))?;
 
         let mut embeddings = model
-            .embed(texts, None)
+            .embed(prefixed, None)
             .map_err(|e| MemoryError::Embedding(e.to_string()))?;
 
         for embedding in &mut embeddings {

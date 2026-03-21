@@ -214,6 +214,15 @@ fn default_dedup_threshold() -> f32 {
     0.90
 }
 
+/// Read dedup threshold from ENGRAM_DEDUP_THRESHOLD env var, clamped to [0.5, 1.0].
+fn dedup_threshold() -> f32 {
+    std::env::var("ENGRAM_DEDUP_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|v| v.clamp(0.5, 1.0))
+        .unwrap_or(0.90)
+}
+
 #[derive(Debug, Serialize)]
 pub struct MergeInfo {
     pub merged_with: String,
@@ -644,10 +653,10 @@ impl ToolHandler {
         // Fetch all embeddings once (reused for both dedup and contradiction checks)
         let pre_store_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
 
-        // Check for duplicates (>= 0.90 similarity, same type)
-        const DEDUP_THRESHOLD: f32 = 0.90;
+        // Check for duplicates (configurable via ENGRAM_DEDUP_THRESHOLD, default 0.90)
+        let dedup_threshold = dedup_threshold();
         let duplicates =
-            self.find_duplicates(&embedding, memory_type, DEDUP_THRESHOLD, &pre_store_embeddings)?;
+            self.find_duplicates(&embedding, memory_type, dedup_threshold, &pre_store_embeddings)?;
 
         // Store the new memory
         self.db.store_memory(&memory)?;
@@ -822,11 +831,14 @@ impl ToolHandler {
             scored.into_iter().collect()
         };
 
-        // Run keyword search (FTS5)
-        let keyword_results = self.db.keyword_search(
+        let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
+
+        // Run keyword search (FTS5) with branch filtering applied at the DB level
+        let keyword_results = self.db.keyword_search_with_branch(
             &self.project_id,
             &input.query,
             input.limit * 5, // Get more to ensure we have enough after filtering
+            branch_filter,
         )?;
 
         // Normalize keyword scores (BM25 scores can vary widely)
@@ -855,8 +867,6 @@ impl ToolHandler {
 
         // Calculate hybrid scores and build results
         let mut scored_results: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, combined, semantic, keyword)
-
-        let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
 
         for id in candidate_ids_vec.iter() {
             let Some(memory) = memories_map.get(id) else {
@@ -1377,8 +1387,13 @@ impl ToolHandler {
             None
         };
 
-        let export_data =
-            export::create_export(&self.project_id, memories, relationships, embeddings);
+        let export_data = export::create_export(
+            &self.project_id,
+            memories,
+            relationships,
+            embeddings,
+            Some(self.embedding.model_version().to_string()),
+        );
 
         Ok(json!(export_data))
     }
@@ -1390,6 +1405,20 @@ impl ToolHandler {
 
         // Validate version
         export::validate_import(&export_data).map_err(MemoryError::Embedding)?;
+
+        // Warn about embedding model version mismatch
+        let model_warning: Option<String> =
+            export_data.model_version.as_ref().and_then(|imported_model| {
+                if imported_model != self.embedding.model_version() {
+                    Some(format!(
+                        "Warning: embeddings were generated with '{}' but current model is '{}'. Re-embedding recommended.",
+                        imported_model,
+                        self.embedding.model_version()
+                    ))
+                } else {
+                    None
+                }
+            });
 
         let mode: ImportMode = input.mode.parse().unwrap_or(ImportMode::Merge);
 
@@ -1467,7 +1496,8 @@ impl ToolHandler {
                 stats.memories_imported,
                 stats.relationships_imported,
                 stats.memories_skipped + stats.relationships_skipped
-            )
+            ),
+            "model_warning": model_warning,
         }))
     }
 
@@ -1607,11 +1637,25 @@ impl ToolHandler {
                 let _ = self.db.record_access_batch(&memory_ids);
             }
 
+            // Build cluster stats for clusters that contributed results
+            let mut clusters_hit: Vec<Value> = Vec::new();
+            for (cluster_id, cluster_sim) in cluster_scores.iter().take(input.limit) {
+                if let Ok(Some(cluster)) = self.db.get_cluster(cluster_id) {
+                    clusters_hit.push(json!({
+                        "cluster_id": cluster_id,
+                        "summary": cluster.summary,
+                        "similarity": cluster_sim,
+                        "member_count": cluster.member_count,
+                    }));
+                }
+            }
+
             Ok(json!({
                 "context": input.context,
                 "count": memories.len(),
                 "memories": memories,
                 "retrieval_mode": "hierarchical",
+                "clusters_hit": clusters_hit,
             }))
         } else {
             // Flat retrieval (original behavior)
