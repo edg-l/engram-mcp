@@ -22,6 +22,7 @@ pub fn format_tool_result(tool_name: &str, result: &Value) -> String {
         "memory_context" => format_context_result(result),
         "memory_prune" => format_prune_result(result),
         "memory_promote" => format_promote_result(result),
+        "memory_dedup" => format_dedup_result(result),
         _ => format_fallback(result),
     }
 }
@@ -81,6 +82,23 @@ fn format_store_result(result: &Value) -> String {
                 sim * 100.0,
                 summary
             ));
+        }
+    }
+
+    // Show merge info if present
+    if let Some(merge_info) = result.get("merge_info") {
+        out.push_str("\n**Merged with duplicate:**\n");
+        if let Some(merged_with) = merge_info.get("merged_with").and_then(|v| v.as_str()) {
+            out.push_str(&format!("- Merged with: {}\n", merged_with));
+        }
+        if let Some(similarity) = merge_info.get("similarity").and_then(|v| v.as_f64()) {
+            out.push_str(&format!("- Similarity: {:.2}\n", similarity));
+        }
+        if let Some(preview) = merge_info
+            .get("old_content_preview")
+            .and_then(|v| v.as_str())
+        {
+            out.push_str(&format!("- Old content: {}\n", preview));
         }
     }
 
@@ -339,13 +357,18 @@ fn format_stats_result(result: &Value) -> String {
         .get("avg_relevance")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+    let cluster_count = result
+        .get("cluster_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     format!(
         "Project: {}\n\
          Memories: {}\n\
          Relationships: {}\n\
+         Clusters: {}\n\
          Avg relevance: {:.2}",
-        project, mem_count, rel_count, avg_rel
+        project, mem_count, rel_count, cluster_count, avg_rel
     )
 }
 
@@ -548,6 +571,49 @@ fn format_prune_result(result: &Value) -> String {
     }
 
     out
+}
+
+fn format_dedup_result(result: &Value) -> String {
+    let mut output = String::new();
+
+    let dry_run = result.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+    let threshold = result.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.9);
+    let groups = result.get("duplicate_groups").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = result.get("total_duplicates").and_then(|v| v.as_u64()).unwrap_or(0);
+    let merged = result.get("merged").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if dry_run {
+        output.push_str(&format!("## Dedup Scan (dry run, threshold: {:.2})\n\n", threshold));
+    } else {
+        output.push_str(&format!("## Dedup Results (threshold: {:.2})\n\n", threshold));
+    }
+
+    output.push_str(&format!("- Duplicate groups: {}\n", groups));
+    output.push_str(&format!("- Total duplicates: {}\n", total));
+    if !dry_run {
+        output.push_str(&format!("- Merged: {}\n", merged));
+    }
+
+    if let Some(group_list) = result.get("groups").and_then(|v| v.as_array()) {
+        for (i, group) in group_list.iter().enumerate() {
+            output.push_str(&format!("\n### Group {}\n", i + 1));
+            if let Some(members) = group.get("members").and_then(|v| v.as_array()) {
+                for member in members {
+                    let id = member.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sim = member.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let preview = member.get("content_preview").and_then(|v| v.as_str()).unwrap_or("");
+                    let mem_type = member.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                    output.push_str(&format!("- `{}` ({}) [{:.2}]: {}\n", id, mem_type, sim, preview));
+                }
+            }
+        }
+    }
+
+    if dry_run && total > 0 {
+        output.push_str("\n*Set `confirm: true` to merge duplicates.*\n");
+    }
+
+    output
 }
 
 /// Truncate a string to a maximum length, adding "..." if truncated.

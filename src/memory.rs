@@ -99,6 +99,13 @@ impl FromStr for RelationType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeSource {
+    pub id: String,
+    pub content_preview: String,
+    pub merged_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
     pub project_id: String,
@@ -115,6 +122,9 @@ pub struct Memory {
     /// Git branch this memory belongs to. NULL means global (visible on all branches).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Provenance tracking: IDs and previews of memories that were merged into this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_from: Option<Vec<MergeSource>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,4 +164,15 @@ pub struct ProjectStats {
     pub memory_count: usize,
     pub relationship_count: usize,
     pub avg_relevance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryCluster {
+    pub id: String,
+    pub project_id: String,
+    pub summary: String,
+    pub member_count: usize,
+    pub centroid: Option<Vec<f32>>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }

@@ -148,6 +148,198 @@ async fn run_decay_job(db_path: PathBuf, project_id: String) {
     }
 }
 
+/// Default re-clustering interval: 6 hours
+const RECLUSTER_INTERVAL_SECS: u64 = 21600;
+
+/// Run the background re-clustering job
+async fn run_recluster_job(db_path: PathBuf, project_id: String) {
+    let interval = Duration::from_secs(
+        std::env::var("ENGRAM_RECLUSTER_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(RECLUSTER_INTERVAL_SECS),
+    );
+
+    // Wait one interval before first run
+    tokio::time::sleep(interval).await;
+
+    loop {
+        match Database::open(&db_path) {
+            Ok(db) => {
+                match recluster_project(&db, &project_id) {
+                    Ok((merged, split)) => {
+                        if merged > 0 || split > 0 {
+                            tracing::debug!(
+                                "Re-clustering: merged {} clusters, split {} members",
+                                merged,
+                                split
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Re-clustering job failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Re-clustering job failed to open database: {}", e);
+            }
+        }
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Re-cluster a project: merge similar clusters, split divergent members.
+fn recluster_project(db: &Database, project_id: &str) -> Result<(usize, usize), MemoryError> {
+    use crate::embedding::cosine_similarity;
+
+    let clusters = db.get_clusters_for_project(project_id)?;
+    let mut merged_count = 0usize;
+    let mut split_count = 0usize;
+
+    // Build embedding map once (reused throughout)
+    let all_embeddings = db.get_all_embeddings_for_project(project_id)?;
+    let embedding_map: std::collections::HashMap<String, Vec<f32>> =
+        all_embeddings.into_iter().collect();
+
+    // Phase 1: Merge similar clusters (centroid similarity >= 0.80)
+    let mut skip_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in 0..clusters.len() {
+        if skip_ids.contains(&clusters[i].id) {
+            continue;
+        }
+        let Some(ref centroid_i) = clusters[i].centroid else {
+            continue;
+        };
+
+        for j in (i + 1)..clusters.len() {
+            if skip_ids.contains(&clusters[j].id) {
+                continue;
+            }
+            let Some(ref centroid_j) = clusters[j].centroid else {
+                continue;
+            };
+
+            let similarity = cosine_similarity(centroid_i, centroid_j);
+            if similarity >= 0.80 {
+                // Merge cluster j into cluster i
+                let member_ids = db.get_cluster_member_ids(&clusters[j].id)?;
+                for member_id in &member_ids {
+                    db.remove_from_cluster(member_id)?;
+                    db.add_to_cluster(&clusters[i].id, member_id)?;
+                }
+                skip_ids.insert(clusters[j].id.clone());
+                merged_count += 1;
+            }
+        }
+    }
+
+    // Phase 2: Recalculate centroids after merges (before split evaluation)
+    recalculate_all_centroids(db, project_id, &embedding_map)?;
+    db.delete_empty_clusters(project_id)?;
+
+    // Phase 3: Split divergent members (similarity to centroid < 0.50)
+    // Use fresh clusters with updated centroids
+    let updated_clusters = db.get_clusters_for_project(project_id)?;
+    for cluster in &updated_clusters {
+        let Some(ref centroid) = cluster.centroid else {
+            continue;
+        };
+
+        let member_ids = db.get_cluster_member_ids(&cluster.id)?;
+        for member_id in &member_ids {
+            if let Some(member_embedding) = embedding_map.get(member_id) {
+                let similarity = cosine_similarity(centroid, member_embedding);
+                if similarity < 0.50 {
+                    db.remove_from_cluster(member_id)?;
+                    split_count += 1;
+
+                    // Try to find a better cluster
+                    let mut best_match: Option<(String, f32)> = None;
+                    for other_cluster in &updated_clusters {
+                        if other_cluster.id == cluster.id {
+                            continue;
+                        }
+                        if let Some(ref other_centroid) = other_cluster.centroid {
+                            let sim = cosine_similarity(member_embedding, other_centroid);
+                            if sim >= 0.75
+                                && (best_match.is_none()
+                                    || sim > best_match.as_ref().unwrap().1)
+                            {
+                                best_match = Some((other_cluster.id.clone(), sim));
+                            }
+                        }
+                    }
+
+                    if let Some((better_cluster_id, _)) = best_match {
+                        db.add_to_cluster(&better_cluster_id, member_id)?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 4: Final cleanup
+    db.delete_empty_clusters(project_id)?;
+    recalculate_all_centroids(db, project_id, &embedding_map)?;
+
+    Ok((merged_count, split_count))
+}
+
+/// Recalculate centroids and summaries for all clusters in a project.
+fn recalculate_all_centroids(
+    db: &Database,
+    project_id: &str,
+    embedding_map: &std::collections::HashMap<String, Vec<f32>>,
+) -> Result<(), MemoryError> {
+    let clusters = db.get_clusters_for_project(project_id)?;
+    for cluster in &clusters {
+        let member_ids = db.get_cluster_member_ids(&cluster.id)?;
+        if member_ids.is_empty() {
+            continue;
+        }
+
+        // Compute new centroid
+        let mut sum: Option<Vec<f32>> = None;
+        let mut count = 0usize;
+        for member_id in &member_ids {
+            if let Some(emb) = embedding_map.get(member_id) {
+                count += 1;
+                match &mut sum {
+                    None => sum = Some(emb.clone()),
+                    Some(s) => {
+                        for (i, v) in emb.iter().enumerate() {
+                            if i < s.len() {
+                                s[i] += v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mut centroid) = sum {
+            let c = count as f32;
+            for v in &mut centroid {
+                *v /= c;
+            }
+            let members_map = db.get_memories_batch(&member_ids)?;
+            let best_member = members_map.values().max_by(|a, b| {
+                a.importance
+                    .partial_cmp(&b.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let summary = best_member
+                .map(|m| crate::summarize::extract_first_sentence(&m.content))
+                .unwrap_or_else(|| "Cluster".to_string());
+
+            db.update_cluster_centroid(&cluster.id, &centroid, &summary)?;
+        }
+    }
+    Ok(())
+}
+
 struct MemoryServer {
     tool_handler: Arc<RwLock<Option<ToolHandler>>>,
     db_path: PathBuf,
@@ -504,6 +696,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decay_project_id = project_id.clone();
     tokio::spawn(async move {
         run_decay_job(decay_db_path, decay_project_id).await;
+    });
+
+    // Spawn background re-clustering job
+    let recluster_db_path = db_path.clone();
+    let recluster_project_id = project_id.clone();
+    tokio::spawn(async move {
+        run_recluster_job(recluster_db_path, recluster_project_id).await;
     });
 
     let server = MemoryServer::new(db_path, project_id, current_branch);

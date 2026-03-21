@@ -60,6 +60,7 @@ mod tests {
             updated_at: now - (days_ago * 86400),
             last_accessed_at: now - (days_ago * 86400),
             branch: None,
+            merged_from: None,
         }
     }
 

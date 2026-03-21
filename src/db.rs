@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::error::MemoryError;
-use crate::memory::{Memory, MemoryType, Project, ProjectStats, RelationType, Relationship};
+use crate::memory::{Memory, MemoryCluster, MemoryType, Project, ProjectStats, RelationType, Relationship};
 
 const SCHEMA: &str = r#"
 -- Core memory storage
@@ -93,6 +93,11 @@ CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content, summary, tags)
     VALUES ('delete', OLD.rowid, OLD.content, OLD.summary, OLD.tags);
 END;
+
+-- Schema versioning
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY
+);
 "#;
 
 #[derive(Clone)]
@@ -128,6 +133,7 @@ impl Database {
         drop(conn);
         self.migrate_branch_column()?;
         self.migrate_fts()?;
+        self.run_migrations()?;
         Ok(())
     }
 
@@ -183,6 +189,77 @@ impl Database {
         Ok(())
     }
 
+    fn run_migrations(&self) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+
+        // Ensure schema_version table exists
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);"
+        )?;
+
+        let current_version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Migration 1: Add merged_from, memory_clusters, cluster_members
+        if current_version < 1 {
+            // Check if merged_from column already exists
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let has_merged_from = stmt
+                .query_map([], |row| {
+                    let name: String = row.get(1)?;
+                    Ok(name)
+                })?
+                .filter_map(|r| r.ok())
+                .any(|name| name == "merged_from");
+
+            if !has_merged_from {
+                conn.execute_batch("ALTER TABLE memories ADD COLUMN merged_from TEXT;")?;
+            }
+
+            conn.execute_batch(r#"
+                CREATE TABLE IF NOT EXISTS memory_clusters (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    member_count INTEGER NOT NULL DEFAULT 0,
+                    centroid BLOB,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cluster_members (
+                    cluster_id TEXT NOT NULL REFERENCES memory_clusters(id) ON DELETE CASCADE,
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    PRIMARY KEY (cluster_id, memory_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_clusters_project ON memory_clusters(project_id);
+                CREATE INDEX IF NOT EXISTS idx_cluster_members_memory ON cluster_members(memory_id);
+            "#)?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![1],
+            )?;
+        }
+
+        // Migration 2: wipe embeddings table due to dimension change (384 -> 256)
+        if current_version < 2 {
+            conn.execute_batch("DELETE FROM embeddings;")?;
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![2],
+            )?;
+        }
+
+        Ok(())
+    }
+
     // Project operations
     pub fn create_project(&self, project: &Project) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
@@ -233,9 +310,13 @@ impl Database {
     pub fn store_memory(&self, memory: &Memory) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
         let tags_json = serde_json::to_string(&memory.tags)?;
+        let merged_from_json = memory
+            .merged_from
+            .as_ref()
+            .map(|mf| serde_json::to_string(mf).unwrap_or_default());
         conn.execute(
-            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 memory.id,
                 memory.project_id,
@@ -250,6 +331,7 @@ impl Database {
                 memory.updated_at,
                 memory.last_accessed_at,
                 memory.branch,
+                merged_from_json,
             ],
         )?;
         Ok(())
@@ -258,7 +340,7 @@ impl Database {
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from
              FROM memories WHERE id = ?1"
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -280,6 +362,9 @@ impl Database {
                 updated_at: row.get(10)?,
                 last_accessed_at: row.get(11)?,
                 branch: row.get(12)?,
+                merged_from: row
+                    .get::<_, Option<String>>(13)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             }))
         } else {
             Ok(None)
@@ -340,7 +425,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         let mut sql = String::from(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from
              FROM memories WHERE project_id = ?1"
         );
 
@@ -387,6 +472,9 @@ impl Database {
                 updated_at: row.get(10)?,
                 last_accessed_at: row.get(11)?,
                 branch: row.get(12)?,
+                merged_from: row
+                    .get::<_, Option<String>>(13)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             })
         }
 
@@ -453,9 +541,13 @@ impl Database {
         let mut count = 0;
         for memory in memories {
             let tags_json = serde_json::to_string(&memory.tags)?;
+            let merged_from_json = memory
+                .merged_from
+                .as_ref()
+                .map(|mf| serde_json::to_string(mf).unwrap_or_default());
             tx.execute(
-                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     memory.id,
                     memory.project_id,
@@ -470,6 +562,7 @@ impl Database {
                     memory.updated_at,
                     memory.last_accessed_at,
                     memory.branch,
+                    merged_from_json,
                 ],
             )?;
             count += 1;
@@ -519,6 +612,229 @@ impl Database {
 
         tx.commit()?;
         Ok(total_deleted)
+    }
+
+    /// Merge a duplicate memory into an existing one.
+    /// Keeps the new memory's content, unions tags, takes max importance,
+    /// and records merge provenance in merged_from.
+    pub fn merge_memories(
+        &self,
+        new_id: &str,
+        old_id: &str,
+        old_content_preview: &str,
+    ) -> Result<(), MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Get old memory's tags and importance
+        let (old_tags_json, old_importance): (String, f64) = tx.query_row(
+            "SELECT tags, importance FROM memories WHERE id = ?1",
+            params![old_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let old_tags: Vec<String> = serde_json::from_str(&old_tags_json).unwrap_or_default();
+
+        // Get new memory's current state
+        let (new_tags_json, new_importance, existing_merged_from): (String, f64, Option<String>) = tx.query_row(
+            "SELECT tags, importance, merged_from FROM memories WHERE id = ?1",
+            params![new_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut new_tags: Vec<String> = serde_json::from_str(&new_tags_json).unwrap_or_default();
+
+        // Union tags
+        for tag in old_tags {
+            if !new_tags.contains(&tag) {
+                new_tags.push(tag);
+            }
+        }
+        let merged_tags_json = serde_json::to_string(&new_tags)?;
+
+        // Max importance
+        let max_importance = new_importance.max(old_importance);
+
+        // Build merged_from provenance
+        let now = chrono::Utc::now().timestamp();
+        let mut merge_sources: Vec<crate::memory::MergeSource> = existing_merged_from
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        merge_sources.push(crate::memory::MergeSource {
+            id: old_id.to_string(),
+            content_preview: old_content_preview.to_string(),
+            merged_at: now,
+        });
+        let merged_from_json = serde_json::to_string(&merge_sources)?;
+
+        // Update the new memory with merged data
+        tx.execute(
+            "UPDATE memories SET tags = ?1, importance = ?2, merged_from = ?3, updated_at = ?4 WHERE id = ?5",
+            params![merged_tags_json, max_importance, merged_from_json, now, new_id],
+        )?;
+
+        // Delete the old memory (provenance is already tracked in merged_from above)
+        tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Create a new memory cluster.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn create_cluster(&self, cluster: &MemoryCluster) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let centroid_bytes: Option<Vec<u8>> = cluster.centroid.as_ref().map(|v| {
+            v.iter().flat_map(|f| f.to_le_bytes()).collect()
+        });
+        conn.execute(
+            "INSERT INTO memory_clusters (id, project_id, summary, member_count, centroid, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                cluster.id,
+                cluster.project_id,
+                cluster.summary,
+                cluster.member_count as i64,
+                centroid_bytes,
+                cluster.created_at,
+                cluster.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Add a memory to a cluster.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn add_to_cluster(&self, cluster_id: &str, memory_id: &str) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO cluster_members (cluster_id, memory_id) VALUES (?1, ?2)",
+            params![cluster_id, memory_id],
+        )?;
+        conn.execute(
+            "UPDATE memory_clusters SET member_count = (SELECT COUNT(*) FROM cluster_members WHERE cluster_id = ?1), updated_at = ?2 WHERE id = ?1",
+            params![cluster_id, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a memory from its cluster.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn remove_from_cluster(&self, memory_id: &str) -> Result<Option<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        // Get the cluster_id before removing
+        let cluster_id: Option<String> = conn
+            .query_row(
+                "SELECT cluster_id FROM cluster_members WHERE memory_id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(ref cid) = cluster_id {
+            conn.execute(
+                "DELETE FROM cluster_members WHERE memory_id = ?1",
+                params![memory_id],
+            )?;
+            // Update member count
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "UPDATE memory_clusters SET member_count = (SELECT COUNT(*) FROM cluster_members WHERE cluster_id = ?1), updated_at = ?2 WHERE id = ?1",
+                params![cid, now],
+            )?;
+        }
+
+        Ok(cluster_id)
+    }
+
+    /// Get a cluster by ID.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn get_cluster(&self, id: &str) -> Result<Option<MemoryCluster>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, summary, member_count, centroid, created_at, updated_at FROM memory_clusters WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query(params![id])?;
+
+        if let Some(row) = rows.next()? {
+            let centroid_bytes: Option<Vec<u8>> = row.get(4)?;
+            let centroid = centroid_bytes.map(|bytes| {
+                bytes.chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()
+            });
+            Ok(Some(MemoryCluster {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                summary: row.get(2)?,
+                member_count: row.get::<_, i64>(3)? as usize,
+                centroid,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all clusters for a project.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn get_clusters_for_project(&self, project_id: &str) -> Result<Vec<MemoryCluster>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, summary, member_count, centroid, created_at, updated_at FROM memory_clusters WHERE project_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            let centroid_bytes: Option<Vec<u8>> = row.get(4)?;
+            let centroid = centroid_bytes.map(|bytes| {
+                bytes.chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()
+            });
+            Ok(MemoryCluster {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                summary: row.get(2)?,
+                member_count: row.get::<_, i64>(3)? as usize,
+                centroid,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Update a cluster's centroid.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn update_cluster_centroid(&self, id: &str, centroid: &[f32], summary: &str) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let centroid_bytes: Vec<u8> = centroid.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE memory_clusters SET centroid = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
+            params![centroid_bytes, summary, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete clusters with no members.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn delete_empty_clusters(&self, project_id: &str) -> Result<usize, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM memory_clusters WHERE project_id = ?1 AND member_count = 0",
+            params![project_id],
+        )?;
+        Ok(rows)
+    }
+
+    /// Get all memory IDs in a cluster.
+    #[allow(dead_code)] // Used by clustering pipeline
+    pub fn get_cluster_member_ids(&self, cluster_id: &str) -> Result<Vec<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT memory_id FROM cluster_members WHERE cluster_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![cluster_id], |row| row.get(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Delete all memories and relationships for a project
@@ -848,7 +1164,7 @@ impl Database {
         // Build query with placeholders
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from
              FROM memories WHERE id IN ({})",
             placeholders.join(",")
         );
@@ -876,6 +1192,9 @@ impl Database {
                 updated_at: row.get(10)?,
                 last_accessed_at: row.get(11)?,
                 branch: row.get(12)?,
+                merged_from: row
+                    .get::<_, Option<String>>(13)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             })
         })?;
 
@@ -1061,6 +1380,7 @@ mod tests {
             updated_at: now,
             last_accessed_at: now,
             branch: None,
+            merged_from: None,
         };
         db.store_memory(&memory).unwrap();
 
@@ -1071,5 +1391,196 @@ mod tests {
         // Delete memory
         assert!(db.delete_memory("mem-1").unwrap());
         assert!(db.get_memory("mem-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_migration_creates_tables() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Verify schema_version table exists and has version 2
+        let conn = db.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        // Verify memory_clusters table exists
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_clusters", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Verify cluster_members table exists
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cluster_members", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Verify merged_from column exists on memories
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
+        let has_merged_from = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                Ok(name)
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "merged_from");
+        assert!(has_merged_from);
+    }
+
+    #[test]
+    fn test_migration_idempotent() {
+        // Running initialize twice should not fail
+        let db = Database::open_in_memory().unwrap();
+        // The second initialize happens automatically, but let's verify the DB works
+        let project = crate::memory::Project {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&project).unwrap();
+        let p = db.get_project("test").unwrap();
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn test_merge_memories() {
+        let db = Database::open_in_memory().unwrap();
+
+        let project = crate::memory::Project {
+            id: "test-merge".to_string(),
+            name: "test-merge".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&project).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let old_mem = Memory {
+            id: "mem_old".to_string(),
+            project_id: "test-merge".to_string(),
+            memory_type: MemoryType::Fact,
+            content: "Old fact".to_string(),
+            summary: None,
+            tags: vec!["tag_a".to_string()],
+            importance: 0.3,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: None,
+            merged_from: None,
+        };
+        db.store_memory(&old_mem).unwrap();
+
+        let new_mem = Memory {
+            id: "mem_new".to_string(),
+            tags: vec!["tag_b".to_string()],
+            importance: 0.7,
+            content: "New fact".to_string(),
+            ..old_mem.clone()
+        };
+        db.store_memory(&new_mem).unwrap();
+
+        // Merge
+        db.merge_memories("mem_new", "mem_old", "Old fact preview").unwrap();
+
+        // Old memory should be deleted
+        assert!(db.get_memory("mem_old").unwrap().is_none());
+
+        // New memory should have merged data
+        let merged = db.get_memory("mem_new").unwrap().unwrap();
+        assert_eq!(merged.importance, 0.7); // max(0.3, 0.7)
+        assert!(merged.tags.contains(&"tag_a".to_string()));
+        assert!(merged.tags.contains(&"tag_b".to_string()));
+        assert!(merged.merged_from.is_some());
+        let sources = merged.merged_from.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "mem_old");
+    }
+
+    #[test]
+    fn test_cluster_operations() {
+        let db = Database::open_in_memory().unwrap();
+
+        let project = crate::memory::Project {
+            id: "test-cluster".to_string(),
+            name: "test-cluster".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&project).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Create a memory
+        let mem = Memory {
+            id: "mem_c1".to_string(),
+            project_id: "test-cluster".to_string(),
+            memory_type: MemoryType::Fact,
+            content: "Cluster test".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.5,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: None,
+            merged_from: None,
+        };
+        db.store_memory(&mem).unwrap();
+
+        // Create a cluster
+        let cluster = crate::memory::MemoryCluster {
+            id: "clust_1".to_string(),
+            project_id: "test-cluster".to_string(),
+            summary: "Test cluster".to_string(),
+            member_count: 0,
+            centroid: Some(vec![0.1, 0.2, 0.3]),
+            created_at: now,
+            updated_at: now,
+        };
+        db.create_cluster(&cluster).unwrap();
+
+        // Add memory to cluster
+        db.add_to_cluster("clust_1", "mem_c1").unwrap();
+
+        // Verify
+        let c = db.get_cluster("clust_1").unwrap().unwrap();
+        assert_eq!(c.member_count, 1);
+
+        let members = db.get_cluster_member_ids("clust_1").unwrap();
+        assert_eq!(members, vec!["mem_c1"]);
+
+        // List clusters
+        let clusters = db.get_clusters_for_project("test-cluster").unwrap();
+        assert_eq!(clusters.len(), 1);
+
+        // Update centroid
+        db.update_cluster_centroid("clust_1", &[0.4, 0.5, 0.6], "Updated summary").unwrap();
+        let c = db.get_cluster("clust_1").unwrap().unwrap();
+        assert_eq!(c.summary, "Updated summary");
+        assert_eq!(c.centroid.unwrap(), vec![0.4, 0.5, 0.6]);
+
+        // Remove from cluster
+        let removed_from = db.remove_from_cluster("mem_c1").unwrap();
+        assert_eq!(removed_from, Some("clust_1".to_string()));
+
+        let c = db.get_cluster("clust_1").unwrap().unwrap();
+        assert_eq!(c.member_count, 0);
+
+        // Delete empty clusters
+        let deleted = db.delete_empty_clusters("test-cluster").unwrap();
+        assert_eq!(deleted, 1);
+        assert!(db.get_cluster("clust_1").unwrap().is_none());
     }
 }

@@ -159,6 +159,15 @@ enum Commands {
         /// Memory ID to promote
         id: String,
     },
+    /// Find and merge duplicate memories
+    Dedup {
+        /// Similarity threshold (default: 0.90)
+        #[arg(short, long, default_value = "0.90")]
+        threshold: f32,
+        /// Actually merge (default: dry run)
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -274,6 +283,7 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
             | Commands::Store { .. }
             | Commands::Update { .. }
             | Commands::Import { .. }
+            | Commands::Dedup { .. }
     )
 }
 
@@ -409,6 +419,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Promote { id } => {
             cmd_promote(&db, &id)?;
+        }
+        Commands::Dedup { threshold, confirm } => {
+            cmd_dedup(
+                &db,
+                &project_id,
+                embedding_service.as_ref().unwrap(),
+                threshold,
+                confirm,
+            )?;
         }
     }
 
@@ -712,6 +731,7 @@ fn cmd_store(
         updated_at: now,
         last_accessed_at: now,
         branch: branch.clone(),
+        merged_from: None,
     };
 
     db.store_memory(&memory)?;
@@ -1005,6 +1025,116 @@ fn cmd_promote(db: &Database, id: &str) -> Result<(), MemoryError> {
         );
     } else {
         println!("Failed to promote memory {}", id);
+    }
+
+    Ok(())
+}
+
+fn cmd_dedup(
+    db: &Database,
+    project_id: &str,
+    _embedding_service: &EmbeddingService,
+    threshold: f32,
+    confirm: bool,
+) -> Result<(), MemoryError> {
+    let all_embeddings = db.get_all_embeddings_for_project(project_id)?;
+
+    // Find duplicate groups
+    let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut groups: Vec<Vec<(String, f32)>> = Vec::new();
+
+    for i in 0..all_embeddings.len() {
+        let (ref id_i, ref vec_i) = all_embeddings[i];
+        if processed.contains(id_i) {
+            continue;
+        }
+
+        let mem_i = match db.get_memory(id_i)? {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let mut group = vec![(id_i.clone(), 1.0_f32)];
+
+        for (id_j, vec_j) in all_embeddings.iter().skip(i + 1) {
+            if processed.contains(id_j) {
+                continue;
+            }
+
+            let similarity = crate::embedding::cosine_similarity(vec_i, vec_j);
+            if similarity >= threshold
+                && let Some(mem_j) = db.get_memory(id_j)?
+                && mem_j.memory_type == mem_i.memory_type
+            {
+                group.push((id_j.clone(), similarity));
+            }
+        }
+
+        if group.len() > 1 {
+            for (id, _) in &group {
+                processed.insert(id.clone());
+            }
+            groups.push(group);
+        }
+    }
+
+    if groups.is_empty() {
+        println!("No duplicates found at threshold {:.2}", threshold);
+        return Ok(());
+    }
+
+    println!("Found {} duplicate groups:", groups.len());
+    for (gi, group) in groups.iter().enumerate() {
+        println!("\n  Group {}:", gi + 1);
+        for (id, sim) in group {
+            if let Some(mem) = db.get_memory(id)? {
+                let preview: String = mem.content.chars().take(80).collect();
+                println!(
+                    "    [{:.2}] {} ({}) - {}",
+                    sim,
+                    id,
+                    mem.memory_type.as_str(),
+                    preview
+                );
+            }
+        }
+    }
+
+    if confirm {
+        let mut merged_count = 0;
+        for group in &groups {
+            let mut with_time: Vec<(String, f32, i64)> = group
+                .iter()
+                .filter_map(|(id, sim)| {
+                    db.get_memory(id)
+                        .ok()
+                        .flatten()
+                        .map(|m| (id.clone(), *sim, m.updated_at))
+                })
+                .collect();
+            with_time.sort_by(|a, b| b.2.cmp(&a.2));
+
+            if with_time.len() < 2 {
+                continue;
+            }
+
+            let keeper_id = with_time[0].0.clone();
+            for (old_id, _, _) in &with_time[1..] {
+                let old_preview: String = db
+                    .get_memory(old_id)?
+                    .map(|m| m.content.chars().take(100).collect())
+                    .unwrap_or_default();
+                db.merge_memories(&keeper_id, old_id, &old_preview)?;
+                merged_count += 1;
+            }
+        }
+        println!("\nMerged {} duplicate memories.", merged_count);
+    } else {
+        let total_dups: usize = groups.iter().map(|g| g.len() - 1).sum();
+        println!(
+            "\n{} duplicates would be merged. Use --confirm to merge.",
+            total_dups
+        );
     }
 
     Ok(())

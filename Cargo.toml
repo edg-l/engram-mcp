@@ -24,6 +24,7 @@ serde_json = "1.0"
 uuid = { version = "1.22", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 fastembed = "5"
+hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"] }
 thiserror = "2.0"
 dirs = "6.0"
 tracing = "0.1"

@@ -55,7 +55,7 @@ pub fn generate_summary(content: &str) -> String {
 }
 
 /// Extract the first sentence from content.
-fn extract_first_sentence(content: &str) -> String {
+pub fn extract_first_sentence(content: &str) -> String {
     let content = content.trim();
 
     // Find sentence boundary (., !, ?)
@@ -90,7 +90,7 @@ fn extract_first_sentence(content: &str) -> String {
 }
 
 /// Extract top N keywords from content using simple TF scoring.
-fn extract_keywords(content: &str, n: usize) -> Vec<String> {
+pub fn extract_keywords(content: &str, n: usize) -> Vec<String> {
     let mut word_counts: HashMap<String, usize> = HashMap::new();
 
     // Tokenize and count words

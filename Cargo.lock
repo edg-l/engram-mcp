@@ -685,6 +685,7 @@ dependencies = [
  "clap",
  "dirs",
  "fastembed",
+ "hf-hub",
  "moka",
  "rmcp",
  "rusqlite",

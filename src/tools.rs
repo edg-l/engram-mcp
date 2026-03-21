@@ -163,6 +163,9 @@ pub struct MemoryContextInput {
     /// Filter by memory types
     #[serde(default)]
     pub types: Vec<String>,
+    /// Enable hierarchical retrieval via clusters (default: true)
+    #[serde(default = "default_hierarchical")]
+    pub hierarchical: bool,
 }
 
 fn default_context_limit() -> usize {
@@ -171,6 +174,10 @@ fn default_context_limit() -> usize {
 
 fn default_context_min_score() -> f64 {
     0.3
+}
+
+fn default_hierarchical() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +200,27 @@ pub struct MemoryPromoteInput {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MemoryDedupInput {
+    /// Similarity threshold for duplicate detection (default: 0.90)
+    #[serde(default = "default_dedup_threshold")]
+    pub threshold: f32,
+    /// If true, execute merges. If false (default), dry run.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+fn default_dedup_threshold() -> f32 {
+    0.90
+}
+
+#[derive(Debug, Serialize)]
+pub struct MergeInfo {
+    pub merged_with: String,
+    pub similarity: f64,
+    pub old_content_preview: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MemoryStoreResult {
     pub id: String,
@@ -201,6 +229,8 @@ pub struct MemoryStoreResult {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub potential_contradictions: Vec<PotentialContradiction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_info: Option<MergeInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,7 +432,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "context": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    "types": {"type": "array", "items": {"type": "string"}}
+                    "types": {"type": "array", "items": {"type": "string"}},
+                    "hierarchical": {"type": "boolean", "description": "Use cluster-based retrieval (default true)"}
                 },
                 "required": ["context"]
             })),
@@ -427,6 +458,17 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "id": {"type": "string", "description": "Memory ID to promote"}
                 },
                 "required": ["id"]
+            })),
+        ),
+        Tool::new(
+            "memory_dedup",
+            "Find and merge duplicate memories (dry run by default).",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "threshold": {"type": "number", "minimum": 0.5, "maximum": 1.0, "description": "Similarity threshold (default 0.90)"},
+                    "confirm": {"type": "boolean", "description": "Set true to execute merges"}
+                }
             })),
         ),
     ]
@@ -481,9 +523,56 @@ impl ToolHandler {
         &self.project_id
     }
 
+    /// Convert branch_mode string to the Option<Option<&str>> format for DB queries.
+    /// - "current" -> global + current branch (falls back to "all" if no branch detected)
+    /// - "global" -> global only (branch IS NULL)
+    /// - "all" -> no filter
+    /// - other -> global + that specific branch
+    fn branch_mode_to_filter<'a>(&'a self, branch_mode: &'a str) -> Option<Option<&'a str>> {
+        match branch_mode {
+            "all" => None,
+            "global" => Some(None),
+            "current" => {
+                match self.current_branch.as_deref() {
+                    Some(branch) => Some(Some(branch)),
+                    None => None, // Fall back to "all" if no branch detected
+                }
+            }
+            specific => Some(Some(specific)),
+        }
+    }
+
     /// Invalidate search result cache (call after memory modifications).
     fn invalidate_search_cache(&self) {
         self.search_cache.invalidate_project(&self.project_id);
+    }
+
+    /// Find memories that are potential duplicates of the given embedding.
+    /// Returns (memory_id, similarity) pairs where similarity >= threshold and same type.
+    fn find_duplicates(
+        &self,
+        embedding: &[f32],
+        memory_type: MemoryType,
+        threshold: f32,
+        existing_embeddings: &[(String, Vec<f32>)],
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        let mut duplicates = Vec::new();
+
+        for (existing_id, existing_vec) in existing_embeddings {
+            let similarity = cosine_similarity(embedding, existing_vec);
+            if similarity >= threshold {
+                // Check same memory type
+                if let Ok(Some(mem)) = self.db.get_memory(existing_id)
+                    && mem.memory_type == memory_type
+                {
+                    duplicates.push((existing_id.clone(), similarity));
+                }
+            }
+        }
+
+        // Sort by similarity descending
+        duplicates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(duplicates)
     }
 
     pub fn handle_tool(&self, name: &str, arguments: Value) -> Result<Value, MemoryError> {
@@ -502,6 +591,7 @@ impl ToolHandler {
             "memory_context" => self.memory_context(arguments),
             "memory_prune" => self.memory_prune(arguments),
             "memory_promote" => self.memory_promote(arguments),
+            "memory_dedup" => self.memory_dedup(arguments),
             _ => Ok(json!({"error": format!("Unknown tool: {}", name)})),
         }
     }
@@ -545,38 +635,68 @@ impl ToolHandler {
             updated_at: now,
             last_accessed_at: now,
             branch: branch.clone(),
+            merged_from: None,
         };
 
-        // Generate embedding first to check for potential contradictions
+        // Generate embedding first to check for duplicates
         let embedding = self.embedding.embed_memory(memory_type, &input.content)?;
 
-        // Check for potential contradictions (high similarity with existing memories)
-        let existing_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
-        let mut potential_contradictions: Vec<PotentialContradiction> = Vec::new();
+        // Fetch all embeddings once (reused for both dedup and contradiction checks)
+        let pre_store_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
 
-        // Threshold for flagging potential contradictions (very high similarity)
-        const CONTRADICTION_THRESHOLD: f32 = 0.85;
+        // Check for duplicates (>= 0.90 similarity, same type)
+        const DEDUP_THRESHOLD: f32 = 0.90;
+        let duplicates =
+            self.find_duplicates(&embedding, memory_type, DEDUP_THRESHOLD, &pre_store_embeddings)?;
 
-        for (existing_id, existing_vec) in &existing_embeddings {
-            let similarity = cosine_similarity(&embedding, existing_vec);
-            if similarity >= CONTRADICTION_THRESHOLD {
-                // High similarity - might be contradicting or duplicating
-                if let Ok(Some(existing_memory)) = self.db.get_memory(existing_id) {
-                    potential_contradictions.push(PotentialContradiction {
-                        memory_id: existing_id.clone(),
-                        summary: existing_memory
-                            .summary
-                            .unwrap_or_else(|| existing_memory.content.chars().take(100).collect()),
-                        similarity: similarity as f64,
-                    });
-                }
-            }
-        }
-
+        // Store the new memory
         self.db.store_memory(&memory)?;
-
         self.db
             .store_embedding(&id, &embedding, self.embedding.model_version())?;
+
+        // If duplicate found, merge (keep new, absorb old)
+        let mut merge_info: Option<MergeInfo> = None;
+        if let Some((dup_id, dup_similarity)) = duplicates.first() {
+            let old_preview: String = self
+                .db
+                .get_memory(dup_id)?
+                .map(|m| m.content.chars().take(100).collect())
+                .unwrap_or_default();
+
+            self.db.merge_memories(&id, dup_id, &old_preview)?;
+
+            merge_info = Some(MergeInfo {
+                merged_with: dup_id.clone(),
+                similarity: *dup_similarity as f64,
+                old_content_preview: old_preview,
+            });
+        }
+
+        // Check for contradictions using pre-fetched embeddings, excluding self and any merged duplicate
+        let mut potential_contradictions: Vec<PotentialContradiction> = Vec::new();
+        const CONTRADICTION_THRESHOLD: f32 = 0.85;
+        let merged_id: Option<&str> = merge_info.as_ref().map(|mi| mi.merged_with.as_str());
+
+        for (existing_id, existing_vec) in &pre_store_embeddings {
+            if existing_id.as_str() == id.as_str() {
+                continue; // Skip self
+            }
+            if merged_id == Some(existing_id.as_str()) {
+                continue; // Skip the merged-away duplicate
+            }
+            let similarity = cosine_similarity(&embedding, existing_vec);
+            if similarity >= CONTRADICTION_THRESHOLD
+                && let Ok(Some(existing_memory)) = self.db.get_memory(existing_id)
+            {
+                potential_contradictions.push(PotentialContradiction {
+                    memory_id: existing_id.clone(),
+                    summary: existing_memory
+                        .summary
+                        .unwrap_or_else(|| existing_memory.content.chars().take(100).collect()),
+                    similarity: similarity as f64,
+                });
+            }
+        }
 
         // Create relationships to related memories
         for related_id in input.related_to {
@@ -591,10 +711,15 @@ impl ToolHandler {
             self.db.create_relationship(&rel)?;
         }
 
+        // Assign to cluster
+        let _cluster_id = self.assign_to_cluster(&id, &embedding, &input.content, memory.importance)?;
+
         // Invalidate search cache since we added new data
         self.invalidate_search_cache();
 
-        let message = if potential_contradictions.is_empty() {
+        let message = if merge_info.is_some() {
+            "Memory stored and merged with duplicate".to_string()
+        } else if potential_contradictions.is_empty() {
             "Memory stored successfully".to_string()
         } else {
             format!(
@@ -608,6 +733,7 @@ impl ToolHandler {
             message,
             branch,
             potential_contradictions,
+            merge_info,
         }))
     }
 
@@ -624,7 +750,8 @@ impl ToolHandler {
 
         // Optimization: if query is empty, skip search and use filter-only path
         if input.query.trim().is_empty() {
-            let memories = self.db.query_memories(
+            let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
+            let memories = self.db.query_memories_with_branch(
                 &self.project_id,
                 if type_filters.is_empty() {
                     None
@@ -638,6 +765,7 @@ impl ToolHandler {
                 },
                 Some(input.min_relevance),
                 input.limit + input.offset,
+                branch_filter,
             )?;
 
             let results: Vec<MemoryWithScore> = memories
@@ -728,10 +856,32 @@ impl ToolHandler {
         // Calculate hybrid scores and build results
         let mut scored_results: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, combined, semantic, keyword)
 
+        let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
+
         for id in candidate_ids_vec.iter() {
             let Some(memory) = memories_map.get(id) else {
                 continue;
             };
+
+            // Filter by branch
+            match branch_filter {
+                None => {} // "all" - no filtering
+                Some(None) => {
+                    // "global" - only global memories
+                    if memory.branch.is_some() {
+                        continue;
+                    }
+                }
+                Some(Some(branch)) => {
+                    // specific branch - global + that branch
+                    if let Some(ref mem_branch) = memory.branch
+                        && mem_branch != branch
+                    {
+                        continue;
+                    }
+                    // branch is None (global) -> include
+                }
+            }
 
             // Filter by types
             if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
@@ -895,6 +1045,21 @@ impl ToolHandler {
 
     fn memory_delete(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryDeleteInput = serde_json::from_value(arguments)?;
+
+        // Remove from cluster before deleting
+        if let Ok(Some(cluster_id)) = self.db.remove_from_cluster(&input.id) {
+            // Recalculate centroid if cluster still has members
+            let member_ids = self.db.get_cluster_member_ids(&cluster_id)?;
+            if member_ids.is_empty() {
+                let _ = self.db.delete_empty_clusters(&self.project_id);
+            } else {
+                let new_centroid = self.compute_cluster_centroid(&member_ids)?;
+                let summary = self.generate_cluster_summary(&member_ids)?;
+                if let Some(centroid) = new_centroid {
+                    let _ = self.db.update_cluster_centroid(&cluster_id, &centroid, &summary);
+                }
+            }
+        }
 
         let deleted = self.db.delete_memory(&input.id)?;
 
@@ -1125,6 +1290,7 @@ impl ToolHandler {
                 updated_at: now,
                 last_accessed_at: now,
                 branch,
+                merged_from: None,
             };
 
             embeddings.push((
@@ -1139,6 +1305,11 @@ impl ToolHandler {
         // Store memories in batch
         let stored = self.db.store_memories_batch(&memories)?;
         self.db.store_embeddings_batch(&embeddings)?;
+
+        // Assign each new memory to a cluster
+        for (i, mem) in memories.iter().enumerate() {
+            let _ = self.assign_to_cluster(&mem.id, &all_embeddings[i], &mem.content, mem.importance);
+        }
 
         // Invalidate search cache since we added new data
         if stored > 0 {
@@ -1156,7 +1327,29 @@ impl ToolHandler {
     fn memory_delete_batch(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryDeleteBatchInput = serde_json::from_value(arguments)?;
 
+        // Remove from clusters before deleting
+        let mut affected_clusters: HashSet<String> = HashSet::new();
+        for id in &input.ids {
+            if let Ok(Some(cluster_id)) = self.db.remove_from_cluster(id) {
+                affected_clusters.insert(cluster_id);
+            }
+        }
+
         let deleted = self.db.delete_memories_batch(&input.ids)?;
+
+        // Cleanup affected clusters
+        for cluster_id in &affected_clusters {
+            let member_ids = self.db.get_cluster_member_ids(cluster_id)?;
+            if member_ids.is_empty() {
+                let _ = self.db.delete_empty_clusters(&self.project_id);
+            } else {
+                let new_centroid = self.compute_cluster_centroid(&member_ids)?;
+                let summary = self.generate_cluster_summary(&member_ids)?;
+                if let Some(centroid) = new_centroid {
+                    let _ = self.db.update_cluster_centroid(cluster_id, &centroid, &summary);
+                }
+            }
+        }
 
         if deleted > 0 {
             // Invalidate search cache since we deleted data
@@ -1280,12 +1473,14 @@ impl ToolHandler {
 
     fn memory_stats(&self, _arguments: Value) -> Result<Value, MemoryError> {
         let stats: ProjectStats = self.db.get_project_stats(&self.project_id)?;
+        let clusters = self.db.get_clusters_for_project(&self.project_id)?;
 
         Ok(json!({
             "project_id": self.project_id,
             "memory_count": stats.memory_count,
             "relationship_count": stats.relationship_count,
-            "avg_relevance": stats.avg_relevance
+            "avg_relevance": stats.avg_relevance,
+            "cluster_count": clusters.len(),
         }))
     }
 
@@ -1306,58 +1501,192 @@ impl ToolHandler {
             embedding
         };
 
-        // Get all embeddings and calculate similarities
-        let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
-
-        let mut scored: Vec<(String, f32)> = embeddings
-            .iter()
-            .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
-            .filter(|(_, score)| *score >= input.min_score as f32)
-            .collect();
-
-        // Sort by similarity descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Fetch memories and build results
-        let mut memories: Vec<Value> = Vec::new();
-        let mut memory_ids: Vec<String> = Vec::new();
-
-        for (id, similarity) in scored.into_iter().take(input.limit * 2) {
-            // Fetch extra to account for type filtering
-            if let Ok(Some(memory)) = self.db.get_memory(&id) {
-                // Apply type filter
-                if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
-                    continue;
+        // Check if hierarchical retrieval is viable (avoid DB queries when not requested)
+        let should_use_hierarchical = if input.hierarchical {
+            let clusters_result = self.db.get_clusters_for_project(&self.project_id)?;
+            if !clusters_result.is_empty() {
+                let stats = self.db.get_project_stats(&self.project_id)?;
+                if stats.memory_count >= 10 {
+                    Some(clusters_result)
+                } else {
+                    None
                 }
-
-                if memories.len() >= input.limit {
-                    break;
-                }
-
-                memory_ids.push(id);
-                memories.push(json!({
-                    "id": memory.id,
-                    "type": memory.memory_type.as_str(),
-                    "content": memory.content,
-                    "summary": memory.summary,
-                    "tags": memory.tags,
-                    "importance": memory.importance,
-                    "relevance_score": memory.relevance_score,
-                    "similarity": similarity,
-                }));
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        // Record access for retrieved memories
-        if !memory_ids.is_empty() {
-            let _ = self.db.record_access_batch(&memory_ids);
-        }
+        if let Some(clusters) = should_use_hierarchical {
+            // Hierarchical: query cluster centroids, then fetch members from top clusters
+            let mut cluster_scores: Vec<(String, f32)> = Vec::new();
+            for cluster in &clusters {
+                if let Some(ref centroid) = cluster.centroid {
+                    let similarity = cosine_similarity(&context_embedding, centroid);
+                    if similarity >= input.min_score as f32 {
+                        cluster_scores.push((cluster.id.clone(), similarity));
+                    }
+                }
+            }
+            cluster_scores
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(json!({
-            "context": input.context,
-            "count": memories.len(),
-            "memories": memories,
-        }))
+            // Get members from top clusters
+            let mut memories: Vec<Value> = Vec::new();
+            let mut memory_ids: Vec<String> = Vec::new();
+
+            let all_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+            let embedding_map: std::collections::HashMap<String, Vec<f32>> =
+                all_embeddings.into_iter().collect();
+
+            for (cluster_id, _cluster_sim) in cluster_scores.iter().take(input.limit) {
+                let member_ids = self.db.get_cluster_member_ids(cluster_id)?;
+                let member_set: std::collections::HashSet<&String> = member_ids.iter().collect();
+
+                // Score individual members using pre-fetched embeddings
+                let mut member_scores: Vec<(String, f32)> = embedding_map
+                    .iter()
+                    .filter(|(id, _)| member_set.contains(id))
+                    .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
+                    .collect();
+                member_scores
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Batch fetch all scored member memories
+                let scored_ids: Vec<String> = member_scores.iter().map(|(id, _)| id.clone()).collect();
+                let members_map = self.db.get_memories_batch(&scored_ids)?;
+
+                for (id, similarity) in member_scores {
+                    if memories.len() >= input.limit {
+                        break;
+                    }
+                    if let Some(memory) = members_map.get(&id) {
+                        // Apply branch filter (default: current branch mode)
+                        let branch_filter = self.branch_mode_to_filter("current");
+                        match branch_filter {
+                            None => {}
+                            Some(None) => {
+                                if memory.branch.is_some() {
+                                    continue;
+                                }
+                            }
+                            Some(Some(branch)) => {
+                                if let Some(ref mem_branch) = memory.branch
+                                    && mem_branch != branch
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if !type_filters.is_empty()
+                            && !type_filters.contains(&memory.memory_type)
+                        {
+                            continue;
+                        }
+
+                        memory_ids.push(id);
+                        memories.push(json!({
+                            "id": memory.id,
+                            "type": memory.memory_type.as_str(),
+                            "content": memory.content,
+                            "summary": memory.summary,
+                            "tags": memory.tags,
+                            "importance": memory.importance,
+                            "relevance_score": memory.relevance_score,
+                            "similarity": similarity,
+                            "cluster_id": cluster_id,
+                        }));
+                    }
+                }
+            }
+
+            // Record access
+            if !memory_ids.is_empty() {
+                let _ = self.db.record_access_batch(&memory_ids);
+            }
+
+            Ok(json!({
+                "context": input.context,
+                "count": memories.len(),
+                "memories": memories,
+                "retrieval_mode": "hierarchical",
+            }))
+        } else {
+            // Flat retrieval (original behavior)
+            let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+
+            let mut scored: Vec<(String, f32)> = embeddings
+                .iter()
+                .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
+                .filter(|(_, score)| *score >= input.min_score as f32)
+                .collect();
+
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut memories: Vec<Value> = Vec::new();
+            let mut memory_ids: Vec<String> = Vec::new();
+
+            let top_scored: Vec<(String, f32)> = scored.into_iter().take(input.limit * 2).collect();
+
+            // Batch fetch all candidate memories
+            let flat_ids: Vec<String> = top_scored.iter().map(|(id, _)| id.clone()).collect();
+            let flat_map = self.db.get_memories_batch(&flat_ids)?;
+
+            for (id, similarity) in top_scored {
+                if let Some(memory) = flat_map.get(&id) {
+                    // Apply branch filter
+                    let branch_filter = self.branch_mode_to_filter("current");
+                    match branch_filter {
+                        None => {}
+                        Some(None) => {
+                            if memory.branch.is_some() {
+                                continue;
+                            }
+                        }
+                        Some(Some(branch)) => {
+                            if let Some(ref mem_branch) = memory.branch
+                                && mem_branch != branch
+                            {
+                                continue;
+                            }
+                        }
+                    }
+
+                    if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
+                        continue;
+                    }
+
+                    if memories.len() >= input.limit {
+                        break;
+                    }
+
+                    memory_ids.push(id);
+                    memories.push(json!({
+                        "id": memory.id,
+                        "type": memory.memory_type.as_str(),
+                        "content": memory.content,
+                        "summary": memory.summary,
+                        "tags": memory.tags,
+                        "importance": memory.importance,
+                        "relevance_score": memory.relevance_score,
+                        "similarity": similarity,
+                    }));
+                }
+            }
+
+            if !memory_ids.is_empty() {
+                let _ = self.db.record_access_batch(&memory_ids);
+            }
+
+            Ok(json!({
+                "context": input.context,
+                "count": memories.len(),
+                "memories": memories,
+                "retrieval_mode": "flat",
+            }))
+        }
     }
 
     fn memory_prune(&self, arguments: Value) -> Result<Value, MemoryError> {
@@ -1477,5 +1806,293 @@ impl ToolHandler {
                 "message": "Failed to promote memory"
             }))
         }
+    }
+
+    fn memory_dedup(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryDedupInput = serde_json::from_value(arguments)?;
+        let threshold = input.threshold.clamp(0.5, 1.0);
+
+        // Get all embeddings and memories for the project
+        let all_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+
+        // Pre-fetch all memories upfront to avoid O(n) individual get_memory calls
+        let all_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
+        let all_memories: std::collections::HashMap<String, Memory> = all_memories_list
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+
+        // Build duplicate groups: for each pair with similarity >= threshold and same type
+        let mut processed: HashSet<String> = HashSet::new();
+        let mut groups: Vec<Vec<(String, f32)>> = Vec::new(); // groups of (id, similarity_to_first)
+
+        for i in 0..all_embeddings.len() {
+            let (ref id_i, ref vec_i) = all_embeddings[i];
+            if processed.contains(id_i) {
+                continue;
+            }
+
+            let mem_i = match all_memories.get(id_i) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let mut group = vec![(id_i.clone(), 1.0_f32)];
+
+            for (id_j, vec_j) in all_embeddings.iter().skip(i + 1) {
+                if processed.contains(id_j) {
+                    continue;
+                }
+
+                let similarity = cosine_similarity(vec_i, vec_j);
+                if similarity >= threshold
+                    && let Some(mem_j) = all_memories.get(id_j)
+                    && mem_j.memory_type == mem_i.memory_type
+                {
+                    group.push((id_j.clone(), similarity));
+                }
+            }
+
+            if group.len() > 1 {
+                for (id, _) in &group {
+                    processed.insert(id.clone());
+                }
+                groups.push(group);
+            }
+        }
+
+        if groups.is_empty() {
+            return Ok(json!({
+                "success": true,
+                "dry_run": !input.confirm,
+                "threshold": threshold,
+                "duplicate_groups": 0,
+                "total_duplicates": 0,
+                "merged": 0,
+                "message": format!("No duplicates found at threshold {:.2}", threshold),
+                "groups": []
+            }));
+        }
+
+        // Build group info for display
+        let mut group_info: Vec<Value> = Vec::new();
+        let mut total_duplicates = 0usize;
+
+        for group in &groups {
+            let mut members: Vec<Value> = Vec::new();
+            for (id, sim) in group {
+                if let Some(mem) = all_memories.get(id) {
+                    members.push(json!({
+                        "id": id,
+                        "type": mem.memory_type.as_str(),
+                        "similarity": sim,
+                        "content_preview": mem.content.chars().take(100).collect::<String>(),
+                        "updated_at": mem.updated_at,
+                    }));
+                }
+            }
+            total_duplicates += members.len() - 1; // -1 because one is kept
+            group_info.push(json!({"members": members}));
+        }
+
+        if input.confirm {
+            let mut merged_count = 0usize;
+
+            for group in &groups {
+                // Keep the most recently updated memory, merge others into it
+                let with_time: Vec<(String, f32, i64)> = group
+                    .iter()
+                    .filter_map(|(id, sim)| {
+                        all_memories.get(id).map(|m| (id.clone(), *sim, m.updated_at))
+                    })
+                    .collect();
+
+                let mut sorted = with_time;
+                sorted.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+
+                if sorted.len() < 2 {
+                    continue;
+                }
+
+                let keeper_id = sorted[0].0.clone();
+                for (old_id, _, _) in &sorted[1..] {
+                    let old_preview: String = all_memories.get(old_id)
+                        .map(|m| m.content.chars().take(100).collect())
+                        .unwrap_or_default();
+                    self.db.merge_memories(&keeper_id, old_id, &old_preview)?;
+                    merged_count += 1;
+                }
+            }
+
+            self.invalidate_search_cache();
+
+            Ok(json!({
+                "success": true,
+                "dry_run": false,
+                "threshold": threshold,
+                "duplicate_groups": groups.len(),
+                "total_duplicates": total_duplicates,
+                "merged": merged_count,
+                "message": format!("Merged {} duplicate memories from {} groups", merged_count, groups.len()),
+                "groups": group_info
+            }))
+        } else {
+            Ok(json!({
+                "success": true,
+                "dry_run": true,
+                "threshold": threshold,
+                "duplicate_groups": groups.len(),
+                "total_duplicates": total_duplicates,
+                "merged": 0,
+                "message": format!("Found {} duplicate groups ({} duplicates). Set confirm=true to merge.", groups.len(), total_duplicates),
+                "groups": group_info
+            }))
+        }
+    }
+
+    /// Generate a cluster summary from member memories.
+    /// Uses the first sentence of the highest-importance member + top keywords across all members.
+    fn generate_cluster_summary(&self, member_ids: &[String]) -> Result<String, MemoryError> {
+        if member_ids.is_empty() {
+            return Ok("Empty cluster".to_string());
+        }
+
+        let members = self.db.get_memories_batch(member_ids)?;
+        if members.is_empty() {
+            return Ok("Empty cluster".to_string());
+        }
+
+        // Find highest-importance member
+        let best_member = members
+            .values()
+            .max_by(|a, b| {
+                a.importance
+                    .partial_cmp(&b.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap();
+
+        // Get first sentence from best member
+        let first_sentence = crate::summarize::extract_first_sentence(&best_member.content);
+
+        // Collect keywords from all members
+        let all_content: String = members
+            .values()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let keywords = crate::summarize::extract_keywords(&all_content, 3);
+
+        if keywords.is_empty() {
+            Ok(first_sentence)
+        } else {
+            Ok(format!("{} [{}]", first_sentence, keywords.join(", ")))
+        }
+    }
+
+    /// Assign a memory to the best matching cluster, or create a new one.
+    fn assign_to_cluster(
+        &self,
+        memory_id: &str,
+        embedding: &[f32],
+        content: &str,
+        _importance: f64,
+    ) -> Result<Option<String>, MemoryError> {
+        use crate::memory::MemoryCluster;
+
+        let clusters = self.db.get_clusters_for_project(&self.project_id)?;
+
+        // Find best matching cluster by centroid similarity
+        const CLUSTER_THRESHOLD: f32 = 0.75;
+        let mut best_match: Option<(String, f32)> = None;
+
+        for cluster in &clusters {
+            if let Some(ref centroid) = cluster.centroid {
+                let similarity = cosine_similarity(embedding, centroid);
+                if similarity >= CLUSTER_THRESHOLD
+                    && (best_match.is_none() || similarity > best_match.as_ref().unwrap().1)
+                {
+                    best_match = Some((cluster.id.clone(), similarity));
+                }
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp();
+
+        if let Some((cluster_id, _)) = best_match {
+            // Add to existing cluster
+            self.db.add_to_cluster(&cluster_id, memory_id)?;
+
+            // Update centroid (running average)
+            let member_ids = self.db.get_cluster_member_ids(&cluster_id)?;
+            let new_centroid = self.compute_cluster_centroid(&member_ids)?;
+            let summary = self.generate_cluster_summary(&member_ids)?;
+
+            if let Some(centroid) = new_centroid {
+                self.db
+                    .update_cluster_centroid(&cluster_id, &centroid, &summary)?;
+            }
+
+            Ok(Some(cluster_id))
+        } else {
+            // Create new cluster
+            let cluster_id = format!("clust_{}", uuid::Uuid::new_v4().simple());
+            let summary = crate::summarize::extract_first_sentence(content);
+
+            let cluster = MemoryCluster {
+                id: cluster_id.clone(),
+                project_id: self.project_id.clone(),
+                summary,
+                member_count: 1,
+                centroid: Some(embedding.to_vec()),
+                created_at: now,
+                updated_at: now,
+            };
+
+            self.db.create_cluster(&cluster)?;
+            self.db.add_to_cluster(&cluster_id, memory_id)?;
+
+            Ok(Some(cluster_id))
+        }
+    }
+
+    /// Compute the centroid (average embedding) for a set of memory IDs.
+    fn compute_cluster_centroid(
+        &self,
+        member_ids: &[String],
+    ) -> Result<Option<Vec<f32>>, MemoryError> {
+        if member_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let all_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+        let member_set: HashSet<&String> = member_ids.iter().collect();
+
+        let mut sum: Option<Vec<f32>> = None;
+        let mut count = 0usize;
+
+        for (id, vec) in &all_embeddings {
+            if member_set.contains(id) {
+                count += 1;
+                match &mut sum {
+                    None => sum = Some(vec.clone()),
+                    Some(s) => {
+                        for (i, v) in vec.iter().enumerate() {
+                            if i < s.len() {
+                                s[i] += v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(sum.map(|mut s| {
+            let c = count as f32;
+            for v in &mut s {
+                *v /= c;
+            }
+            s
+        }))
     }
 }
