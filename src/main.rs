@@ -395,8 +395,12 @@ impl ServerHandler for MemoryServer {
                 .with_title("Engram MCP Server"),
         )
         .with_instructions(
-            "A persistent memory system for AI agents. Use memory_store to save facts, \
-            decisions, and patterns. Use memory_query to search for relevant memories.",
+            "Persistent memory for AI agents. Core workflow: \
+            (1) memory_store to save knowledge as you learn it -- facts, decisions, preferences, patterns, debug findings. \
+            Use specific content, 2-5 lowercase tags, and appropriate importance (0.5=normal, 0.7=important, 0.9=critical). \
+            (2) memory_context at the start of tasks to load relevant background knowledge. \
+            (3) memory_query for targeted lookups when you need a specific fact or decision. \
+            Memories auto-deduplicate, auto-cluster, and decay over time if not accessed.",
         )
     }
 
