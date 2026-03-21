@@ -223,6 +223,39 @@ fn dedup_threshold() -> f32 {
         .unwrap_or(0.90)
 }
 
+/// Compute a scoring boost based on query word overlap with memory tags.
+///
+/// For each query word that matches a tag (substring or exact), adds a boost.
+/// The boost is capped to avoid overwhelming semantic/keyword scores.
+/// Returns a value in [0.0, 0.15].
+fn compute_tag_boost(query_words: &[String], tags: &[String]) -> f64 {
+    if query_words.is_empty() || tags.is_empty() {
+        return 0.0;
+    }
+
+    let tags_lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+
+    let mut matches = 0usize;
+    for qw in query_words {
+        for tag in &tags_lower {
+            // Match if query word contains the tag or tag contains the query word
+            // e.g. "database" matches tag "database", "errors" matches tag "errors",
+            // "auth" matches tag "auth" or "authentication"
+            if qw == tag || tag.contains(qw.as_str()) || qw.contains(tag.as_str()) {
+                matches += 1;
+                break; // One match per query word
+            }
+        }
+    }
+
+    if matches == 0 {
+        return 0.0;
+    }
+
+    // Scale: 1 match = 0.05, 2 = 0.10, 3+ = 0.15 (capped)
+    (matches as f64 * 0.05).min(0.15)
+}
+
 #[derive(Debug, Serialize)]
 pub struct MergeInfo {
     pub merged_with: String,
@@ -865,6 +898,16 @@ impl ToolHandler {
         let candidate_ids_vec: Vec<String> = candidate_ids.into_iter().collect();
         let memories_map = self.db.get_memories_batch(&candidate_ids_vec)?;
 
+        // Extract normalized query words for tag boosting
+        let query_words: Vec<String> = input
+            .query
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() >= 3)
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+
         // Calculate hybrid scores and build results
         let mut scored_results: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, combined, semantic, keyword)
 
@@ -909,8 +952,13 @@ impl ToolHandler {
             // Hybrid score: weighted combination of semantic and keyword scores
             let hybrid_score = semantic_weight * semantic_score + keyword_weight * keyword_score;
 
-            // Apply relevance decay
-            let final_score = hybrid_score * memory.relevance_score;
+            // Tag boost: if query words match memory tags, boost the score.
+            // This helps disambiguate memories that share similar embeddings
+            // but differ in their tagged topics.
+            let tag_boost = compute_tag_boost(&query_words, &memory.tags);
+
+            // Apply relevance decay and tag boost
+            let final_score = (hybrid_score + tag_boost) * memory.relevance_score;
 
             if final_score >= input.min_relevance {
                 scored_results.push((id.clone(), final_score, semantic_score, keyword_score));
