@@ -597,18 +597,18 @@ impl ToolHandler {
         memory_type: MemoryType,
         threshold: f32,
         existing_embeddings: &[(String, Vec<f32>)],
+        existing_memories: &std::collections::HashMap<String, Memory>,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
         let mut duplicates = Vec::new();
 
         for (existing_id, existing_vec) in existing_embeddings {
             let similarity = cosine_similarity(embedding, existing_vec);
-            if similarity >= threshold {
-                // Check same memory type
-                if let Ok(Some(mem)) = self.db.get_memory(existing_id)
-                    && mem.memory_type == memory_type
-                {
-                    duplicates.push((existing_id.clone(), similarity));
-                }
+            // Check threshold and same memory type using pre-fetched map (avoids N+1 DB queries)
+            if similarity >= threshold
+                && let Some(mem) = existing_memories.get(existing_id)
+                && mem.memory_type == memory_type
+            {
+                duplicates.push((existing_id.clone(), similarity));
             }
         }
 
@@ -686,10 +686,22 @@ impl ToolHandler {
         // Fetch all embeddings once (reused for both dedup and contradiction checks)
         let pre_store_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
 
+        // Pre-fetch all memories once (avoids N+1 queries in find_duplicates and contradiction loop)
+        let pre_store_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
+        let pre_store_memories: std::collections::HashMap<String, Memory> = pre_store_memories_list
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+
         // Check for duplicates (configurable via ENGRAM_DEDUP_THRESHOLD, default 0.90)
         let dedup_threshold = dedup_threshold();
-        let duplicates =
-            self.find_duplicates(&embedding, memory_type, dedup_threshold, &pre_store_embeddings)?;
+        let duplicates = self.find_duplicates(
+            &embedding,
+            memory_type,
+            dedup_threshold,
+            &pre_store_embeddings,
+            &pre_store_memories,
+        )?;
 
         // Store the new memory
         self.db.store_memory(&memory)?;
@@ -699,9 +711,8 @@ impl ToolHandler {
         // If duplicate found, merge (keep new, absorb old)
         let mut merge_info: Option<MergeInfo> = None;
         if let Some((dup_id, dup_similarity)) = duplicates.first() {
-            let old_preview: String = self
-                .db
-                .get_memory(dup_id)?
+            let old_preview: String = pre_store_memories
+                .get(dup_id)
                 .map(|m| m.content.chars().take(100).collect())
                 .unwrap_or_default();
 
@@ -728,12 +739,13 @@ impl ToolHandler {
             }
             let similarity = cosine_similarity(&embedding, existing_vec);
             if similarity >= CONTRADICTION_THRESHOLD
-                && let Ok(Some(existing_memory)) = self.db.get_memory(existing_id)
+                && let Some(existing_memory) = pre_store_memories.get(existing_id)
             {
                 potential_contradictions.push(PotentialContradiction {
                     memory_id: existing_id.clone(),
                     summary: existing_memory
                         .summary
+                        .clone()
                         .unwrap_or_else(|| existing_memory.content.chars().take(100).collect()),
                     similarity: similarity as f64,
                 });
@@ -780,7 +792,8 @@ impl ToolHandler {
     }
 
     fn memory_query(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryQueryInput = serde_json::from_value(arguments)?;
+        let mut input: MemoryQueryInput = serde_json::from_value(arguments)?;
+        input.limit = input.limit.min(100); // Server-side cap to prevent overflow
 
         // Parse type filters
         let type_filters: Vec<MemoryType> =
@@ -1225,15 +1238,13 @@ impl ToolHandler {
                     {
                         continue;
                     }
-                    if !visited.contains(&rel.target_id) {
-                        visited.insert(rel.target_id.clone());
-                        neighbor_ids.push(rel.target_id.clone());
-                        neighbors_info.push((
-                            rel.target_id.clone(),
-                            rel.relation_type.as_str().to_string(),
-                            "outgoing".to_string(),
-                        ));
-                    }
+                    visited.insert(rel.target_id.clone());
+                    neighbor_ids.push(rel.target_id.clone());
+                    neighbors_info.push((
+                        rel.target_id.clone(),
+                        rel.relation_type.as_str().to_string(),
+                        "outgoing".to_string(),
+                    ));
                 }
             }
 
@@ -1248,15 +1259,13 @@ impl ToolHandler {
                     {
                         continue;
                     }
-                    if !visited.contains(&rel.source_id) {
-                        visited.insert(rel.source_id.clone());
-                        neighbor_ids.push(rel.source_id.clone());
-                        neighbors_info.push((
-                            rel.source_id.clone(),
-                            rel.relation_type.as_str().to_string(),
-                            "incoming".to_string(),
-                        ));
-                    }
+                    visited.insert(rel.source_id.clone());
+                    neighbor_ids.push(rel.source_id.clone());
+                    neighbors_info.push((
+                        rel.source_id.clone(),
+                        rel.relation_type.as_str().to_string(),
+                        "incoming".to_string(),
+                    ));
                 }
             }
 
@@ -1618,7 +1627,10 @@ impl ToolHandler {
             let embedding_map: std::collections::HashMap<String, Vec<f32>> =
                 all_embeddings.into_iter().collect();
 
-            for (cluster_id, _cluster_sim) in cluster_scores.iter().take(input.limit) {
+            let num_top_clusters = cluster_scores.len().min(input.limit).max(1);
+            let per_cluster_cap = (input.limit / num_top_clusters).max(1);
+
+            for (cluster_id, _cluster_sim) in cluster_scores.iter().take(num_top_clusters) {
                 let member_ids = self.db.get_cluster_member_ids(cluster_id)?;
                 let member_set: std::collections::HashSet<&String> = member_ids.iter().collect();
 
@@ -1635,9 +1647,13 @@ impl ToolHandler {
                 let scored_ids: Vec<String> = member_scores.iter().map(|(id, _)| id.clone()).collect();
                 let members_map = self.db.get_memories_batch(&scored_ids)?;
 
+                let mut cluster_count = 0usize;
                 for (id, similarity) in member_scores {
                     if memories.len() >= input.limit {
                         break;
+                    }
+                    if cluster_count > per_cluster_cap {
+                        break; // Allow one extra per cluster for flexibility
                     }
                     if let Some(memory) = members_map.get(&id) {
                         // Apply branch filter (default: current branch mode)
@@ -1676,6 +1692,7 @@ impl ToolHandler {
                             "similarity": similarity,
                             "cluster_id": cluster_id,
                         }));
+                        cluster_count += 1;
                     }
                 }
             }
@@ -2157,22 +2174,19 @@ impl ToolHandler {
             return Ok(None);
         }
 
-        let all_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
-        let member_set: HashSet<&String> = member_ids.iter().collect();
+        let member_embeddings = self.db.get_embeddings_batch(member_ids)?;
 
         let mut sum: Option<Vec<f32>> = None;
         let mut count = 0usize;
 
-        for (id, vec) in &all_embeddings {
-            if member_set.contains(id) {
-                count += 1;
-                match &mut sum {
-                    None => sum = Some(vec.clone()),
-                    Some(s) => {
-                        for (i, v) in vec.iter().enumerate() {
-                            if i < s.len() {
-                                s[i] += v;
-                            }
+        for (_id, vec) in &member_embeddings {
+            count += 1;
+            match &mut sum {
+                None => sum = Some(vec.clone()),
+                Some(s) => {
+                    for (i, v) in vec.iter().enumerate() {
+                        if i < s.len() {
+                            s[i] += v;
                         }
                     }
                 }

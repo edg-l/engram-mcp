@@ -313,7 +313,8 @@ impl Database {
         let merged_from_json = memory
             .merged_from
             .as_ref()
-            .map(|mf| serde_json::to_string(mf).unwrap_or_default());
+            .map(serde_json::to_string)
+            .transpose()?;
         conn.execute(
             "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -448,6 +449,18 @@ impl Database {
             sql.push_str(" AND relevance_score >= ?2");
         }
 
+        // Apply type filter in SQL (safe: MemoryType enum values are hardcoded strings)
+        if let Some(types) = types
+            && !types.is_empty()
+        {
+            let type_list: Vec<String> =
+                types.iter().map(|t| format!("'{}'", t.as_str())).collect();
+            sql.push_str(&format!(" AND memory_type IN ({})", type_list.join(",")));
+        }
+
+        // Fetch extra rows when tag filtering is active to compensate for post-filter losses
+        let fetch_limit = if tags.is_some() { limit * 3 } else { limit };
+
         sql.push_str(" ORDER BY relevance_score DESC LIMIT ?3");
 
         let mut stmt = conn.prepare(&sql)?;
@@ -481,26 +494,24 @@ impl Database {
         let mut memories: Vec<Memory> = match branch_filter {
             Some(Some(branch)) => stmt
                 .query_map(
-                    params![project_id, min_rel, limit as i64, branch],
+                    params![project_id, min_rel, fetch_limit as i64, branch],
                     parse_row,
                 )?
                 .filter_map(|r| r.ok())
                 .collect(),
             _ => stmt
-                .query_map(params![project_id, min_rel, limit as i64], parse_row)?
+                .query_map(params![project_id, min_rel, fetch_limit as i64], parse_row)?
                 .filter_map(|r| r.ok())
                 .collect(),
         };
 
-        // Filter by types if specified
-        if let Some(types) = types {
-            memories.retain(|m| types.contains(&m.memory_type));
-        }
-
-        // Filter by tags if specified
+        // Filter by tags if specified (type filter is now applied in SQL above)
         if let Some(filter_tags) = tags {
             memories.retain(|m| filter_tags.iter().any(|t| m.tags.contains(t)));
         }
+
+        // Truncate to requested limit after tag filtering
+        memories.truncate(limit);
 
         Ok(memories)
     }
@@ -544,7 +555,8 @@ impl Database {
             let merged_from_json = memory
                 .merged_from
                 .as_ref()
-                .map(|mf| serde_json::to_string(mf).unwrap_or_default());
+                .map(serde_json::to_string)
+                .transpose()?;
             tx.execute(
                 "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -820,7 +832,7 @@ impl Database {
     pub fn delete_empty_clusters(&self, project_id: &str) -> Result<usize, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
-            "DELETE FROM memory_clusters WHERE project_id = ?1 AND member_count = 0",
+            "DELETE FROM memory_clusters WHERE project_id = ?1 AND NOT EXISTS (SELECT 1 FROM cluster_members WHERE cluster_id = memory_clusters.id)",
             params![project_id],
         )?;
         Ok(rows)
@@ -988,6 +1000,37 @@ impl Database {
             Ok((memory_id, vector))
         })?;
 
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Fetch embeddings for a specific set of memory IDs.
+    pub fn get_embeddings_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<&str> = memory_ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT memory_id, vector FROM embeddings WHERE memory_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = memory_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let memory_id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let vector: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((memory_id, vector))
+        })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 

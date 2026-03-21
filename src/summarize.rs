@@ -24,6 +24,20 @@ const STOP_WORDS: &[&str] = &[
     "after", "above", "below", "between", "under", "again", "further", "any", "am", "being",
 ];
 
+/// Truncate a string to at most `max_chars` Unicode characters, returning a
+/// sub-slice ending on a character boundary (never a byte boundary).
+fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let byte_idx = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    &s[..byte_idx]
+}
+
 /// Generate an extractive summary from content.
 ///
 /// Returns the first sentence (up to MAX_SUMMARY_LENGTH chars) followed by
@@ -32,18 +46,20 @@ pub fn generate_summary(content: &str) -> String {
     let first_sentence = extract_first_sentence(content);
     let keywords = extract_keywords(content, 3);
 
+    let first_sentence_chars = first_sentence.chars().count();
+
     // If first sentence is short enough, append keywords
-    if first_sentence.len() < MAX_SUMMARY_LENGTH - 20 && !keywords.is_empty() {
+    if first_sentence_chars < MAX_SUMMARY_LENGTH - 20 && !keywords.is_empty() {
         let keyword_suffix = format!(" [{}]", keywords.join(", "));
         let combined = format!("{}{}", first_sentence, keyword_suffix);
-        if combined.len() <= MAX_SUMMARY_LENGTH {
+        if combined.chars().count() <= MAX_SUMMARY_LENGTH {
             return combined;
         }
     }
 
     // Just return the truncated first sentence
-    if first_sentence.len() > MAX_SUMMARY_LENGTH {
-        let truncated = &first_sentence[..MAX_SUMMARY_LENGTH - 3];
+    if first_sentence_chars > MAX_SUMMARY_LENGTH {
+        let truncated = safe_truncate(&first_sentence, MAX_SUMMARY_LENGTH - 3);
         // Try to break at word boundary
         if let Some(last_space) = truncated.rfind(' ') {
             return format!("{}...", &truncated[..last_space]);
@@ -82,8 +98,8 @@ pub fn extract_first_sentence(content: &str) -> String {
     }
 
     // Return first MAX_SUMMARY_LENGTH chars if no boundary found
-    if content.len() > MAX_SUMMARY_LENGTH {
-        content[..MAX_SUMMARY_LENGTH].to_string()
+    if content.chars().count() > MAX_SUMMARY_LENGTH {
+        safe_truncate(content, MAX_SUMMARY_LENGTH).to_string()
     } else {
         content.to_string()
     }

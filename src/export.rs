@@ -89,12 +89,24 @@ pub fn encode_embedding(vector: &[f32]) -> String {
 }
 
 /// Decode a base64 embedding to a vector
-pub fn decode_embedding(encoded: &str) -> Result<Vec<f32>, base64::DecodeError> {
-    let bytes = BASE64.decode(encoded)?;
-    Ok(bytes
+pub fn decode_embedding(encoded: &str) -> Result<Vec<f32>, String> {
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|e| format!("Failed to decode embedding: {}", e))?;
+
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "Corrupted embedding: byte length {} is not a multiple of 4",
+            bytes.len()
+        ));
+    }
+
+    let vector: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+        .collect();
+
+    Ok(vector)
 }
 
 /// Create export data from memories and relationships

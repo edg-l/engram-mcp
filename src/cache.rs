@@ -51,8 +51,7 @@ impl Default for QueryEmbeddingCache {
 /// Hash helper for embedding vectors (used as part of search result cache key).
 fn hash_embedding(embedding: &[f32]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Hash the first 32 components for speed (sufficient for uniqueness)
-    for &val in embedding.iter().take(32) {
+    for &val in embedding {
         val.to_bits().hash(&mut hasher);
     }
     hasher.finish()
