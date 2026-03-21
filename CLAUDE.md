@@ -71,6 +71,8 @@ engram-cli decay                   # run decay manually
 engram-cli prune -t 0.2 --confirm  # remove low-relevance
 engram-cli dedup -t 0.90           # find duplicates (dry run)
 engram-cli dedup -t 0.90 --confirm # merge duplicates
+engram-cli wipe                    # show what would be wiped
+engram-cli wipe --confirm          # delete all project memories
 ```
 
 ## Features

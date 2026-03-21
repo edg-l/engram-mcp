@@ -159,6 +159,12 @@ enum Commands {
         /// Memory ID to promote
         id: String,
     },
+    /// Wipe all memories for the current project
+    Wipe {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Find and merge duplicate memories
     Dedup {
         /// Similarity threshold (default: 0.90)
@@ -428,6 +434,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 threshold,
                 confirm,
             )?;
+        }
+        Commands::Wipe { confirm } => {
+            if !confirm {
+                let stats = db.get_project_stats(&project_id)?;
+                println!(
+                    "This will delete all {} memories and {} relationships for project '{}'.",
+                    stats.memory_count, stats.relationship_count, project_id
+                );
+                println!("Run with --confirm to proceed.");
+            } else {
+                let deleted = db.delete_project_data(&project_id)?;
+                // Also clean up clusters
+                db.delete_empty_clusters(&project_id)?;
+                println!("Wiped {} memories from project '{}'.", deleted, project_id);
+            }
         }
     }
 
