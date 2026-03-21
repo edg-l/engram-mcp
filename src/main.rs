@@ -16,9 +16,9 @@ use rmcp::model::{
     Annotated, CallToolRequestParams, CallToolResult, Content, GetPromptRequestParams,
     GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
-    PromptMessage, PromptMessageRole, PromptsCapability, RawResource, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ResourcesCapability, Role,
-    ServerCapabilities, ServerInfo, ToolsCapability,
+    PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, Role, ServerCapabilities,
+    ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -191,34 +191,21 @@ impl MemoryServer {
 
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
-                resources: Some(ResourcesCapability {
-                    subscribe: Some(false),
-                    list_changed: Some(false),
-                }),
-                prompts: Some(PromptsCapability {
-                    list_changed: Some(false),
-                }),
-                ..Default::default()
-            },
-            server_info: Implementation {
-                name: "engram".to_string(),
-                title: Some("Engram MCP Server".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
-                "A persistent memory system for AI agents. Use memory_store to save facts, \
-                decisions, and patterns. Use memory_query to search for relevant memories."
-                    .to_string(),
-            ),
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new("engram", env!("CARGO_PKG_VERSION"))
+                .with_title("Engram MCP Server"),
+        )
+        .with_instructions(
+            "A persistent memory system for AI agents. Use memory_store to save facts, \
+            decisions, and patterns. Use memory_query to search for relevant memories.",
+        )
     }
 
     fn list_tools(
@@ -227,11 +214,7 @@ impl ServerHandler for MemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
-            Ok(ListToolsResult {
-                tools: get_tool_definitions(),
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(ListToolsResult::with_all_items(get_tool_definitions()))
         }
     }
 
@@ -258,17 +241,12 @@ impl ServerHandler for MemoryServer {
             // Compact JSON for LLM consumption
             let compact_json = format::compact_tool_result(&request.name, &result);
 
-            Ok(CallToolResult {
-                content: vec![
-                    // Human-readable: audience=User means NOT sent to LLM
-                    Content::text(formatted).with_audience(vec![Role::User]),
-                    // Compact JSON: audience=Assistant means sent to LLM only
-                    Content::text(compact_json).with_audience(vec![Role::Assistant]),
-                ],
-                structured_content: None,
-                is_error: Some(false),
-                meta: None,
-            })
+            Ok(CallToolResult::success(vec![
+                // Human-readable: audience=User means NOT sent to LLM
+                Content::text(formatted).with_audience(vec![Role::User]),
+                // Compact JSON: audience=Assistant means sent to LLM only
+                Content::text(compact_json).with_audience(vec![Role::Assistant]),
+            ]))
         }
     }
 
@@ -306,11 +284,7 @@ impl ServerHandler for MemoryServer {
                 })
                 .collect();
 
-            Ok(ListResourcesResult {
-                resources,
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(ListResourcesResult::with_all_items(resources))
         }
     }
 
@@ -321,8 +295,8 @@ impl ServerHandler for MemoryServer {
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_
     {
         async move {
-            Ok(ListResourceTemplatesResult {
-                resource_templates: vec![Annotated::new(
+            Ok(ListResourceTemplatesResult::with_all_items(vec![
+                Annotated::new(
                     RawResourceTemplate {
                         uri_template: format!("memory://{}/{{memory_id}}", self.project_id),
                         name: "Memory".to_string(),
@@ -332,10 +306,8 @@ impl ServerHandler for MemoryServer {
                         icons: None,
                     },
                     None,
-                )],
-                next_cursor: None,
-                meta: None,
-            })
+                ),
+            ]))
         }
     }
 
@@ -375,9 +347,10 @@ impl ServerHandler for MemoryServer {
                 memory.content
             );
 
-            Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text(content, uri.clone())],
-            })
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                content,
+                uri.clone(),
+            )]))
         }
     }
 
@@ -387,22 +360,16 @@ impl ServerHandler for MemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
-            Ok(ListPromptsResult {
-                prompts: vec![Prompt::new(
-                    "recall_context",
-                    Some("Recall relevant memories for a given context or question"),
-                    Some(vec![PromptArgument {
-                        name: "context".to_string(),
-                        title: Some("Context".to_string()),
-                        description: Some(
-                            "The context or question to find relevant memories for".to_string(),
-                        ),
-                        required: Some(true),
-                    }]),
-                )],
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+                "recall_context",
+                Some("Recall relevant memories for a given context or question"),
+                Some(vec![PromptArgument::new("context")
+                    .with_title("Context")
+                    .with_description(
+                        "The context or question to find relevant memories for",
+                    )
+                    .with_required(true)]),
+            )]))
         }
     }
 
@@ -476,16 +443,14 @@ impl ServerHandler for MemoryServer {
                 memories_text = "No relevant memories found for this context.".to_string();
             }
 
-            Ok(GetPromptResult {
-                description: Some(format!("Relevant memories for: {}", context)),
-                messages: vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    format!(
-                        "Here are relevant memories from the project knowledge base:\n\n{}\n\nUse these memories to inform your response about: {}",
-                        memories_text, context
-                    ),
-                )],
-            })
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!(
+                    "Here are relevant memories from the project knowledge base:\n\n{}\n\nUse these memories to inform your response about: {}",
+                    memories_text, context
+                ),
+            )])
+            .with_description(format!("Relevant memories for: {}", context)))
         }
     }
 }
