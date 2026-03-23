@@ -61,12 +61,14 @@ engram-cli query "search text"     # semantic search
 engram-cli list                    # list all memories
 engram-cli show <id>               # show specific memory
 engram-cli store "content" -t fact # store new memory
+engram-cli store "content" -t preference --pinned --global  # pinned global memory
 engram-cli delete <id>             # delete memory
 engram-cli update <id> -c "new"    # update memory
 engram-cli link <src> <tgt> -r relates_to  # link memories
 engram-cli export -o backup.json   # export to file
 engram-cli import backup.json      # import from file
 engram-cli context "auth refactor"  # load relevant context
+engram-cli context "auth refactor" --global  # include global memories in context
 engram-cli stats                   # show statistics
 engram-cli decay                   # run decay manually
 engram-cli prune -t 0.2 --confirm  # remove low-relevance
@@ -74,6 +76,10 @@ engram-cli dedup -t 0.90           # find duplicates (dry run)
 engram-cli dedup -t 0.90 --confirm # merge duplicates
 engram-cli wipe                    # show what would be wiped
 engram-cli wipe --confirm          # delete all project memories
+engram-cli pin <id>                # pin a memory (exempt from decay/prune)
+engram-cli unpin <id>              # unpin a memory
+engram-cli insights                # show memory health insights
+engram-cli health                  # check memory store health
 ```
 
 ## Features
@@ -94,6 +100,7 @@ engram-cli wipe --confirm          # delete all project memories
 - `ENGRAM_PROJECT` - project scope (default: cwd name)
 - `ENGRAM_DECAY_INTERVAL` - decay job interval in seconds (default: 3600)
 - `ENGRAM_RECLUSTER_INTERVAL` - re-clustering job interval in seconds (default: 21600)
+- `ENGRAM_MAX_CANDIDATES` - max candidate memories to score during search (default: 200)
 
 ## Commands
 ```bash

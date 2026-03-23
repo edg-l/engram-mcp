@@ -158,9 +158,23 @@ fn format_query_result(result: &Value) -> String {
             };
 
             let branch_info = branch.map(|b| format!(" [{}]", b)).unwrap_or_default();
+            let pinned = memory
+                .get("pinned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let is_global = memory
+                .get("global")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let badges = match (pinned, is_global) {
+                (true, true) => " [pinned] [global]",
+                (true, false) => " [pinned]",
+                (false, true) => " [global]",
+                (false, false) => "",
+            };
             out.push_str(&format!(
-                "\n{} [{}] {}{} (score: {:.2}, importance: {:.1})\n",
-                icon, mem_type, id, branch_info, score, importance
+                "\n{} [{}] {}{}{} (score: {:.2}, importance: {:.1})\n",
+                icon, mem_type, id, branch_info, badges, score, importance
             ));
 
             // Show summary or truncated content
@@ -361,14 +375,24 @@ fn format_stats_result(result: &Value) -> String {
         .get("cluster_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let pinned_count = result
+        .get("pinned_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let global_count = result
+        .get("global_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     format!(
         "Project: {}\n\
          Memories: {}\n\
          Relationships: {}\n\
          Clusters: {}\n\
+         Pinned: {}\n\
+         Global: {}\n\
          Avg relevance: {:.2}",
-        project, mem_count, rel_count, cluster_count, avg_rel
+        project, mem_count, rel_count, cluster_count, pinned_count, global_count, avg_rel
     )
 }
 
@@ -481,11 +505,20 @@ fn format_context_result(result: &Value) -> String {
                 _ => "📝",
             };
 
+            let pinned = mem.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_global = mem.get("global").and_then(|v| v.as_bool()).unwrap_or(false);
+            let badges = match (pinned, is_global) {
+                (true, true) => " [pinned] [global]",
+                (true, false) => " [pinned]",
+                (false, true) => " [global]",
+                (false, false) => "",
+            };
             out.push_str(&format!(
-                "\n{} [{}] {} (similarity: {:.0}%, importance: {:.1})\n",
+                "\n{} [{}] {}{} (similarity: {:.0}%, importance: {:.1})\n",
                 icon,
                 mem_type,
                 id,
+                badges,
                 similarity * 100.0,
                 importance
             ));

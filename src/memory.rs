@@ -125,6 +125,12 @@ pub struct Memory {
     /// Provenance tracking: IDs and previews of memories that were merged into this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_from: Option<Vec<MergeSource>>,
+    /// Whether this memory is pinned (exempt from decay and auto-prune).
+    #[serde(default)]
+    pub pinned: bool,
+    /// Whether this memory is visible across all projects.
+    #[serde(default)]
+    pub global: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +170,8 @@ pub struct ProjectStats {
     pub memory_count: usize,
     pub relationship_count: usize,
     pub avg_relevance: f64,
+    pub pinned_count: usize,
+    pub global_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

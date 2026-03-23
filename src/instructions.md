@@ -26,6 +26,8 @@ Use `memory_query` when you need to recall a specific piece of knowledge -- "wha
 - **Use 2-5 lowercase tags**: Tags improve search ranking. Use domain terms like "database", "auth", "deployment", "testing".
 - **Set importance appropriately**: 0.3 = minor detail, 0.5 = normal (default), 0.7 = important decision or preference, 0.9 = critical constraint or blocker.
 - **Choose the right type**: fact, decision, preference, pattern, debug, or entity. This helps with filtering and retrieval.
+- **Use `pinned: true`** for permanent knowledge that should never decay or be pruned -- critical constraints, foundational decisions, or standing user preferences.
+- **Use `global: true`** for knowledge that applies across all projects -- user preferences, environment facts, or universal conventions.
 
 # Memory maintenance
 

@@ -139,6 +139,21 @@ async fn run_decay_job(db_path: PathBuf, project_id: String) {
                         tracing::warn!("Decay job failed: {}", e);
                     }
                 }
+
+                match db.auto_prune_dead_memories(&project_id) {
+                    Ok(pruned_ids) => {
+                        if !pruned_ids.is_empty() {
+                            tracing::debug!(
+                                "Auto-pruned {} dead memories: {:?}",
+                                pruned_ids.len(),
+                                pruned_ids
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Auto-prune failed: {}", e);
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("Decay job failed to open database: {}", e);
@@ -164,20 +179,36 @@ async fn run_recluster_job(db_path: PathBuf, project_id: String) {
 
     loop {
         match Database::open(&db_path) {
-            Ok(db) => match recluster_project(&db, &project_id) {
-                Ok((merged, split)) => {
-                    if merged > 0 || split > 0 {
-                        tracing::debug!(
-                            "Re-clustering: merged {} clusters, split {} members",
-                            merged,
-                            split
-                        );
+            Ok(db) => {
+                match recluster_project(&db, &project_id) {
+                    Ok((merged, split)) => {
+                        if merged > 0 || split > 0 {
+                            tracing::debug!(
+                                "Re-clustering: merged {} clusters, split {} members",
+                                merged,
+                                split
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Re-clustering job failed: {}", e);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Re-clustering job failed: {}", e);
+
+                match dedup_within_clusters(&db, &project_id) {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::debug!(
+                                "Background dedup merged {} duplicate memories within clusters",
+                                count
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Background dedup failed: {}", e);
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!("Re-clustering job failed to open database: {}", e);
             }
@@ -281,6 +312,79 @@ fn recluster_project(db: &Database, project_id: &str) -> Result<(usize, usize), 
     recalculate_all_centroids(db, project_id, &embedding_map)?;
 
     Ok((merged_count, split_count))
+}
+
+/// Dedup memories within each cluster: find same-type pairs with similarity >= 0.90 and merge.
+/// Global memories always survive: if one is global and the other is local, the global survives.
+/// Returns the number of merges performed.
+fn dedup_within_clusters(db: &Database, project_id: &str) -> Result<usize, MemoryError> {
+    use crate::embedding::cosine_similarity;
+
+    let clusters = db.get_clusters_for_project(project_id)?;
+    let all_embeddings = db.get_all_embeddings_for_project_and_global(project_id)?;
+    let embedding_map: std::collections::HashMap<String, Vec<f32>> =
+        all_embeddings.into_iter().collect();
+
+    let mut merge_count = 0usize;
+    // Track consumed IDs so we don't try to merge already-deleted memories
+    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for cluster in &clusters {
+        let member_ids = db.get_cluster_member_ids(&cluster.id)?;
+        if member_ids.len() < 2 {
+            continue;
+        }
+
+        for (i, id_i) in member_ids.iter().enumerate() {
+            if consumed.contains(id_i) {
+                continue;
+            }
+            let Some(emb_i) = embedding_map.get(id_i) else {
+                continue;
+            };
+            let Some(mem_i) = db.get_memory(id_i)? else {
+                continue;
+            };
+
+            for id_j in member_ids.iter().skip(i + 1) {
+                if consumed.contains(id_j) {
+                    continue;
+                }
+                let Some(emb_j) = embedding_map.get(id_j) else {
+                    continue;
+                };
+                let Some(mem_j) = db.get_memory(id_j)? else {
+                    continue;
+                };
+
+                // Only merge same-type memories
+                if mem_i.memory_type != mem_j.memory_type {
+                    continue;
+                }
+
+                let similarity = cosine_similarity(emb_i, emb_j);
+                if similarity >= 0.90 {
+                    // Determine survivor: global always wins; otherwise keep i (first seen)
+                    let (survivor_id, consumed_id, consumed_preview) =
+                        if mem_j.global && !mem_i.global {
+                            // j is global, i is local: j survives
+                            let preview: String = mem_i.content.chars().take(100).collect();
+                            (mem_j.id.clone(), mem_i.id.clone(), preview)
+                        } else {
+                            // i survives (i is global, or both same scope)
+                            let preview: String = mem_j.content.chars().take(100).collect();
+                            (mem_i.id.clone(), mem_j.id.clone(), preview)
+                        };
+
+                    db.merge_memories(&survivor_id, &consumed_id, &consumed_preview)?;
+                    consumed.insert(consumed_id);
+                    merge_count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(merge_count)
 }
 
 /// Recalculate centroids and summaries for all clusters in a project.

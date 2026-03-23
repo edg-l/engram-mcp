@@ -35,6 +35,11 @@ pub struct MemoryStoreInput {
     /// Branch for this memory: null/omitted = global, "auto" = current branch, "branch-name" = explicit
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    /// Make this memory visible across all projects. Global memories always have branch=null.
+    #[serde(default)]
+    pub global: bool,
 }
 
 fn default_importance() -> f64 {
@@ -87,6 +92,7 @@ pub struct MemoryUpdateInput {
     pub importance: Option<f64>,
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
+    pub pinned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,12 +324,24 @@ fn make_input_schema(schema: Value) -> Arc<Map<String, Value>> {
     }
 }
 
+/// Compute a hybrid relevance score combining semantic similarity, recency, and importance.
+///
+/// `score = 0.6 * semantic + 0.2 * recency + 0.2 * importance`
+///
+/// where `recency = exp(-0.02 * days_since_access)`.
+pub fn compute_hybrid_score(similarity: f32, last_accessed_at: i64, importance: f64) -> f32 {
+    let now = chrono::Utc::now().timestamp();
+    let days_since_access = ((now - last_accessed_at).max(0) as f64) / 86_400.0;
+    let recency = (-0.02 * days_since_access).exp() as f32;
+    0.6 * similarity + 0.2 * recency + 0.2 * importance as f32
+}
+
 pub fn get_tool_definitions() -> Vec<Tool> {
     vec![
         // === Core tools (used frequently by agents) ===
         Tool::new(
             "memory_store",
-            "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Duplicates are auto-detected and merged.",
+            "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Duplicates are auto-detected and merged. Use `pinned: true` for permanent knowledge that must never decay, and `global: true` for knowledge that applies across all projects.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -333,7 +351,9 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "How critical this is. 0.3=minor detail, 0.5=normal (default), 0.7=important, 0.9=critical decision or constraint."},
                     "summary": {"type": "string", "description": "Optional short summary. Auto-generated for long content if omitted."},
                     "related_to": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs this relates to. Creates 'relates_to' links."},
-                    "branch": {"type": "string", "description": "Git branch scope. Omit for global (visible everywhere), 'auto' for current branch only, or an explicit branch name."}
+                    "branch": {"type": "string", "description": "Git branch scope. Omit for global (visible everywhere), 'auto' for current branch only, or an explicit branch name."},
+                    "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."},
+                    "global": {"type": "boolean", "description": "Make this memory visible across all projects. Global memories always have branch=null."}
                 },
                 "required": ["content", "type"]
             })),
@@ -373,7 +393,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_update",
-            "Correct or update an existing memory. Use when information has changed (e.g. a version was upgraded, a decision was revised). Only provide fields you want to change.",
+            "Correct or update an existing memory. Use when information has changed (e.g. a version was upgraded, a decision was revised). Only provide fields you want to change. Supports `pinned` to protect a memory from decay/pruning.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -381,7 +401,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "content": {"type": "string", "description": "New content (replaces old, re-indexes for search)."},
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "New importance level."},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces old)."},
-                    "summary": {"type": "string", "description": "New summary (replaces old)."}
+                    "summary": {"type": "string", "description": "New summary (replaces old)."},
+                    "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."}
                 },
                 "required": ["id"]
             })),
@@ -664,10 +685,15 @@ impl ToolHandler {
         };
 
         // Resolve branch: null/omitted = global (None), "auto" = current branch, else explicit
-        let branch = match input.branch.as_deref() {
-            None | Some("") => None, // Global
-            Some("auto") => self.current_branch.clone(),
-            Some(explicit) => Some(explicit.to_string()),
+        // If global=true, force branch to None regardless of what was passed
+        let branch = if input.global {
+            None
+        } else {
+            match input.branch.as_deref() {
+                None | Some("") => None, // Global
+                Some("auto") => self.current_branch.clone(),
+                Some(explicit) => Some(explicit.to_string()),
+            }
         };
 
         let memory = Memory {
@@ -685,13 +711,18 @@ impl ToolHandler {
             last_accessed_at: now,
             branch: branch.clone(),
             merged_from: None,
+            pinned: input.pinned,
+            global: input.global,
         };
 
         // Generate embedding first to check for duplicates
         let embedding = self.embedding.embed_memory(memory_type, &input.content)?;
 
         // Fetch all embeddings once (reused for both dedup and contradiction checks)
-        let pre_store_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+        // Include global memories from other projects to catch cross-project duplicates
+        let pre_store_embeddings = self
+            .db
+            .get_all_embeddings_for_project_and_global(&self.project_id)?;
 
         // Pre-fetch all memories once (avoids N+1 queries in find_duplicates and contradiction loop)
         let pre_store_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
@@ -715,15 +746,28 @@ impl ToolHandler {
         self.db
             .store_embedding(&id, &embedding, self.embedding.model_version())?;
 
-        // If duplicate found, merge (keep new, absorb old)
+        // If duplicate found, merge. Global always survives:
+        // - existing global + new local: merge_memories(global_id, new_id) -> keep global
+        // - existing local + new global: merge_memories(new_id, existing_id) -> keep new global
+        // - both same scope: merge_memories(new_id, existing_id) -> keep new (default)
         let mut merge_info: Option<MergeInfo> = None;
         if let Some((dup_id, dup_similarity)) = duplicates.first() {
-            let old_preview: String = pre_store_memories
-                .get(dup_id)
+            let dup_memory = pre_store_memories.get(dup_id);
+            let old_preview: String = dup_memory
                 .map(|m| m.content.chars().take(100).collect())
                 .unwrap_or_default();
 
-            self.db.merge_memories(&id, dup_id, &old_preview)?;
+            let existing_is_global = dup_memory.map(|m| m.global).unwrap_or(false);
+            let (survivor_id, consumed_id) = if existing_is_global && !input.global {
+                // Existing global wins: keep existing, consume new local
+                (dup_id.as_str(), id.as_str())
+            } else {
+                // New wins (default): keep new, consume old
+                (id.as_str(), dup_id.as_str())
+            };
+
+            self.db
+                .merge_memories(survivor_id, consumed_id, &old_preview)?;
 
             merge_info = Some(MergeInfo {
                 merged_with: dup_id.clone(),
@@ -869,7 +913,9 @@ impl ToolHandler {
         {
             cached_results.into_iter().collect()
         } else {
-            let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+            let embeddings = self
+                .db
+                .get_all_embeddings_for_project_and_global(&self.project_id)?;
 
             let scored: Vec<(String, f32)> = embeddings
                 .iter()
@@ -1114,6 +1160,10 @@ impl ToolHandler {
             memory.summary = Some(summary);
         }
 
+        if let Some(pinned) = input.pinned {
+            memory.pinned = pinned;
+        }
+
         self.db.update_memory(&memory)?;
 
         // Invalidate search cache since we updated data
@@ -1347,10 +1397,15 @@ impl ToolHandler {
             };
 
             // Resolve branch: null/omitted = global (None), "auto" = current branch, else explicit
-            let branch = match mem_input.branch.as_deref() {
-                None | Some("") => None, // Global
-                Some("auto") => self.current_branch.clone(),
-                Some(explicit) => Some(explicit.to_string()),
+            // If global=true, force branch to None regardless of what was passed
+            let branch = if mem_input.global {
+                None
+            } else {
+                match mem_input.branch.as_deref() {
+                    None | Some("") => None, // Global
+                    Some("auto") => self.current_branch.clone(),
+                    Some(explicit) => Some(explicit.to_string()),
+                }
             };
 
             let memory = Memory {
@@ -1368,6 +1423,8 @@ impl ToolHandler {
                 last_accessed_at: now,
                 branch,
                 merged_from: None,
+                pinned: mem_input.pinned,
+                global: mem_input.global,
             };
 
             embeddings.push((
@@ -1581,6 +1638,8 @@ impl ToolHandler {
             "relationship_count": stats.relationship_count,
             "avg_relevance": stats.avg_relevance,
             "cluster_count": clusters.len(),
+            "pinned_count": stats.pinned_count,
+            "global_count": stats.global_count,
         }))
     }
 
@@ -1590,6 +1649,12 @@ impl ToolHandler {
         // Parse type filters
         let type_filters: Vec<MemoryType> =
             input.types.iter().filter_map(|t| t.parse().ok()).collect();
+
+        // Pre-filter candidate cap (configurable via ENGRAM_MAX_CANDIDATES, default 500)
+        let max_candidates: usize = std::env::var("ENGRAM_MAX_CANDIDATES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
 
         // Generate embedding for the context
         let context_embedding = if let Some(cached) = self.query_cache.get(&input.context) {
@@ -1636,7 +1701,9 @@ impl ToolHandler {
             let mut memories: Vec<Value> = Vec::new();
             let mut memory_ids: Vec<String> = Vec::new();
 
-            let all_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+            let all_embeddings = self
+                .db
+                .get_prefiltered_embeddings(&self.project_id, max_candidates)?;
             let embedding_map: std::collections::HashMap<String, Vec<f32>> =
                 all_embeddings.into_iter().collect();
 
@@ -1647,22 +1714,34 @@ impl ToolHandler {
                 let member_ids = self.db.get_cluster_member_ids(cluster_id)?;
                 let member_set: std::collections::HashSet<&String> = member_ids.iter().collect();
 
-                // Score individual members using pre-fetched embeddings
-                let mut member_scores: Vec<(String, f32)> = embedding_map
+                // Compute raw similarity for all cluster members present in embedding map
+                let member_raw: Vec<(String, f32)> = embedding_map
                     .iter()
                     .filter(|(id, _)| member_set.contains(id))
                     .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
                     .collect();
-                member_scores
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                // Batch fetch all scored member memories
-                let scored_ids: Vec<String> =
-                    member_scores.iter().map(|(id, _)| id.clone()).collect();
-                let members_map = self.db.get_memories_batch(&scored_ids)?;
+                // Batch fetch members to get metadata for hybrid scoring
+                let member_ids_for_batch: Vec<String> =
+                    member_raw.iter().map(|(id, _)| id.clone()).collect();
+                let members_map = self.db.get_memories_batch(&member_ids_for_batch)?;
+
+                // Compute hybrid scores and sort by hybrid score
+                let mut member_scores: Vec<(String, f32, f32)> = member_raw
+                    .into_iter()
+                    .filter_map(|(id, similarity)| {
+                        members_map.get(&id).map(|m| {
+                            let hybrid =
+                                compute_hybrid_score(similarity, m.last_accessed_at, m.importance);
+                            (id, similarity, hybrid)
+                        })
+                    })
+                    .collect();
+                member_scores
+                    .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
                 let mut cluster_count = 0usize;
-                for (id, similarity) in member_scores {
+                for (id, similarity, _hybrid) in member_scores {
                     if memories.len() >= input.limit {
                         break;
                     }
@@ -1735,28 +1814,40 @@ impl ToolHandler {
                 "clusters_hit": clusters_hit,
             }))
         } else {
-            // Flat retrieval (original behavior)
-            let embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+            // Flat retrieval with pre-filtering and hybrid scoring
+            let embeddings = self
+                .db
+                .get_prefiltered_embeddings(&self.project_id, max_candidates)?;
 
-            let mut scored: Vec<(String, f32)> = embeddings
+            // Compute raw cosine similarities and filter by min_score
+            let raw_scored: Vec<(String, f32)> = embeddings
                 .iter()
                 .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
                 .filter(|(_, score)| *score >= input.min_score as f32)
                 .collect();
 
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Batch fetch candidate memories to get metadata for hybrid scoring
+            let candidate_ids: Vec<String> = raw_scored.iter().map(|(id, _)| id.clone()).collect();
+            let candidate_map = self.db.get_memories_batch(&candidate_ids)?;
+
+            // Compute hybrid scores and sort by hybrid score (keep raw similarity for output)
+            let mut scored: Vec<(String, f32, f32)> = raw_scored
+                .into_iter()
+                .filter_map(|(id, similarity)| {
+                    candidate_map.get(&id).map(|m| {
+                        let hybrid =
+                            compute_hybrid_score(similarity, m.last_accessed_at, m.importance);
+                        (id, similarity, hybrid)
+                    })
+                })
+                .collect();
+            scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut memories: Vec<Value> = Vec::new();
             let mut memory_ids: Vec<String> = Vec::new();
 
-            let top_scored: Vec<(String, f32)> = scored.into_iter().take(input.limit * 2).collect();
-
-            // Batch fetch all candidate memories
-            let flat_ids: Vec<String> = top_scored.iter().map(|(id, _)| id.clone()).collect();
-            let flat_map = self.db.get_memories_batch(&flat_ids)?;
-
-            for (id, similarity) in top_scored {
-                if let Some(memory) = flat_map.get(&id) {
+            for (id, similarity, _hybrid) in scored.into_iter().take(input.limit * 2) {
+                if let Some(memory) = candidate_map.get(&id) {
                     // Apply branch filter
                     let branch_filter = self.branch_mode_to_filter("current");
                     match branch_filter {
@@ -1813,11 +1904,11 @@ impl ToolHandler {
     fn memory_prune(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryPruneInput = serde_json::from_value(arguments)?;
 
-        // Get all memories and filter by relevance threshold
+        // Get all memories and filter by relevance threshold, excluding pinned memories
         let all_memories = self.db.get_all_memories_for_project(&self.project_id)?;
         let candidates: Vec<&Memory> = all_memories
             .iter()
-            .filter(|m| m.relevance_score < input.threshold)
+            .filter(|m| m.relevance_score < input.threshold && !m.pinned)
             .collect();
 
         if candidates.is_empty() {

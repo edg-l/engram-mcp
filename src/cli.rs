@@ -88,6 +88,12 @@ enum Commands {
         /// Branch: omit for global, "auto" for current branch, or explicit branch name
         #[arg(short, long)]
         branch: Option<String>,
+        /// Pin this memory so it never decays or gets pruned
+        #[arg(long)]
+        pinned: bool,
+        /// Make this memory visible across all projects (forces branch=null)
+        #[arg(long)]
+        global: bool,
     },
     /// Delete a memory
     Delete {
@@ -174,6 +180,16 @@ enum Commands {
         #[arg(long)]
         confirm: bool,
     },
+    /// Pin a memory so it never decays or gets pruned
+    Pin {
+        /// Memory ID to pin
+        id: String,
+    },
+    /// Unpin a memory to allow decay and pruning
+    Unpin {
+        /// Memory ID to unpin
+        id: String,
+    },
     /// Load relevant memories for a context (like memory_context MCP tool)
     Context {
         /// Context description (e.g. "working on auth refactor")
@@ -188,6 +204,10 @@ enum Commands {
         #[arg(short, long)]
         types: Vec<String>,
     },
+    /// Show memory usage patterns and effectiveness metrics
+    Insights,
+    /// Show actionable memory health report
+    Health,
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -375,6 +395,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             importance,
             summary,
             branch,
+            pinned,
+            global,
         } => {
             cmd_store(
                 &db,
@@ -387,6 +409,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 summary,
                 branch.as_deref(),
                 current_branch.as_deref(),
+                pinned,
+                global,
             )?;
         }
         Commands::Delete { id } => {
@@ -450,6 +474,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 confirm,
             )?;
         }
+        Commands::Pin { id } => {
+            if db.set_pinned(&id, true)? {
+                println!("Pinned memory: {}", id);
+            } else {
+                println!("Memory not found: {}", id);
+            }
+        }
+        Commands::Unpin { id } => {
+            if db.set_pinned(&id, false)? {
+                println!("Unpinned memory: {}", id);
+            } else {
+                println!("Memory not found: {}", id);
+            }
+        }
         Commands::Context {
             context,
             limit,
@@ -482,6 +520,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Wiped {} memories from project '{}'.", deleted, project_id);
             }
         }
+        Commands::Insights => {
+            cmd_insights(&db, &project_id)?;
+        }
+        Commands::Health => {
+            cmd_health(&db, &project_id)?;
+        }
     }
 
     Ok(())
@@ -513,9 +557,9 @@ fn cmd_query(
     const SEMANTIC_WEIGHT: f64 = 0.7;
     const KEYWORD_WEIGHT: f64 = 0.3;
 
-    // Run semantic search
+    // Run semantic search (include global memories from other projects)
     let query_embedding = embedding_service.embed(query)?;
-    let embeddings = db.get_all_embeddings_for_project(project_id)?;
+    let embeddings = db.get_all_embeddings_for_project_and_global(project_id)?;
 
     let semantic_scores: HashMap<String, f32> = embeddings
         .iter()
@@ -745,6 +789,8 @@ fn cmd_store(
     summary: Option<String>,
     branch_arg: Option<&str>,
     current_branch: Option<&str>,
+    pinned: bool,
+    global: bool,
 ) -> Result<(), MemoryError> {
     let memory_type: MemoryType = type_str
         .parse()
@@ -764,10 +810,15 @@ fn cmd_store(
         .unwrap_or_default();
 
     // Resolve branch: omit for global, "auto" for current branch, else explicit
-    let branch = match branch_arg {
-        None | Some("") => None, // Global
-        Some("auto") => current_branch.map(String::from),
-        Some(explicit) => Some(explicit.to_string()),
+    // If global=true, force branch to None
+    let branch = if global {
+        None
+    } else {
+        match branch_arg {
+            None | Some("") => None, // Global
+            Some("auto") => current_branch.map(String::from),
+            Some(explicit) => Some(explicit.to_string()),
+        }
     };
 
     let memory = Memory {
@@ -785,6 +836,8 @@ fn cmd_store(
         last_accessed_at: now,
         branch: branch.clone(),
         merged_from: None,
+        pinned,
+        global,
     };
 
     db.store_memory(&memory)?;
@@ -998,6 +1051,130 @@ fn cmd_stats(db: &Database, project_id: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
+fn cmd_insights(db: &Database, project_id: &str) -> Result<(), MemoryError> {
+    let stats = db.get_project_stats(project_id)?;
+
+    if stats.memory_count == 0 {
+        println!("No memories found for this project.");
+        return Ok(());
+    }
+
+    println!("Insights for project: {}", project_id);
+    println!("─────────────────────────────────────────");
+
+    // Top 10 most accessed
+    let most_accessed = db.get_most_accessed(project_id, 10)?;
+    println!("\nTop accessed memories:");
+    if most_accessed.is_empty() || most_accessed.iter().all(|m| m.access_count == 0) {
+        println!("  (none accessed yet)");
+    } else {
+        for memory in &most_accessed {
+            if memory.access_count == 0 {
+                break;
+            }
+            let preview = memory
+                .summary
+                .as_deref()
+                .unwrap_or_else(|| &memory.content[..memory.content.len().min(60)]);
+            println!(
+                "  [{}] {} ({:?}) - {} accesses",
+                &memory.id[..memory.id.len().min(8)],
+                preview,
+                memory.memory_type,
+                memory.access_count
+            );
+        }
+    }
+
+    // Never accessed (older than 7 days)
+    let never_accessed_count = db.get_never_accessed(project_id, 7)?;
+    println!("\nNever accessed:");
+    if never_accessed_count == 0 {
+        println!("  All memories have been retrieved at least once.");
+    } else {
+        println!(
+            "  {} memories stored 7+ days ago have never been retrieved.",
+            never_accessed_count
+        );
+    }
+
+    // Decaying (below 0.2 relevance)
+    let decaying_count = db.get_below_relevance(project_id, 0.2)?;
+    println!("\nDecaying memories (relevance < 0.2): {}", decaying_count);
+
+    // Pinned and global counts
+    println!("\nPinned: {}", stats.pinned_count);
+    println!("Global: {}", stats.global_count);
+
+    // Type distribution
+    let type_dist = db.get_type_distribution(project_id)?;
+    println!("\nType distribution:");
+    for (memory_type, count) in &type_dist {
+        println!("  {}: {}", memory_type, count);
+    }
+
+    // Storage rate (last 30 days)
+    let rate = db.get_storage_rate(project_id, 30)?;
+    println!("\nStorage rate (last 30 days): {:.2} memories/day", rate);
+
+    // Health summary: subtract never-accessed + decaying, but add back the overlap to avoid
+    // double-counting memories that are both never-accessed and decaying.
+    let overlap = db.get_never_accessed_and_below_relevance(project_id, 7, 0.2)?;
+    let healthy = stats
+        .memory_count
+        .saturating_sub(never_accessed_count + decaying_count - overlap);
+    println!(
+        "\nHealth: {} healthy, {} never accessed, {} decaying, {} pinned",
+        healthy, never_accessed_count, decaying_count, stats.pinned_count
+    );
+
+    Ok(())
+}
+
+fn cmd_health(db: &Database, project_id: &str) -> Result<(), MemoryError> {
+    let stats = db.get_project_stats(project_id)?;
+    let decaying_count = db.get_below_relevance(project_id, 0.2)?;
+    let never_accessed_count = db.get_never_accessed(project_id, 7)?;
+    let potential_dupes = db.get_potential_duplicate_count(project_id)?;
+
+    if decaying_count == 0 && never_accessed_count == 0 && potential_dupes == 0 {
+        println!("All clear. {} memories, all healthy.", stats.memory_count);
+        return Ok(());
+    }
+
+    println!("Health report for project: {}", project_id);
+    println!("─────────────────────────────────────────");
+
+    if decaying_count > 0 {
+        println!(
+            "\n{} memories below relevance 0.2 (candidates for pruning).",
+            decaying_count
+        );
+        println!(
+            "  Run `engram-cli prune -t 0.2 --confirm` to remove {} decayed memories.",
+            decaying_count
+        );
+    }
+
+    if never_accessed_count > 0 {
+        println!(
+            "\n{} memories stored 7+ days ago have never been retrieved.",
+            never_accessed_count
+        );
+        println!("  Consider reviewing these with `engram-cli list` and removing unneeded ones.");
+    }
+
+    if potential_dupes > 0 {
+        println!(
+            "\n{} potential duplicate pairs (same cluster + type).",
+            potential_dupes
+        );
+        println!("  Run `engram-cli dedup -t 0.90 --confirm` to merge duplicates.");
+    }
+
+    Ok(())
+}
+
 fn cmd_decay(db: &Database, project_id: &str) -> Result<(), MemoryError> {
     let project = db
         .get_project(project_id)?
@@ -1205,7 +1382,7 @@ fn cmd_context(
     current_branch: Option<&str>,
 ) -> Result<(), MemoryError> {
     let context_embedding = embedding_service.embed(context)?;
-    let embeddings = db.get_all_embeddings_for_project(project_id)?;
+    let embeddings = db.get_all_embeddings_for_project_and_global(project_id)?;
 
     let type_filters: Vec<MemoryType> = types.iter().filter_map(|t| t.parse().ok()).collect();
 
