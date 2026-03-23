@@ -66,6 +66,7 @@ engram-cli update <id> -c "new"    # update memory
 engram-cli link <src> <tgt> -r relates_to  # link memories
 engram-cli export -o backup.json   # export to file
 engram-cli import backup.json      # import from file
+engram-cli context "auth refactor"  # load relevant context
 engram-cli stats                   # show statistics
 engram-cli decay                   # run decay manually
 engram-cli prune -t 0.2 --confirm  # remove low-relevance

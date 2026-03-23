@@ -133,9 +133,41 @@ Configuration is done via environment variables:
 
 **Background Decay:** The MCP server runs a background job that periodically applies decay to all memories based on time since last access.
 
+### Auto-load context on session start (Claude Code hook)
+
+Engram includes a hook script that automatically loads relevant memories at the start of every Claude Code conversation. This gives the LLM project context without relying on it to call `memory_context` explicitly.
+
+**1. Copy the hook script:**
+
+```bash
+cp scripts/engram-hook.sh ~/.claude/hooks/engram-hook.sh
+# or reference it directly from the install location
+```
+
+**2. Add to your settings** (`~/.claude/settings.json` for global, or `.claude/settings.json` per-project):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/engram-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook runs `engram-cli context` to load the top 10 relevant memories for the current project and injects them into the conversation.
+
 ### Tip: Add a CLAUDE.md hint
 
-Claude discovers Engram tools automatically via MCP, but adding a brief hint to your project's `CLAUDE.md` encourages proactive use:
+Optionally, you can add a brief hint to your project's `CLAUDE.md` to encourage proactive memory use:
 
 ```markdown
 ## Memory
@@ -521,6 +553,9 @@ engram-cli export -o backup.json
 
 # Import from file
 engram-cli import backup.json
+
+# Load context for a task (semantic search for relevant memories)
+engram-cli context "working on authentication refactor"
 
 # Show project statistics
 engram-cli stats

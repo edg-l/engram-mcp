@@ -174,6 +174,20 @@ enum Commands {
         #[arg(long)]
         confirm: bool,
     },
+    /// Load relevant memories for a context (like memory_context MCP tool)
+    Context {
+        /// Context description (e.g. "working on auth refactor")
+        context: String,
+        /// Maximum memories to return
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+        /// Minimum similarity score
+        #[arg(short, long, default_value = "0.3")]
+        min_score: f64,
+        /// Filter by type(s)
+        #[arg(short, long)]
+        types: Vec<String>,
+    },
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -290,6 +304,7 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
             | Commands::Update { .. }
             | Commands::Import { .. }
             | Commands::Dedup { .. }
+            | Commands::Context { .. }
     )
 }
 
@@ -433,6 +448,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 embedding_service.as_ref().unwrap(),
                 threshold,
                 confirm,
+            )?;
+        }
+        Commands::Context {
+            context,
+            limit,
+            min_score,
+            types,
+        } => {
+            cmd_context(
+                &db,
+                &project_id,
+                embedding_service.as_ref().unwrap(),
+                &context,
+                limit,
+                min_score,
+                &types,
+                current_branch.as_deref(),
             )?;
         }
         Commands::Wipe { confirm } => {
@@ -1156,6 +1188,94 @@ fn cmd_dedup(
             "\n{} duplicates would be merged. Use --confirm to merge.",
             total_dups
         );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_context(
+    db: &Database,
+    project_id: &str,
+    embedding_service: &EmbeddingService,
+    context: &str,
+    limit: usize,
+    min_score: f64,
+    types: &[String],
+    current_branch: Option<&str>,
+) -> Result<(), MemoryError> {
+    let context_embedding = embedding_service.embed(context)?;
+    let embeddings = db.get_all_embeddings_for_project(project_id)?;
+
+    let type_filters: Vec<MemoryType> = types.iter().filter_map(|t| t.parse().ok()).collect();
+
+    let mut scored: Vec<(String, f32)> = embeddings
+        .iter()
+        .map(|(id, vec)| {
+            (
+                id.clone(),
+                embedding::cosine_similarity(&context_embedding, vec),
+            )
+        })
+        .filter(|(_, score)| *score >= min_score as f32)
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Batch fetch candidates
+    let candidate_ids: Vec<String> = scored
+        .iter()
+        .take(limit * 2)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let memories_map = db.get_memories_batch(&candidate_ids)?;
+
+    let mut count = 0usize;
+    for (id, similarity) in &scored {
+        if count >= limit {
+            break;
+        }
+        let Some(memory) = memories_map.get(id) else {
+            continue;
+        };
+
+        // Branch filter: show global + current branch
+        match &memory.branch {
+            Some(branch) if current_branch.is_some_and(|cb| cb != branch) => continue,
+            _ => {}
+        }
+
+        if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
+            continue;
+        }
+
+        if count > 0 {
+            println!();
+        }
+        println!(
+            "[{}] ({}, importance: {:.1}, similarity: {:.2})",
+            memory.memory_type.as_str(),
+            memory.id,
+            memory.importance,
+            similarity,
+        );
+        if let Some(ref summary) = memory.summary {
+            println!("{}", summary);
+        } else {
+            println!("{}", memory.content);
+        }
+
+        count += 1;
+    }
+
+    // Record access
+    let accessed_ids: Vec<String> = scored
+        .iter()
+        .take(count)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if !accessed_ids.is_empty() {
+        let _ = db.record_access_batch(&accessed_ids);
     }
 
     Ok(())

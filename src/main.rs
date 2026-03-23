@@ -16,9 +16,8 @@ use rmcp::model::{
     Annotated, CallToolRequestParams, CallToolResult, Content, GetPromptRequestParams,
     GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
-    PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, Role, ServerCapabilities,
-    ServerInfo,
+    PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, Role, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -165,22 +164,20 @@ async fn run_recluster_job(db_path: PathBuf, project_id: String) {
 
     loop {
         match Database::open(&db_path) {
-            Ok(db) => {
-                match recluster_project(&db, &project_id) {
-                    Ok((merged, split)) => {
-                        if merged > 0 || split > 0 {
-                            tracing::debug!(
-                                "Re-clustering: merged {} clusters, split {} members",
-                                merged,
-                                split
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Re-clustering job failed: {}", e);
+            Ok(db) => match recluster_project(&db, &project_id) {
+                Ok((merged, split)) => {
+                    if merged > 0 || split > 0 {
+                        tracing::debug!(
+                            "Re-clustering: merged {} clusters, split {} members",
+                            merged,
+                            split
+                        );
                     }
                 }
-            }
+                Err(e) => {
+                    tracing::warn!("Re-clustering job failed: {}", e);
+                }
+            },
             Err(e) => {
                 tracing::warn!("Re-clustering job failed to open database: {}", e);
             }
@@ -264,8 +261,7 @@ fn recluster_project(db: &Database, project_id: &str) -> Result<(usize, usize), 
                         if let Some(ref other_centroid) = other_cluster.centroid {
                             let sim = cosine_similarity(member_embedding, other_centroid);
                             if sim >= 0.75
-                                && (best_match.is_none()
-                                    || sim > best_match.as_ref().unwrap().1)
+                                && (best_match.is_none() || sim > best_match.as_ref().unwrap().1)
                             {
                                 best_match = Some((other_cluster.id.clone(), sim));
                             }
@@ -394,14 +390,7 @@ impl ServerHandler for MemoryServer {
             Implementation::new("engram", env!("CARGO_PKG_VERSION"))
                 .with_title("Engram MCP Server"),
         )
-        .with_instructions(
-            "Persistent memory for AI agents. Core workflow: \
-            (1) memory_store to save knowledge as you learn it -- facts, decisions, preferences, patterns, debug findings. \
-            Use specific content, 2-5 lowercase tags, and appropriate importance (0.5=normal, 0.7=important, 0.9=critical). \
-            (2) memory_context at the start of tasks to load relevant background knowledge. \
-            (3) memory_query for targeted lookups when you need a specific fact or decision. \
-            Memories auto-deduplicate, auto-cluster, and decay over time if not accessed.",
-        )
+        .with_instructions(include_str!("instructions.md"))
     }
 
     fn list_tools(
@@ -409,9 +398,7 @@ impl ServerHandler for MemoryServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async move {
-            Ok(ListToolsResult::with_all_items(get_tool_definitions()))
-        }
+        async move { Ok(ListToolsResult::with_all_items(get_tool_definitions())) }
     }
 
     fn call_tool(
@@ -559,12 +546,12 @@ impl ServerHandler for MemoryServer {
             Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
                 "recall_context",
                 Some("Recall relevant memories for a given context or question"),
-                Some(vec![PromptArgument::new("context")
-                    .with_title("Context")
-                    .with_description(
-                        "The context or question to find relevant memories for",
-                    )
-                    .with_required(true)]),
+                Some(vec![
+                    PromptArgument::new("context")
+                        .with_title("Context")
+                        .with_description("The context or question to find relevant memories for")
+                        .with_required(true),
+                ]),
             )]))
         }
     }
