@@ -17,7 +17,7 @@ use rmcp::model::{
     GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
     PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, Role, ServerCapabilities, ServerInfo,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -518,22 +518,18 @@ impl ServerHandler for MemoryServer {
                 .as_ref()
                 .ok_or_else(|| McpError::internal_error("Server not initialized", None))?;
 
-            let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
+            let args_value = request.arguments.map(Value::Object).unwrap_or(Value::Null);
+            let content_length = args_value
+                .get("content_length")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(300);
             let result = handler
-                .handle_tool(&request.name, args)
+                .handle_tool(&request.name, args_value)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            // Human-readable format (not sent to LLM)
-            let formatted = format::format_tool_result(&request.name, &result);
-            // Compact JSON for LLM consumption
-            let compact_json = format::compact_tool_result(&request.name, &result);
-
-            Ok(CallToolResult::success(vec![
-                // Human-readable: audience=User means NOT sent to LLM
-                Content::text(formatted).with_audience(vec![Role::User]),
-                // Compact JSON: audience=Assistant means sent to LLM only
-                Content::text(compact_json).with_audience(vec![Role::Assistant]),
-            ]))
+            let formatted = format::compact_tool_result(&request.name, &result, content_length);
+            Ok(CallToolResult::success(vec![Content::text(formatted)]))
         }
     }
 

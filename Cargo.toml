@@ -1,6 +1,6 @@
 [package]
 name = "engram_mcp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "MCP server for AI agent persistent memory with SQLite and local embeddings"
 license = "MIT"

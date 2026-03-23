@@ -371,7 +371,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "types": {"type": "array", "items": {"type": "string"}, "description": "Filter by memory type(s): fact, decision, preference, pattern, debug, entity."},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter to memories with any of these tags."},
                     "semantic_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Balance between meaning (1.0) and keywords (0.0). Default 0.7. Lower for exact-term searches."},
-                    "branch_mode": {"type": "string", "description": "'current' (default) = global + current branch, 'all' = all branches, 'global' = global only, or a specific branch name."}
+                    "branch_mode": {"type": "string", "description": "'current' (default) = global + current branch, 'all' = all branches, 'global' = global only, or a specific branch name."},
+                    "content_length": {"type": "integer", "minimum": 1, "description": "Max characters to show per memory content (default 300)."}
                 },
                 "required": ["query"]
             })),
@@ -386,7 +387,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Max memories to return (default 5)."},
                     "min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Minimum similarity threshold (default 0.3)."},
                     "types": {"type": "array", "items": {"type": "string"}, "description": "Filter by memory type(s)."},
-                    "hierarchical": {"type": "boolean", "description": "Use cluster-based retrieval for diverse results (default true). Set false for flat similarity ranking."}
+                    "hierarchical": {"type": "boolean", "description": "Use cluster-based retrieval for diverse results (default true). Set false for flat similarity ranking."},
+                    "content_length": {"type": "integer", "minimum": 1, "description": "Max characters to show per memory content (default 300)."}
                 },
                 "required": ["context"]
             })),
