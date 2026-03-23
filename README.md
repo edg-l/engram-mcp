@@ -133,19 +133,15 @@ Configuration is done via environment variables:
 
 **Background Decay:** The MCP server runs a background job that periodically applies decay to all memories based on time since last access.
 
-### Auto-load context with Claude Code hooks
+### Auto-load context on session start (Claude Code hook)
 
-Engram includes two hook scripts for Claude Code that inject memories into the conversation automatically:
+Engram includes a hook script that automatically loads relevant memories at the start of every Claude Code conversation. This gives the LLM project context without relying on it to call `memory_context` explicitly.
 
-- `engram-hook.sh` — runs on `SessionStart`, loads the top 10 project-relevant memories at the beginning of each conversation
-- `engram-prompt-hook.sh` — runs on `UserPromptSubmit`, queries memories matching each user message for targeted context
-
-**1. Copy the hook scripts:**
+**1. Copy the hook script:**
 
 ```bash
 cp scripts/engram-hook.sh ~/.claude/hooks/engram-hook.sh
-cp scripts/engram-prompt-hook.sh ~/.claude/hooks/engram-prompt-hook.sh
-# or reference them directly from the install location
+# or reference it directly from the install location
 ```
 
 **2. Add to your settings** (`~/.claude/settings.json` for global, or `.claude/settings.json` per-project):
@@ -162,22 +158,12 @@ cp scripts/engram-prompt-hook.sh ~/.claude/hooks/engram-prompt-hook.sh
           }
         ]
       }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/engram-prompt-hook.sh"
-          }
-        ]
-      }
     ]
   }
 }
 ```
 
-`engram-hook.sh` runs `engram-cli context` to load broad project context once per session. `engram-prompt-hook.sh` reads the submitted prompt from stdin and runs `engram-cli query` to surface the top 5 memories relevant to that specific message. Both hooks exit silently if `engram-cli` is not on PATH or no memories are found. Both work in non-git directories, using the directory name as the project context.
+The hook runs `engram-cli context` to load the top 10 relevant memories for the current project using recent git activity as context. It exits silently if `engram-cli` is not on PATH or no memories are found. Works in non-git directories, using the directory name as the project context.
 
 ### Tip: Add a CLAUDE.md hint
 
