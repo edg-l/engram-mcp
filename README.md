@@ -10,42 +10,27 @@
   <a href="https://github.com/edg-l/engram-mcp/actions/workflows/release.yml"><img src="https://github.com/edg-l/engram-mcp/actions/workflows/release.yml/badge.svg" alt="Release"></a>
 </p>
 
-A persistent memory system for AI agents built as an MCP (Model Context Protocol) server. Provides project-scoped knowledge storage with semantic search, memory decay, and relationship graphs.
-
-## Overview
-
-Engram enables AI agents to maintain long-term memory across sessions, remembering:
-
-- **Facts** about the codebase and project
-- **Decisions** and their rationale
-- **Preferences** for coding style and patterns
-- **Patterns** and idioms used in the codebase
-- **Debug history** and solutions
-- **Entities** like important files, functions, or concepts
-
-Memories are stored locally in SQLite, embedded using a local model (all-MiniLM-L6-v2), and retrieved via semantic similarity search.
+A persistent memory system for AI agents, built as an [MCP](https://modelcontextprotocol.io/) server. Gives LLMs long-term, project-scoped knowledge with semantic search, automatic decay, deduplication, and relationship graphs. Everything runs locally: SQLite for storage, ONNX embeddings (256-dim MRL vectors) for retrieval.
 
 ## Features
 
-- **Semantic Search**: Find relevant memories using natural language queries
-- **Local Embeddings**: Uses fastembed with all-MiniLM-L6-v2 (384 dimensions, runs locally)
-- **Memory Decay**: Relevance scores decay over time, with reinforcement on access
-- **Relationship Graphs**: Link memories with typed relationships (supersedes, relates_to, derived_from, contradicts)
-- **Contradiction Detection**: Automatically flags potential contradictions (similarity > 0.85)
-- **Auto-Summarization**: Long content (> 500 chars) is automatically summarized
-- **Batch Operations**: Store or delete up to 100 memories atomically
-- **Import/Export**: Backup and restore memories in JSON format
-- **Project Scoping**: Memories are isolated per project
-- **MCP Protocol**: Standard interface for AI assistant integration
+- **Semantic search** with hybrid scoring (cosine similarity + recency + importance)
+- **Local embeddings** via [mdbr-leaf-ir](https://huggingface.co/onnx-community/mdbr-leaf-ir-ONNX) (256-dim MRL, quantized ONNX, runs locally)
+- **Memory decay** with automatic relevance scoring, reinforcement on access, and auto-pruning of dead memories
+- **Pinned memories** that never decay or get pruned, for permanent knowledge
+- **Global memories** visible across all projects, for cross-project knowledge
+- **Semantic deduplication** at store time (0.90+ similarity auto-merge) and periodic background dedup
+- **Hierarchical clustering** with centroid-based retrieval for large memory stores
+- **Relationship graphs** linking memories (supersedes, relates_to, derived_from, contradicts)
+- **Contradiction detection** automatically flags conflicts (similarity > 0.85)
+- **Pre-filtered retrieval** caps embedding scans at 500 candidates (configurable) for performance at scale
+- **Branch-aware queries** filter by git branch scope
+- **Import/export** for backup and migration
+- **Claude Code hook** for automatic context injection at session start
 
 ## Installation
 
-### Prerequisites
-
-- Rust 1.70+ (uses edition 2024)
-- SQLite (bundled with rusqlite)
-
-### Install from crates.io
+### From crates.io
 
 ```bash
 cargo install engram_mcp
@@ -53,7 +38,7 @@ cargo install engram_mcp
 
 This installs both `engram` (MCP server) and `engram-cli` (command-line tool).
 
-### Build from Source
+### From source
 
 ```bash
 git clone https://github.com/edg-l/engram-mcp.git
@@ -61,39 +46,15 @@ cd engram-mcp
 cargo build --release
 ```
 
-The binary will be at `target/release/engram`.
+## Setup
 
-### Configure with Claude Code
+### Claude Code
 
 ```bash
 claude mcp add -s user engram $(which engram)
 ```
 
-#### Allow All Permissions
-
-By default, Claude Code will ask for permission before using each MCP tool. To allow all Engram tools without prompts, add to your `~/.claude/settings.json`:
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "mcp__engram__memory_store",
-      "mcp__engram__memory_query",
-      "mcp__engram__memory_update",
-      "mcp__engram__memory_delete",
-      "mcp__engram__memory_link",
-      "mcp__engram__memory_graph",
-      "mcp__engram__memory_store_batch",
-      "mcp__engram__memory_delete_batch",
-      "mcp__engram__memory_export",
-      "mcp__engram__memory_import",
-      "mcp__engram__memory_stats"
-    ]
-  }
-}
-```
-
-Or allow all Engram tools with a single pattern:
+Allow all Engram tools without permission prompts:
 
 ```json
 {
@@ -103,9 +64,9 @@ Or allow all Engram tools with a single pattern:
 }
 ```
 
-### Configure with Claude Desktop
+### Claude Desktop
 
-Add to the config file:
+Add to your config file:
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
@@ -119,32 +80,17 @@ Add to the config file:
 }
 ```
 
-## Configuration
+### Auto-load context on session start (Claude Code)
 
-Configuration is done via environment variables:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ENGRAM_DB` | Path to SQLite database file | `~/.local/share/engram/memories.db` |
-| `ENGRAM_PROJECT` | Project identifier for scoping memories | Git root path (or current directory if not in a git repo) |
-| `ENGRAM_DECAY_INTERVAL` | Background decay job interval in seconds | `3600` (1 hour) |
-
-**Project Detection:** Engram automatically detects the git repository root, so running from any subdirectory uses the same project scope.
-
-**Background Decay:** The MCP server runs a background job that periodically applies decay to all memories based on time since last access.
-
-### Auto-load context on session start (Claude Code hook)
-
-Engram includes a hook script that automatically loads relevant memories at the start of every Claude Code conversation. This gives the LLM project context without relying on it to call `memory_context` explicitly.
+Engram includes a hook script that loads relevant memories at the start of every conversation. It uses recent git activity to build a semantic query, so the LLM gets project context without needing to call `memory_context` explicitly.
 
 **1. Copy the hook script:**
 
 ```bash
 cp scripts/engram-hook.sh ~/.claude/hooks/engram-hook.sh
-# or reference it directly from the install location
 ```
 
-**2. Add to your settings** (`~/.claude/settings.json` for global, or `.claude/settings.json` per-project):
+**2. Add to your settings** (`~/.claude/settings.json`):
 
 ```json
 {
@@ -163,126 +109,81 @@ cp scripts/engram-hook.sh ~/.claude/hooks/engram-hook.sh
 }
 ```
 
-The hook runs `engram-cli context` to load the top 10 relevant memories for the current project using recent git activity as context. It exits silently if `engram-cli` is not on PATH or no memories are found. Works in non-git directories, using the directory name as the project context.
+Works in non-git directories (falls back to directory name). Exits silently if `engram-cli` is not on PATH.
 
-### Tip: Add a CLAUDE.md hint
+## Configuration
 
-Optionally, you can add a brief hint to your project's `CLAUDE.md` to encourage proactive memory use:
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENGRAM_DB` | SQLite database path | `~/.local/share/engram/memories.db` |
+| `ENGRAM_PROJECT` | Project scope identifier | Git root directory name |
+| `ENGRAM_DECAY_INTERVAL` | Decay job interval (seconds) | `3600` (1 hour) |
+| `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
+| `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
 
-```markdown
-## Memory
-Engram MCP available. Store decisions/patterns, query before architectural changes.
-```
+## Memory Types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `fact` | Objective information | "The API uses JWT authentication" |
+| `decision` | Architectural choices and rationale | "Chose SQLite over Postgres for simplicity" |
+| `preference` | User or project preferences | "Prefer explicit error handling over unwrap" |
+| `pattern` | Recurring approaches | "All handlers return Result<Json<T>, AppError>" |
+| `debug` | Past issues and solutions | "OOM was caused by unbounded channel buffer" |
+| `entity` | People, systems, services | "UserService handles all auth logic" |
 
 ## MCP Tools
 
-### memory_store
+| Tool | Description |
+|------|-------------|
+| `memory_store` | Store a memory with embedding, auto-dedup, auto-cluster, contradiction detection |
+| `memory_query` | Semantic search with hybrid scoring, pagination, branch filtering |
+| `memory_context` | Load relevant memories for a task (hierarchical retrieval via clusters) |
+| `memory_update` | Update content, tags, importance, pinned status |
+| `memory_delete` | Remove a memory and its relationships |
+| `memory_link` | Create typed relationships between memories |
+| `memory_graph` | Traverse relationship graph from a root memory |
+| `memory_store_batch` | Store up to 100 memories atomically |
+| `memory_delete_batch` | Delete multiple memories by ID |
+| `memory_export` | Export project memories to JSON |
+| `memory_import` | Import from JSON (merge or replace modes) |
+| `memory_stats` | Project statistics (counts, types, pinned, global, clusters) |
+| `memory_prune` | Remove low-relevance memories (dry run by default) |
+| `memory_dedup` | Find and merge duplicate memories (dry run by default) |
+| `memory_promote` | Promote a branch-local memory to global scope |
 
-Store a new memory.
+### Storing memories
 
 ```json
 {
-  "content": "The API uses JWT tokens for authentication with RS256 signing",
-  "type": "fact",
-  "tags": ["auth", "api", "security"],
-  "importance": 0.8,
-  "summary": "JWT auth with RS256",
-  "related_to": ["mem_abc123"]
+  "content": "We chose PostgreSQL over SQLite for the API because of concurrent write requirements",
+  "type": "decision",
+  "tags": ["database", "api", "architecture"],
+  "importance": 0.7,
+  "pinned": true,
+  "global": false
 }
 ```
 
-**Parameters:**
-- `content` (required): The memory content
-- `type` (required): One of `fact`, `decision`, `preference`, `pattern`, `debug`, `entity`
-- `tags`: Array of categorization tags
-- `importance`: 0.0-1.0, affects decay rate (default: 0.5)
-- `summary`: Short version for listings
-- `related_to`: IDs of related memories to link
+- `pinned: true` -- memory never decays or gets pruned
+- `global: true` -- memory is visible in all projects (forces `branch` to null)
+- `importance` -- 0.3 minor, 0.5 normal, 0.7 important, 0.9 critical
 
-**Returns:**
-```json
-{
-  "id": "mem_a1b2c3d4...",
-  "message": "Memory stored successfully"
-}
-```
-
-### memory_query
-
-Search for relevant memories using semantic similarity.
+### Querying
 
 ```json
 {
-  "query": "how does authentication work",
+  "query": "what database do we use and why",
   "limit": 10,
   "min_relevance": 0.3,
-  "types": ["fact", "decision"],
-  "tags": ["auth"]
+  "types": ["decision", "fact"],
+  "branch_mode": "current"
 }
 ```
 
-**Parameters:**
-- `query` (required): Natural language search query
-- `limit`: Maximum results (default: 10, max: 100)
-- `min_relevance`: Minimum score threshold (default: 0.3)
-- `types`: Filter by memory types
-- `tags`: Filter by tags (matches any)
+Branch modes: `current` (global + current branch), `global` (global only), `all`, or a specific branch name.
 
-**Returns:**
-```json
-{
-  "count": 2,
-  "memories": [
-    {
-      "memory": {
-        "id": "mem_...",
-        "content": "...",
-        "memory_type": "fact",
-        "tags": ["auth"],
-        "importance": 0.8,
-        "relevance_score": 0.95,
-        ...
-      },
-      "score": 0.87
-    }
-  ]
-}
-```
-
-### memory_update
-
-Update an existing memory.
-
-```json
-{
-  "id": "mem_abc123",
-  "content": "Updated content...",
-  "importance": 0.9,
-  "tags": ["new", "tags"],
-  "summary": "New summary"
-}
-```
-
-**Parameters:**
-- `id` (required): Memory ID to update
-- `content`: New content (re-generates embedding)
-- `importance`: New importance score
-- `tags`: New tags (replaces existing)
-- `summary`: New summary
-
-### memory_delete
-
-Delete a memory and its relationships.
-
-```json
-{
-  "id": "mem_abc123"
-}
-```
-
-### memory_link
-
-Create a relationship between memories.
+### Relationships
 
 ```json
 {
@@ -293,334 +194,139 @@ Create a relationship between memories.
 }
 ```
 
-**Relation types:**
-- `relates_to`: General association
-- `supersedes`: Source replaces/updates target
-- `derived_from`: Source is derived from target
-- `contradicts`: Source conflicts with target
+Types: `relates_to`, `supersedes`, `derived_from`, `contradicts`.
 
-### memory_graph
+## CLI
 
-Retrieve a memory with its related memories via graph traversal.
+```bash
+# Search
+engram-cli query "how does authentication work"
+engram-cli context "working on auth refactor"    # broad context loading
+engram-cli context "auth refactor" --global      # include global memories
 
-```json
-{
-  "id": "mem_abc123",
-  "depth": 2,
-  "relation_types": ["relates_to", "derived_from"]
-}
+# CRUD
+engram-cli store "The API uses rate limiting" -t fact --tags api,security
+engram-cli store "Always use snake_case" -t preference --pinned --global
+engram-cli show mem_abc123
+engram-cli list
+engram-cli update mem_abc123 -c "Updated content" --importance 0.9
+engram-cli delete mem_abc123
+
+# Pinning
+engram-cli pin mem_abc123       # exempt from decay and pruning
+engram-cli unpin mem_abc123
+
+# Relationships
+engram-cli link mem_abc123 mem_def456 -r relates_to
+
+# Import/Export
+engram-cli export -o backup.json
+engram-cli import backup.json
+
+# Maintenance
+engram-cli stats
+engram-cli decay                        # run decay manually
+engram-cli prune -t 0.2 --confirm       # remove low-relevance memories
+engram-cli dedup -t 0.90                # find duplicates (dry run)
+engram-cli dedup -t 0.90 --confirm      # merge duplicates
+engram-cli wipe                         # show what would be deleted
+engram-cli wipe --confirm               # delete all project memories
+
+# Observability
+engram-cli insights     # usage patterns, top accessed, never accessed, health summary
+engram-cli health       # actionable maintenance report with suggested commands
 ```
 
-**Parameters:**
-- `id` (required): Root memory ID
-- `depth`: Traversal depth (default: 2, max: 5)
-- `relation_types`: Filter by relationship types
+## How It Works
 
-**Returns:**
-```json
-{
-  "root": { "id": "mem_abc123", ... },
-  "related": [
-    {
-      "memory": { ... },
-      "relation": "relates_to",
-      "direction": "outgoing",
-      "depth": 1
-    }
-  ]
-}
-```
+### Hybrid Scoring
 
-### memory_store_batch
-
-Store multiple memories atomically (up to 100).
-
-```json
-{
-  "memories": [
-    {
-      "content": "First memory content",
-      "type": "fact",
-      "tags": ["tag1"]
-    },
-    {
-      "content": "Second memory content",
-      "type": "decision",
-      "importance": 0.9
-    }
-  ]
-}
-```
-
-### memory_delete_batch
-
-Delete multiple memories by ID.
-
-```json
-{
-  "ids": ["mem_abc123", "mem_def456", "mem_ghi789"]
-}
-```
-
-### memory_export
-
-Export all project memories to JSON.
-
-```json
-{
-  "include_embeddings": false
-}
-```
-
-**Parameters:**
-- `include_embeddings`: Include embedding vectors in export (default: false, increases size significantly)
-
-### memory_import
-
-Import memories from JSON.
-
-```json
-{
-  "data": { ... },
-  "mode": "merge"
-}
-```
-
-**Parameters:**
-- `data` (required): JSON data from memory_export
-- `mode`: `merge` (add new, skip existing) or `replace` (clear and import all)
-
-### memory_stats
-
-Get statistics for the current project.
-
-**Returns:**
-```json
-{
-  "total_memories": 42,
-  "by_type": {
-    "fact": 20,
-    "decision": 10,
-    "pattern": 12
-  },
-  "avg_relevance": 0.75,
-  "total_relationships": 15
-}
-```
-
-## MCP Resources
-
-Access individual memories via URI:
+`memory_context` scores memories using three signals:
 
 ```
-memory://{project}/{id}
+score = 0.6 * cosine_similarity + 0.2 * recency + 0.2 * importance
 ```
 
-## MCP Prompts
+Where `recency = exp(-0.02 * days_since_access)`. This means a recently accessed, important memory can outrank a slightly more similar but old, low-importance one.
 
-### recall_context
-
-Retrieve relevant memories for a given context. Useful for pre-loading context at the start of a conversation.
-
-## Memory Types
-
-| Type | Description | Example |
-|------|-------------|---------|
-| `fact` | Objective information | "The API uses JWT authentication" |
-| `decision` | Architectural choices | "Chose SQLite over Postgres for simplicity" |
-| `preference` | User/project preferences | "Prefer explicit error handling over unwrap" |
-| `pattern` | Recurring code patterns | "All handlers return Result<Json<T>, AppError>" |
-| `debug` | Past issues and solutions | "OOM was caused by unbounded channel buffer" |
-| `entity` | Named entities | "UserService handles all auth logic" |
-
-## Memory Decay Algorithm
+### Memory Decay
 
 Memories have a relevance score (0.0-1.0) that evolves over time:
 
 ```
 relevance = (time_decay * importance_factor) + usage_boost
 
-where:
-  time_decay = exp(-decay_rate * days_since_access)
+  time_decay       = exp(-decay_rate * days_since_access)
   importance_factor = 0.5 + (importance * 0.5)
-  usage_boost = ln(1 + access_count) * 0.1
+  usage_boost      = ln(1 + access_count) * 0.1
 ```
 
-- **Decay rate**: Configurable per project (default: 0.01/day)
-- **Reinforcement**: Accessing a memory boosts its score by 0.1
-- **Floor**: Memories never drop below 0.1
+- Accessing a memory boosts its score by 0.1
+- Pinned memories skip decay entirely
+- Memories that hit the floor (0.1), were never accessed, and are older than 30 days are auto-pruned
+
+### Deduplication
+
+- **At store time**: new memories with >= 0.90 cosine similarity to an existing memory of the same type are automatically merged (tags combined, max importance kept, provenance tracked)
+- **Background**: the 6-hourly recluster job also deduplicates within clusters
+- **Global wins**: when a global and local memory are duplicates, the global one always survives
+
+### Clustering
+
+Related memories are automatically grouped into clusters with centroid summaries. `memory_context` uses hierarchical retrieval: score cluster centroids first, then fetch the best members from top clusters. Falls back to flat retrieval when fewer than 10 memories exist.
+
+### Pre-filtered Retrieval
+
+For large memory stores, `memory_context` pre-filters candidates via SQL before loading embeddings:
+
+```sql
+SELECT ... FROM embeddings
+WHERE memory_id IN (
+    SELECT id FROM memories
+    WHERE (project_id = ? OR global = 1)
+    ORDER BY last_accessed_at DESC LIMIT 500
+)
+UNION  -- pinned memories always included
+SELECT ... FROM embeddings
+WHERE memory_id IN (
+    SELECT id FROM memories WHERE pinned = 1
+)
+```
+
+The cap is configurable via `ENGRAM_MAX_CANDIDATES`. `memory_query` always does a full scan for comprehensive results.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     MCP Server                          │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │                    Tools                         │   │
-│  │  memory_store  memory_query  memory_update      │   │
-│  │  memory_delete memory_link   memory_graph       │   │
-│  └──────────────────────┬──────────────────────────┘   │
-│                         │                              │
-│  ┌──────────────────────┴──────────────────────────┐   │
-│  │                 Core Engine                      │   │
-│  │  ┌────────────┐  ┌────────────┐  ┌───────────┐  │   │
-│  │  │ Embedding  │  │   Decay    │  │   Graph   │  │   │
-│  │  │  Service   │  │  Manager   │  │ Resolver  │  │   │
-│  │  └────────────┘  └────────────┘  └───────────┘  │   │
-│  └──────────────────────┬──────────────────────────┘   │
-│                         │                              │
-│  ┌──────────────────────┴──────────────────────────┐   │
-│  │              SQLite Database                     │   │
-│  │  memories | embeddings | relationships | projects│   │
-│  └─────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-```
-
-## Database Schema
-
-```sql
--- Core memory storage
-CREATE TABLE memories (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    memory_type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    summary TEXT,
-    tags TEXT,  -- JSON array
-    importance REAL DEFAULT 0.5,
-    relevance_score REAL DEFAULT 1.0,
-    access_count INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    last_accessed_at INTEGER NOT NULL
-);
-
--- Vector embeddings
-CREATE TABLE embeddings (
-    memory_id TEXT PRIMARY KEY,
-    vector BLOB NOT NULL,  -- 384 x f32 = 1.5KB
-    model_version TEXT NOT NULL
-);
-
--- Relationship graph
-CREATE TABLE relationships (
-    id TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    relation_type TEXT NOT NULL,
-    strength REAL DEFAULT 1.0,
-    created_at INTEGER NOT NULL
-);
-
--- Project configuration
-CREATE TABLE projects (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    root_path TEXT,
-    decay_rate REAL DEFAULT 0.01,
-    created_at INTEGER NOT NULL
-);
-```
-
-## CLI
-
-Engram includes a CLI tool (`engram-cli`) for direct interaction with the memory database.
-
-```bash
-# Semantic search
-engram-cli query "how does authentication work"
-
-# List all memories
-engram-cli list
-
-# Show a specific memory
-engram-cli show mem_abc123
-
-# Store a new memory
-engram-cli store "The API uses rate limiting" -t fact --tags api,security
-
-# Update a memory
-engram-cli update mem_abc123 -c "Updated content" --importance 0.9
-
-# Delete a memory
-engram-cli delete mem_abc123
-
-# Link two memories
-engram-cli link mem_abc123 mem_def456 -r relates_to
-
-# Export to file
-engram-cli export -o backup.json
-
-# Import from file
-engram-cli import backup.json
-
-# Load context for a task (semantic search for relevant memories)
-engram-cli context "working on authentication refactor"
-
-# Show project statistics
-engram-cli stats
-
-# Run decay manually
-engram-cli decay
-
-# Prune low-relevance memories
-engram-cli prune -t 0.2 --confirm
+┌──────────────────────────────────────────────────────┐
+│                    MCP Server                         │
+│                                                      │
+│  Tools: store, query, context, update, delete,       │
+│         link, graph, batch, export/import,            │
+│         stats, prune, dedup, promote                  │
+│                                                      │
+│  ┌────────────┐ ┌──────────┐ ┌───────────────────┐  │
+│  │ Embedding  │ │  Decay   │ │    Clustering      │  │
+│  │  Service   │ │ + Prune  │ │   + Dedup          │  │
+│  └────────────┘ └──────────┘ └───────────────────┘  │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │              SQLite Database                   │   │
+│  │  memories | embeddings | relationships        │   │
+│  │  projects | clusters   | cluster_members      │   │
+│  └──────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Development
 
-### Running Tests
-
 ```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
+cargo build --release    # binaries: target/release/engram, target/release/engram-cli
+cargo test               # run all tests
+cargo clippy             # lint
+cargo fmt --check        # format check
 ```
-
-### Project Structure
-
-```
-src/
-├── main.rs        # MCP server entry point, stdio transport, resources, prompts
-├── cli.rs         # CLI binary (engram-cli)
-├── lib.rs         # Library exports
-├── db.rs          # SQLite operations (memories, embeddings, relationships, batch ops)
-├── memory.rs      # Memory, MemoryType, Relationship, RelationType, ProjectStats
-├── embedding.rs   # fastembed wrapper (384-dim vectors)
-├── decay.rs       # Relevance decay algorithm
-├── tools.rs       # MCP tool handlers + contradiction detection
-├── summarize.rs   # Extractive summarization for large content
-├── export.rs      # Import/export JSON format
-└── error.rs       # MemoryError enum
-
-tests/
-└── integration.rs # Integration tests
-```
-
-## Dependencies
-
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| rmcp | 0.14 | MCP protocol implementation |
-| tokio | 1.49 | Async runtime |
-| rusqlite | 0.38 | SQLite database |
-| fastembed | 5 | Local ONNX embeddings |
-| serde | 1.0 | Serialization |
-| uuid | 1.20 | ID generation |
-| chrono | 0.4 | Timestamps |
 
 ## License
 
 MIT OR Apache-2.0
-
-## Contributing
-
-Contributions welcome! Please ensure tests pass before submitting PRs:
-
-```bash
-cargo test
-cargo clippy
-cargo fmt --check
-```
