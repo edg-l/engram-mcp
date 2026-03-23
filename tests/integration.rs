@@ -338,22 +338,30 @@ fn test_branch_mode_filtering() {
     db.store_memory(&branch_y_mem).unwrap();
 
     // Test "all" mode (no filter)
-    let all = db.query_memories_with_branch(project_id, None, None, None, 100, None).unwrap();
+    let all = db
+        .query_memories_with_branch(project_id, None, None, None, 100, None)
+        .unwrap();
     assert_eq!(all.len(), 3);
 
     // Test "global" mode
-    let global = db.query_memories_with_branch(project_id, None, None, None, 100, Some(None)).unwrap();
+    let global = db
+        .query_memories_with_branch(project_id, None, None, None, 100, Some(None))
+        .unwrap();
     assert_eq!(global.len(), 1);
     assert_eq!(global[0].id, "mem_global");
 
     // Test "current" mode with specific branch
-    let current = db.query_memories_with_branch(project_id, None, None, None, 100, Some(Some("feature-x"))).unwrap();
+    let current = db
+        .query_memories_with_branch(project_id, None, None, None, 100, Some(Some("feature-x")))
+        .unwrap();
     assert_eq!(current.len(), 2); // global + feature-x
     assert!(current.iter().any(|m| m.id == "mem_global"));
     assert!(current.iter().any(|m| m.id == "mem_branch_x"));
 
     // Test specific branch name
-    let specific = db.query_memories_with_branch(project_id, None, None, None, 100, Some(Some("feature-y"))).unwrap();
+    let specific = db
+        .query_memories_with_branch(project_id, None, None, None, 100, Some(Some("feature-y")))
+        .unwrap();
     assert_eq!(specific.len(), 2); // global + feature-y
     assert!(specific.iter().any(|m| m.id == "mem_global"));
     assert!(specific.iter().any(|m| m.id == "mem_branch_y"));
@@ -365,7 +373,7 @@ fn test_store_auto_dedup() {
     let db_path = dir.path().join("test.db");
 
     use engram_mcp::db::Database;
-    use engram_mcp::embedding::{cosine_similarity, EmbeddingService};
+    use engram_mcp::embedding::{EmbeddingService, cosine_similarity};
     use engram_mcp::memory::{Memory, MemoryType};
 
     let db = Database::open(&db_path).unwrap();
@@ -444,7 +452,7 @@ fn test_cluster_assignment() {
     let db_path = dir.path().join("test.db");
 
     use engram_mcp::db::Database;
-    use engram_mcp::embedding::{cosine_similarity, EmbeddingService};
+    use engram_mcp::embedding::{EmbeddingService, cosine_similarity};
     use engram_mcp::memory::{Memory, MemoryCluster, MemoryType};
 
     let db = Database::open(&db_path).unwrap();
@@ -524,7 +532,7 @@ fn test_recluster_merge() {
     let db_path = dir.path().join("test.db");
 
     use engram_mcp::db::Database;
-    use engram_mcp::embedding::{cosine_similarity, EmbeddingService};
+    use engram_mcp::embedding::{EmbeddingService, cosine_similarity};
     use engram_mcp::memory::{Memory, MemoryCluster, MemoryType};
 
     let db = Database::open(&db_path).unwrap();

@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::error::MemoryError;
-use crate::memory::{Memory, MemoryCluster, MemoryType, Project, ProjectStats, RelationType, Relationship};
+use crate::memory::{
+    Memory, MemoryCluster, MemoryType, Project, ProjectStats, RelationType, Relationship,
+};
 
 const SCHEMA: &str = r#"
 -- Core memory storage
@@ -194,7 +196,7 @@ impl Database {
 
         // Ensure schema_version table exists
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);"
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
         )?;
 
         let current_version: i64 = conn
@@ -221,7 +223,8 @@ impl Database {
                 conn.execute_batch("ALTER TABLE memories ADD COLUMN merged_from TEXT;")?;
             }
 
-            conn.execute_batch(r#"
+            conn.execute_batch(
+                r#"
                 CREATE TABLE IF NOT EXISTS memory_clusters (
                     id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
@@ -240,7 +243,8 @@ impl Database {
 
                 CREATE INDEX IF NOT EXISTS idx_clusters_project ON memory_clusters(project_id);
                 CREATE INDEX IF NOT EXISTS idx_cluster_members_memory ON cluster_members(memory_id);
-            "#)?;
+            "#,
+            )?;
 
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
@@ -647,11 +651,12 @@ impl Database {
         let old_tags: Vec<String> = serde_json::from_str(&old_tags_json).unwrap_or_default();
 
         // Get new memory's current state
-        let (new_tags_json, new_importance, existing_merged_from): (String, f64, Option<String>) = tx.query_row(
-            "SELECT tags, importance, merged_from FROM memories WHERE id = ?1",
-            params![new_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        let (new_tags_json, new_importance, existing_merged_from): (String, f64, Option<String>) =
+            tx.query_row(
+                "SELECT tags, importance, merged_from FROM memories WHERE id = ?1",
+                params![new_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         let mut new_tags: Vec<String> = serde_json::from_str(&new_tags_json).unwrap_or_default();
 
         // Union tags
@@ -694,9 +699,10 @@ impl Database {
     #[allow(dead_code)] // Used by clustering pipeline
     pub fn create_cluster(&self, cluster: &MemoryCluster) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let centroid_bytes: Option<Vec<u8>> = cluster.centroid.as_ref().map(|v| {
-            v.iter().flat_map(|f| f.to_le_bytes()).collect()
-        });
+        let centroid_bytes: Option<Vec<u8>> = cluster
+            .centroid
+            .as_ref()
+            .map(|v| v.iter().flat_map(|f| f.to_le_bytes()).collect());
         conn.execute(
             "INSERT INTO memory_clusters (id, project_id, summary, member_count, centroid, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -768,7 +774,8 @@ impl Database {
         if let Some(row) = rows.next()? {
             let centroid_bytes: Option<Vec<u8>> = row.get(4)?;
             let centroid = centroid_bytes.map(|bytes| {
-                bytes.chunks_exact(4)
+                bytes
+                    .chunks_exact(4)
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect()
             });
@@ -788,7 +795,10 @@ impl Database {
 
     /// Get all clusters for a project.
     #[allow(dead_code)] // Used by clustering pipeline
-    pub fn get_clusters_for_project(&self, project_id: &str) -> Result<Vec<MemoryCluster>, MemoryError> {
+    pub fn get_clusters_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<MemoryCluster>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, project_id, summary, member_count, centroid, created_at, updated_at FROM memory_clusters WHERE project_id = ?1"
@@ -796,7 +806,8 @@ impl Database {
         let rows = stmt.query_map(params![project_id], |row| {
             let centroid_bytes: Option<Vec<u8>> = row.get(4)?;
             let centroid = centroid_bytes.map(|bytes| {
-                bytes.chunks_exact(4)
+                bytes
+                    .chunks_exact(4)
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect()
             });
@@ -816,7 +827,12 @@ impl Database {
 
     /// Update a cluster's centroid.
     #[allow(dead_code)] // Used by clustering pipeline
-    pub fn update_cluster_centroid(&self, id: &str, centroid: &[f32], summary: &str) -> Result<(), MemoryError> {
+    pub fn update_cluster_centroid(
+        &self,
+        id: &str,
+        centroid: &[f32],
+        summary: &str,
+    ) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
         let centroid_bytes: Vec<u8> = centroid.iter().flat_map(|f| f.to_le_bytes()).collect();
         let now = chrono::Utc::now().timestamp();
@@ -842,9 +858,8 @@ impl Database {
     #[allow(dead_code)] // Used by clustering pipeline
     pub fn get_cluster_member_ids(&self, cluster_id: &str) -> Result<Vec<String>, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT memory_id FROM cluster_members WHERE cluster_id = ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT memory_id FROM cluster_members WHERE cluster_id = ?1")?;
         let rows = stmt.query_map(params![cluster_id], |row| row.get(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -1520,7 +1535,11 @@ mod tests {
         // Verify schema_version table exists and has version 2
         let conn = db.conn.lock().unwrap();
         let version: i64 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |row| row.get(0))
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(version, 2);
 
@@ -1609,7 +1628,8 @@ mod tests {
         db.store_memory(&new_mem).unwrap();
 
         // Merge
-        db.merge_memories("mem_new", "mem_old", "Old fact preview").unwrap();
+        db.merge_memories("mem_new", "mem_old", "Old fact preview")
+            .unwrap();
 
         // Old memory should be deleted
         assert!(db.get_memory("mem_old").unwrap().is_none());
@@ -1686,7 +1706,8 @@ mod tests {
         assert_eq!(clusters.len(), 1);
 
         // Update centroid
-        db.update_cluster_centroid("clust_1", &[0.4, 0.5, 0.6], "Updated summary").unwrap();
+        db.update_cluster_centroid("clust_1", &[0.4, 0.5, 0.6], "Updated summary")
+            .unwrap();
         let c = db.get_cluster("clust_1").unwrap().unwrap();
         assert_eq!(c.summary, "Updated summary");
         assert_eq!(c.centroid.unwrap(), vec![0.4, 0.5, 0.6]);

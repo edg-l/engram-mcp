@@ -773,7 +773,8 @@ impl ToolHandler {
         }
 
         // Assign to cluster
-        let _cluster_id = self.assign_to_cluster(&id, &embedding, &input.content, memory.importance)?;
+        let _cluster_id =
+            self.assign_to_cluster(&id, &embedding, &input.content, memory.importance)?;
 
         // Invalidate search cache since we added new data
         self.invalidate_search_cache();
@@ -1134,7 +1135,9 @@ impl ToolHandler {
                 let new_centroid = self.compute_cluster_centroid(&member_ids)?;
                 let summary = self.generate_cluster_summary(&member_ids)?;
                 if let Some(centroid) = new_centroid {
-                    let _ = self.db.update_cluster_centroid(&cluster_id, &centroid, &summary);
+                    let _ = self
+                        .db
+                        .update_cluster_centroid(&cluster_id, &centroid, &summary);
                 }
             }
         }
@@ -1382,7 +1385,8 @@ impl ToolHandler {
 
         // Assign each new memory to a cluster
         for (i, mem) in memories.iter().enumerate() {
-            let _ = self.assign_to_cluster(&mem.id, &all_embeddings[i], &mem.content, mem.importance);
+            let _ =
+                self.assign_to_cluster(&mem.id, &all_embeddings[i], &mem.content, mem.importance);
         }
 
         // Invalidate search cache since we added new data
@@ -1420,7 +1424,9 @@ impl ToolHandler {
                 let new_centroid = self.compute_cluster_centroid(&member_ids)?;
                 let summary = self.generate_cluster_summary(&member_ids)?;
                 if let Some(centroid) = new_centroid {
-                    let _ = self.db.update_cluster_centroid(cluster_id, &centroid, &summary);
+                    let _ = self
+                        .db
+                        .update_cluster_centroid(cluster_id, &centroid, &summary);
                 }
             }
         }
@@ -1651,7 +1657,8 @@ impl ToolHandler {
                     .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Batch fetch all scored member memories
-                let scored_ids: Vec<String> = member_scores.iter().map(|(id, _)| id.clone()).collect();
+                let scored_ids: Vec<String> =
+                    member_scores.iter().map(|(id, _)| id.clone()).collect();
                 let members_map = self.db.get_memories_batch(&scored_ids)?;
 
                 let mut cluster_count = 0usize;
@@ -1681,9 +1688,7 @@ impl ToolHandler {
                             }
                         }
 
-                        if !type_filters.is_empty()
-                            && !type_filters.contains(&memory.memory_type)
-                        {
+                        if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
                             continue;
                         }
 
@@ -2019,7 +2024,9 @@ impl ToolHandler {
                 let with_time: Vec<(String, f32, i64)> = group
                     .iter()
                     .filter_map(|(id, sim)| {
-                        all_memories.get(id).map(|m| (id.clone(), *sim, m.updated_at))
+                        all_memories
+                            .get(id)
+                            .map(|m| (id.clone(), *sim, m.updated_at))
                     })
                     .collect();
 
@@ -2032,7 +2039,8 @@ impl ToolHandler {
 
                 let keeper_id = sorted[0].0.clone();
                 for (old_id, _, _) in &sorted[1..] {
-                    let old_preview: String = all_memories.get(old_id)
+                    let old_preview: String = all_memories
+                        .get(old_id)
                         .map(|m| m.content.chars().take(100).collect())
                         .unwrap_or_default();
                     self.db.merge_memories(&keeper_id, old_id, &old_preview)?;

@@ -14,7 +14,7 @@
 use engram_mcp::db::Database;
 use engram_mcp::embedding::EmbeddingService;
 use engram_mcp::tools::ToolHandler;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn setup() -> (ToolHandler, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -28,7 +28,9 @@ fn setup() -> (ToolHandler, tempfile::TempDir) {
 }
 
 fn call(handler: &ToolHandler, tool: &str, args: Value) -> Value {
-    handler.handle_tool(tool, args).expect(&format!("{} failed", tool))
+    handler
+        .handle_tool(tool, args)
+        .expect(&format!("{} failed", tool))
 }
 
 /// A memory to store in the corpus.
@@ -74,7 +76,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["api", "errors"],
             importance: 0.6,
         },
-
         // -- Database --
         CorpusMemory {
             id_tag: "database-primary",
@@ -104,7 +105,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["cache", "redis"],
             importance: 0.6,
         },
-
         // -- Auth --
         CorpusMemory {
             id_tag: "auth-jwt",
@@ -120,7 +120,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["auth", "rbac"],
             importance: 0.8,
         },
-
         // -- Frontend --
         CorpusMemory {
             id_tag: "frontend-stack",
@@ -136,7 +135,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["frontend", "state"],
             importance: 0.6,
         },
-
         // -- Deployment --
         CorpusMemory {
             id_tag: "deploy-k8s",
@@ -159,7 +157,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["deployment", "environments"],
             importance: 0.7,
         },
-
         // -- Monitoring --
         CorpusMemory {
             id_tag: "monitoring-metrics",
@@ -182,7 +179,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["monitoring", "sentry"],
             importance: 0.7,
         },
-
         // -- Testing --
         CorpusMemory {
             id_tag: "testing-integration",
@@ -198,7 +194,6 @@ fn corpus() -> Vec<CorpusMemory> {
             tags: &["testing", "ci"],
             importance: 0.5,
         },
-
         // -- Debug notes --
         CorpusMemory {
             id_tag: "debug-oom",
@@ -250,7 +245,6 @@ fn queries() -> Vec<QueryCase> {
             expected: "deploy-k8s",
             type_filter: None,
         },
-
         // -- Semantic / rephrased queries --
         QueryCase {
             name: "caching layer",
@@ -282,7 +276,6 @@ fn queries() -> Vec<QueryCase> {
             expected: "deploy-ci",
             type_filter: None,
         },
-
         // -- Cross-domain / indirect queries --
         QueryCase {
             name: "schema changes",
@@ -314,7 +307,6 @@ fn queries() -> Vec<QueryCase> {
             expected: "testing-integration",
             type_filter: None,
         },
-
         // -- Debug / incident queries --
         QueryCase {
             name: "payment OOM",
@@ -328,7 +320,6 @@ fn queries() -> Vec<QueryCase> {
             expected: "debug-oom-fix",
             type_filter: None,
         },
-
         // -- Type-filtered queries --
         QueryCase {
             name: "decisions about auth",
@@ -342,7 +333,6 @@ fn queries() -> Vec<QueryCase> {
             expected: "deploy-envs",
             type_filter: Some("decision"),
         },
-
         // -- Harder / ambiguous queries --
         QueryCase {
             name: "observability stack",
@@ -372,18 +362,26 @@ fn bench_retrieval_quality() {
 
     for mem in &corpus {
         let tags: Vec<String> = mem.tags.iter().map(|t| t.to_string()).collect();
-        let r = call(&h, "memory_store", json!({
-            "content": mem.content,
-            "type": mem.memory_type,
-            "tags": tags,
-            "importance": mem.importance,
-        }));
+        let r = call(
+            &h,
+            "memory_store",
+            json!({
+                "content": mem.content,
+                "type": mem.memory_type,
+                "tags": tags,
+                "importance": mem.importance,
+            }),
+        );
         id_map.insert(mem.id_tag, r["id"].as_str().unwrap().to_string());
     }
 
     eprintln!("\n{}", "=".repeat(80));
     eprintln!("ENGRAM RETRIEVAL BENCHMARK");
-    eprintln!("Corpus: {} memories | Model: mdbr-leaf-ir q8 d256 | Queries: {}", corpus.len(), queries().len());
+    eprintln!(
+        "Corpus: {} memories | Model: mdbr-leaf-ir q8 d256 | Queries: {}",
+        corpus.len(),
+        queries().len()
+    );
     eprintln!("{}", "=".repeat(80));
 
     // Run queries
@@ -405,11 +403,13 @@ fn bench_retrieval_quality() {
         let expected_id = id_map.get(q.expected).unwrap();
 
         // Find rank of expected memory
-        let rank = memories.iter().position(|m| {
-            m["memory"]["id"].as_str().unwrap() == expected_id.as_str()
-        }).map(|pos| pos + 1); // 1-indexed
+        let rank = memories
+            .iter()
+            .position(|m| m["memory"]["id"].as_str().unwrap() == expected_id.as_str())
+            .map(|pos| pos + 1); // 1-indexed
 
-        let top_result = memories.first()
+        let top_result = memories
+            .first()
             .map(|m| {
                 let content = m["memory"]["content"].as_str().unwrap();
                 if content.len() > 70 {
@@ -420,7 +420,8 @@ fn bench_retrieval_quality() {
             })
             .unwrap_or_else(|| "(no results)".to_string());
 
-        let score = memories.first()
+        let score = memories
+            .first()
             .and_then(|m| m["score"].as_f64())
             .unwrap_or(0.0);
 
@@ -457,7 +458,10 @@ fn bench_retrieval_quality() {
             None => "X ",
         };
 
-        eprintln!("{} {:<23} {:<6} {}", indicator, r.name, rank_str, r.top_result);
+        eprintln!(
+            "{} {:<23} {:<6} {}",
+            indicator, r.name, rank_str, r.top_result
+        );
 
         match r.rank {
             Some(1) => {
@@ -490,14 +494,32 @@ fn bench_retrieval_quality() {
     eprintln!("\n{}", "=".repeat(80));
     eprintln!("SCORECARD");
     eprintln!("{}", "-".repeat(80));
-    eprintln!("  Hit@1:  {}/{} ({:.0}%)", hit_at_1, total, hit_at_1 as f64 / total as f64 * 100.0);
-    eprintln!("  Hit@3:  {}/{} ({:.0}%)", hit_at_3, total, hit_at_3 as f64 / total as f64 * 100.0);
-    eprintln!("  Hit@5:  {}/{} ({:.0}%)", hit_at_5, total, hit_at_5 as f64 / total as f64 * 100.0);
+    eprintln!(
+        "  Hit@1:  {}/{} ({:.0}%)",
+        hit_at_1,
+        total,
+        hit_at_1 as f64 / total as f64 * 100.0
+    );
+    eprintln!(
+        "  Hit@3:  {}/{} ({:.0}%)",
+        hit_at_3,
+        total,
+        hit_at_3 as f64 / total as f64 * 100.0
+    );
+    eprintln!(
+        "  Hit@5:  {}/{} ({:.0}%)",
+        hit_at_5,
+        total,
+        hit_at_5 as f64 / total as f64 * 100.0
+    );
     eprintln!("  MRR:    {:.3}", mrr);
     eprintln!("{}", "=".repeat(80));
 
     // Print misses for debugging
-    let misses: Vec<&QueryResult> = results.iter().filter(|r| r.rank.is_none() || r.rank.unwrap() > 3).collect();
+    let misses: Vec<&QueryResult> = results
+        .iter()
+        .filter(|r| r.rank.is_none() || r.rank.unwrap() > 3)
+        .collect();
     if !misses.is_empty() {
         eprintln!("\nMISSES / LOW RANKS (rank > 3):");
         for r in &misses {

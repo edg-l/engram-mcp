@@ -576,16 +576,34 @@ fn format_prune_result(result: &Value) -> String {
 fn format_dedup_result(result: &Value) -> String {
     let mut output = String::new();
 
-    let dry_run = result.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
-    let threshold = result.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.9);
-    let groups = result.get("duplicate_groups").and_then(|v| v.as_u64()).unwrap_or(0);
-    let total = result.get("total_duplicates").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dry_run = result
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let threshold = result
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.9);
+    let groups = result
+        .get("duplicate_groups")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = result
+        .get("total_duplicates")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let merged = result.get("merged").and_then(|v| v.as_u64()).unwrap_or(0);
 
     if dry_run {
-        output.push_str(&format!("## Dedup Scan (dry run, threshold: {:.2})\n\n", threshold));
+        output.push_str(&format!(
+            "## Dedup Scan (dry run, threshold: {:.2})\n\n",
+            threshold
+        ));
     } else {
-        output.push_str(&format!("## Dedup Results (threshold: {:.2})\n\n", threshold));
+        output.push_str(&format!(
+            "## Dedup Results (threshold: {:.2})\n\n",
+            threshold
+        ));
     }
 
     output.push_str(&format!("- Duplicate groups: {}\n", groups));
@@ -600,10 +618,19 @@ fn format_dedup_result(result: &Value) -> String {
             if let Some(members) = group.get("members").and_then(|v| v.as_array()) {
                 for member in members {
                     let id = member.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                    let sim = member.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let preview = member.get("content_preview").and_then(|v| v.as_str()).unwrap_or("");
+                    let sim = member
+                        .get("similarity")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let preview = member
+                        .get("content_preview")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let mem_type = member.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-                    output.push_str(&format!("- `{}` ({}) [{:.2}]: {}\n", id, mem_type, sim, preview));
+                    output.push_str(&format!(
+                        "- `{}` ({}) [{:.2}]: {}\n",
+                        id, mem_type, sim, preview
+                    ));
                 }
             }
         }
@@ -670,22 +697,38 @@ fn compact_store(result: &Value) -> String {
     }
 
     if let Some(merge) = result.get("merge_info")
-        && !merge.is_null() {
-            let merged_with = merge.get("merged_with").and_then(|v| v.as_str()).unwrap_or("?");
-            let sim = merge.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            out.push_str(&format!("\nMerged with duplicate {} (similarity: {:.2})", merged_with, sim));
-        }
+        && !merge.is_null()
+    {
+        let merged_with = merge
+            .get("merged_with")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let sim = merge
+            .get("similarity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        out.push_str(&format!(
+            "\nMerged with duplicate {} (similarity: {:.2})",
+            merged_with, sim
+        ));
+    }
 
-    let contradictions = result.get("potential_contradictions").and_then(|v| v.as_array());
+    let contradictions = result
+        .get("potential_contradictions")
+        .and_then(|v| v.as_array());
     if let Some(arr) = contradictions
-        && !arr.is_empty() {
-            out.push_str(&format!("\nWarning: {} potential contradiction(s):", arr.len()));
-            for c in arr {
-                let cid = c.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
-                let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                out.push_str(&format!("\n  {} - {}", cid, truncate_str(summary, 80)));
-            }
+        && !arr.is_empty()
+    {
+        out.push_str(&format!(
+            "\nWarning: {} potential contradiction(s):",
+            arr.len()
+        ));
+        for c in arr {
+            let cid = c.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("\n  {} - {}", cid, truncate_str(summary, 80)));
         }
+    }
 
     out
 }
@@ -704,11 +747,17 @@ fn compact_query(result: &Value) -> String {
     for mem in arr {
         let memory = mem.get("memory").unwrap_or(mem);
         let id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let mem_type = memory.get("memory_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let mem_type = memory
+            .get("memory_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let content = memory.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let score = mem.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let tags = memory.get("tags").and_then(|v| v.as_array());
-        let importance = memory.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let importance = memory
+            .get("importance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         out.push_str(&format!("\n[{}] {} ({}", id, mem_type, format_score(score)));
         if importance >= 0.7 {
@@ -716,27 +765,34 @@ fn compact_query(result: &Value) -> String {
         }
         out.push(')');
         if let Some(tags) = tags
-            && !tags.is_empty() {
-                let tag_strs: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
-                if !tag_strs.is_empty() {
-                    out.push_str(&format!(" [{}]", tag_strs.join(", ")));
-                }
+            && !tags.is_empty()
+        {
+            let tag_strs: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
+            if !tag_strs.is_empty() {
+                out.push_str(&format!(" [{}]", tag_strs.join(", ")));
             }
+        }
         out.push('\n');
         out.push_str(&truncate_str(content, 200));
         out.push('\n');
     }
 
     // Contradiction warnings
-    if let Some(warnings) = result.get("contradiction_warnings").and_then(|v| v.as_array())
-        && !warnings.is_empty() {
-            out.push_str("\nContradictions detected:");
-            for w in warnings {
-                let a = w.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
-                let b = w.get("contradicts_id").and_then(|v| v.as_str()).unwrap_or("?");
-                out.push_str(&format!("\n  {} contradicts {}", a, b));
-            }
+    if let Some(warnings) = result
+        .get("contradiction_warnings")
+        .and_then(|v| v.as_array())
+        && !warnings.is_empty()
+    {
+        out.push_str("\nContradictions detected:");
+        for w in warnings {
+            let a = w.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let b = w
+                .get("contradicts_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!("\n  {} contradicts {}", a, b));
         }
+    }
 
     out
 }
@@ -750,24 +806,35 @@ fn compact_context(result: &Value) -> String {
         return "No relevant memories.".to_string();
     }
 
-    let mode = result.get("retrieval_mode").and_then(|v| v.as_str()).unwrap_or("flat");
-    let mut out = format!("{} relevant memory/memories ({} retrieval):\n", arr.len(), mode);
+    let mode = result
+        .get("retrieval_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("flat");
+    let mut out = format!(
+        "{} relevant memory/memories ({} retrieval):\n",
+        arr.len(),
+        mode
+    );
 
     for mem in arr {
         let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let mem_type = mem.get("type").and_then(|v| v.as_str()).unwrap_or("?");
         let content = mem.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let sim = mem.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sim = mem
+            .get("similarity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let tags = mem.get("tags").and_then(|v| v.as_array());
 
         out.push_str(&format!("\n[{}] {} ({})", id, mem_type, format_score(sim)));
         if let Some(tags) = tags
-            && !tags.is_empty() {
-                let tag_strs: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
-                if !tag_strs.is_empty() {
-                    out.push_str(&format!(" [{}]", tag_strs.join(", ")));
-                }
+            && !tags.is_empty()
+        {
+            let tag_strs: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
+            if !tag_strs.is_empty() {
+                out.push_str(&format!(" [{}]", tag_strs.join(", ")));
             }
+        }
         out.push('\n');
         out.push_str(&truncate_str(content, 200));
         out.push('\n');
@@ -778,11 +845,25 @@ fn compact_context(result: &Value) -> String {
 
 fn compact_graph(result: &Value) -> String {
     let root = result.get("root");
-    let root_id = root.and_then(|r| r.get("id")).and_then(|v| v.as_str()).unwrap_or("?");
-    let root_type = root.and_then(|r| r.get("memory_type")).and_then(|v| v.as_str()).unwrap_or("?");
-    let root_content = root.and_then(|r| r.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+    let root_id = root
+        .and_then(|r| r.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let root_type = root
+        .and_then(|r| r.get("memory_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let root_content = root
+        .and_then(|r| r.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
-    let mut out = format!("Root: [{}] {} - {}\n", root_id, root_type, truncate_str(root_content, 100));
+    let mut out = format!(
+        "Root: [{}] {} - {}\n",
+        root_id,
+        root_type,
+        truncate_str(root_content, 100)
+    );
 
     if let Some(related) = result.get("related").and_then(|v| v.as_array()) {
         if related.is_empty() {
@@ -792,7 +873,10 @@ fn compact_graph(result: &Value) -> String {
             for rel in related {
                 let memory = rel.get("memory").unwrap_or(rel);
                 let id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                let mem_type = memory.get("memory_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let mem_type = memory
+                    .get("memory_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let content = memory.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let relation = rel.get("relation").and_then(|v| v.as_str()).unwrap_or("?");
                 let direction = rel.get("direction").and_then(|v| v.as_str()).unwrap_or("?");
@@ -802,7 +886,12 @@ fn compact_graph(result: &Value) -> String {
                 let arrow = if direction == "outgoing" { "->" } else { "<-" };
                 out.push_str(&format!(
                     "\n{}{} {} [{}] {} - {}",
-                    indent, arrow, relation, id, mem_type, truncate_str(content, 80)
+                    indent,
+                    arrow,
+                    relation,
+                    id,
+                    mem_type,
+                    truncate_str(content, 80)
                 ));
             }
         }
@@ -825,20 +914,38 @@ fn compact_batch_store(result: &Value) -> String {
 }
 
 fn compact_prune(result: &Value) -> String {
-    let dry_run = result.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
-    let candidates = result.get("candidates").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dry_run = result
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let candidates = result
+        .get("candidates")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let deleted = result.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0);
-    let threshold = result.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.2);
+    let threshold = result
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.2);
 
     if dry_run {
-        format!("Prune dry run: {} memories below {:.2} threshold. Set confirm=true to delete.", candidates, threshold)
+        format!(
+            "Prune dry run: {} memories below {:.2} threshold. Set confirm=true to delete.",
+            candidates, threshold
+        )
     } else {
-        format!("Pruned {} memories below {:.2} threshold.", deleted, threshold)
+        format!(
+            "Pruned {} memories below {:.2} threshold.",
+            deleted, threshold
+        )
     }
 }
 
 fn compact_promote(result: &Value) -> String {
-    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = result.get("message").and_then(|v| v.as_str()).unwrap_or("");
     if success {
         message.to_string()
@@ -848,24 +955,51 @@ fn compact_promote(result: &Value) -> String {
 }
 
 fn compact_dedup(result: &Value) -> String {
-    let dry_run = result.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
-    let groups = result.get("duplicate_groups").and_then(|v| v.as_u64()).unwrap_or(0);
-    let total = result.get("total_duplicates").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dry_run = result
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let groups = result
+        .get("duplicate_groups")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = result
+        .get("total_duplicates")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let merged = result.get("merged").and_then(|v| v.as_u64()).unwrap_or(0);
 
     if dry_run {
-        format!("Dedup dry run: {} duplicate groups ({} total). Set confirm=true to merge.", groups, total)
+        format!(
+            "Dedup dry run: {} duplicate groups ({} total). Set confirm=true to merge.",
+            groups, total
+        )
     } else {
         format!("Dedup complete: merged {} duplicate memories.", merged)
     }
 }
 
 fn compact_stats(result: &Value) -> String {
-    let count = result.get("memory_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let rels = result.get("relationship_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let rel = result.get("avg_relevance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let clusters = result.get("cluster_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let project = result.get("project_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let count = result
+        .get("memory_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let rels = result
+        .get("relationship_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let rel = result
+        .get("avg_relevance")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let clusters = result
+        .get("cluster_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let project = result
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
 
     format!(
         "Project: {}\nMemories: {}, Relationships: {}, Clusters: {}, Avg relevance: {:.2}",
@@ -874,7 +1008,10 @@ fn compact_stats(result: &Value) -> String {
 }
 
 fn compact_simple(result: &Value) -> String {
-    let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = result.get("message").and_then(|v| v.as_str()).unwrap_or("");
     if success {
         message.to_string()
@@ -966,11 +1103,20 @@ mod tests {
         let compact = compact_tool_result("memory_query", &result);
 
         // Plain text format should contain memory IDs, types, content
-        assert!(compact.contains("mem_123"), "Should contain first memory ID");
-        assert!(compact.contains("mem_456"), "Should contain second memory ID");
+        assert!(
+            compact.contains("mem_123"),
+            "Should contain first memory ID"
+        );
+        assert!(
+            compact.contains("mem_456"),
+            "Should contain second memory ID"
+        );
         assert!(compact.contains("fact"), "Should contain memory type");
         assert!(compact.contains("decision"), "Should contain memory type");
-        assert!(compact.contains("This is a test memory"), "Should contain content");
+        assert!(
+            compact.contains("This is a test memory"),
+            "Should contain content"
+        );
         assert!(compact.contains("test"), "Should contain tags");
         assert!(compact.contains("2 result"), "Should show result count");
     }
@@ -987,7 +1133,10 @@ mod tests {
 
         assert!(compact.contains("mem_789"), "Should contain memory ID");
         assert!(compact.starts_with("Stored"), "Should start with 'Stored'");
-        assert!(!compact.contains("contradiction"), "No contradictions to show");
+        assert!(
+            !compact.contains("contradiction"),
+            "No contradictions to show"
+        );
     }
 
     #[test]
