@@ -18,7 +18,7 @@ Whenever you discover something worth remembering across conversations, call `me
 Do NOT store things that are obvious from reading the code, git history, or documentation. Store the *why* behind decisions, the context that would be lost, and knowledge that took effort to discover.
 
 ## Query for specific lookups
-Use `memory_query` when you need to recall a specific piece of knowledge -- "what database does this project use?" or "why did we choose this approach?" This performs semantic search across stored memories.
+Use `memory_query` when you need to recall a specific piece of knowledge -- "what database does this project use?" or "why did we choose this approach?" This performs semantic search across stored memories. Use `content_length` to control how much content is shown per result (default 300). Increase it when you need full details, decrease it when scanning many results.
 
 # How to store well
 
