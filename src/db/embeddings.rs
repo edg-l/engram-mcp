@@ -1,0 +1,321 @@
+use rusqlite::params;
+
+use crate::error::MemoryError;
+
+use super::Database;
+
+impl Database {
+    // Embedding operations
+    pub fn store_embedding(
+        &self,
+        memory_id: &str,
+        vector: &[f32],
+        model_version: &str,
+    ) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (memory_id, vector, model_version) VALUES (?1, ?2, ?3)",
+            params![memory_id, vector_bytes, model_version],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Available for export functionality
+    pub fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT vector FROM embeddings WHERE memory_id = ?1")?;
+        let mut rows = stmt.query(params![memory_id])?;
+
+        if let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            let vector: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok(Some(vector))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_all_embeddings_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.memory_id, e.vector FROM embeddings e
+             JOIN memories m ON e.memory_id = m.id
+             WHERE m.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            let memory_id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let vector: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((memory_id, vector))
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Pre-filtered embeddings for `memory_context`: returns at most `max_candidates` embeddings
+    /// ordered by recency, UNION with any pinned memories beyond the cap.
+    ///
+    /// The default cap is 500, configurable via `ENGRAM_MAX_CANDIDATES`.
+    pub fn get_prefiltered_embeddings(
+        &self,
+        project_id: &str,
+        max_candidates: usize,
+    ) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = "
+            SELECT e.memory_id, e.vector FROM embeddings e
+            JOIN memories m ON e.memory_id = m.id
+            WHERE m.id IN (
+                SELECT id FROM memories
+                WHERE (project_id = ?1 OR global = 1)
+                ORDER BY last_accessed_at DESC
+                LIMIT ?2
+            )
+            UNION
+            SELECT e.memory_id, e.vector FROM embeddings e
+            JOIN memories m ON e.memory_id = m.id
+            WHERE m.pinned = 1 AND (m.project_id = ?1 OR m.global = 1)
+        ";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![project_id, max_candidates as i64], |row| {
+            let memory_id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let vector: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((memory_id, vector))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Like `get_all_embeddings_for_project` but also includes global memories from any project.
+    pub fn get_all_embeddings_for_project_and_global(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.memory_id, e.vector FROM embeddings e
+             JOIN memories m ON e.memory_id = m.id
+             WHERE m.project_id = ?1 OR m.global = 1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            let memory_id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let vector: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((memory_id, vector))
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Fetch embeddings for a specific set of memory IDs.
+    pub fn get_embeddings_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<&str> = memory_ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT memory_id, vector FROM embeddings WHERE memory_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = memory_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let memory_id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let vector: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((memory_id, vector))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Store multiple embeddings in a single transaction
+    #[allow(dead_code)] // Used by MCP server tools
+    pub fn store_embeddings_batch(
+        &self,
+        embeddings: &[(String, Vec<f32>, String)],
+    ) -> Result<usize, MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let mut count = 0;
+        for (memory_id, vector, model_version) in embeddings {
+            let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT OR REPLACE INTO embeddings (memory_id, vector, model_version) VALUES (?1, ?2, ?3)",
+                params![memory_id, vector_bytes, model_version],
+            )?;
+            count += 1;
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Full-text search using FTS5 with BM25 scoring.
+    /// Returns (memory_id, bm25_score) pairs sorted by relevance.
+    /// The BM25 score is negated (SQLite returns negative values, we flip to positive).
+    #[allow(dead_code)]
+    pub fn keyword_search(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, MemoryError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Escape special FTS5 characters and build match expression
+        let escaped_query = Self::escape_fts_query(query);
+        if escaped_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // FTS5 bm25() returns negative scores (more negative = more relevant)
+        // We negate to get positive scores where higher = more relevant
+        let mut stmt = conn.prepare(
+            "SELECT m.id, -bm25(memories_fts) as score
+             FROM memories_fts
+             JOIN memories m ON memories_fts.rowid = m.rowid
+             WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+             ORDER BY score DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![escaped_query, project_id, limit as i64], |row| {
+            let id: String = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            Ok((id, score))
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Full-text search with branch filtering.
+    pub fn keyword_search_with_branch(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        branch_filter: Option<Option<&str>>,
+    ) -> Result<Vec<(String, f64)>, MemoryError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let escaped_query = Self::escape_fts_query(query);
+        if escaped_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(String, f64)> = match branch_filter {
+            None => {
+                // No branch filter
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, -bm25(memories_fts) as score
+                     FROM memories_fts
+                     JOIN memories m ON memories_fts.rowid = m.rowid
+                     WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                     ORDER BY score DESC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(params![escaped_query, project_id, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+            Some(None) => {
+                // Global only: branch IS NULL
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, -bm25(memories_fts) as score
+                     FROM memories_fts
+                     JOIN memories m ON memories_fts.rowid = m.rowid
+                     WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                       AND m.branch IS NULL
+                     ORDER BY score DESC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(params![escaped_query, project_id, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+            Some(Some(branch)) => {
+                // Global + specific branch
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, -bm25(memories_fts) as score
+                     FROM memories_fts
+                     JOIN memories m ON memories_fts.rowid = m.rowid
+                     WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                       AND (m.branch IS NULL OR m.branch = ?4)
+                     ORDER BY score DESC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(
+                    params![escaped_query, project_id, limit as i64, branch],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+                )?
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+        };
+
+        Ok(rows)
+    }
+
+    /// Escape special FTS5 query characters for safe searching.
+    fn escape_fts_query(query: &str) -> String {
+        // Split into words and wrap each in quotes for exact matching
+        // This prevents FTS5 syntax errors from special characters
+        query
+            .split_whitespace()
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                // Remove any existing quotes and special chars that could break FTS
+                let cleaned: String = word
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if cleaned.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{}\"", cleaned)
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+}
