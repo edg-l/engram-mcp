@@ -111,6 +111,32 @@ cp scripts/engram-hook.sh ~/.claude/hooks/engram-hook.sh
 
 Works in non-git directories (falls back to directory name). Exits silently if `engram-cli` is not on PATH.
 
+### Handoff skills (Claude Code)
+
+Two opinionated skills wrap the handoff tools so capture and resume become single-command flows:
+
+- `handoff` — gathers session state and calls `handoff_create`
+- `read-handoffs` — calls `handoff_resume`, summarizes, and pairs with `memory_context`
+
+Install both into `~/.claude/skills/` (backs up any existing copies):
+
+```bash
+scripts/install-skills.sh
+```
+
+Skip this if you prefer the bundled MCP prompts (`/mcp__engram__handoff` and `/mcp__engram__resume`) — they cover the same flow without needing local skill files.
+
+### Importing legacy markdown handoffs
+
+If you have pre-existing `.claude/handoff/*.md` files written by older skills, port them into Engram with:
+
+```bash
+scripts/port_md_handoffs.py ~/.claude/handoff /path/to/repo/.claude/handoff   # dry run
+scripts/port_md_handoffs.py --apply ~/.claude/handoff /path/to/repo/.claude/handoff
+```
+
+The script maps old section headings to the new schema and resolves `Continues from:` chains. The mapping is lossy (`Dead ends → blockers`, etc.); the original files stay on disk as a backup.
+
 ## Configuration
 
 | Variable | Description | Default |
