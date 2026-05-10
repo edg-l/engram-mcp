@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Compute a scoring boost based on query word overlap with memory tags.
 ///
 /// For each query word that matches a tag (substring or exact), adds a boost.

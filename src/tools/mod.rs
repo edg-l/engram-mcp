@@ -1,8 +1,8 @@
 //! MCP tool handlers for the Engram memory server.
-//!
-//! All items in this module are used by the MCP server binary (main.rs).
-//! The dead_code warnings appear because the CLI binary doesn't use these.
-#![allow(dead_code)]
+
+// `pub use` re-exports below are part of the public API consumed by integration tests,
+// benches, and external users; the lib crate itself doesn't reference them, which trips
+// `unused_imports` under `-D warnings` during lib-test/bin compilation.
 #![allow(unused_imports)]
 
 mod handler;
@@ -13,7 +13,7 @@ mod scoring;
 #[cfg(test)]
 mod test_utils;
 
-pub use handler::*;
-pub use handoff::*;
-pub use schemas::*;
+pub use handler::ToolHandler;
+pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
+pub use schemas::{MemoryUpdateInput, get_tool_definitions};
 pub use scoring::{compute_hybrid_score, compute_tag_boost};

@@ -2061,10 +2061,12 @@ impl ToolHandler {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::super::handoff::{
         create_handoff, resume_handoff_with_vec, search_handoffs_with_vec,
     };
-    use super::*;
+    use super::{Database, EmbeddingService, MemoryError, RelationType, ToolHandler};
     use crate::memory::{HandoffSections, MemoryType};
     use crate::tools::test_utils::{dummy_vec, insert_test_handoff};
 
