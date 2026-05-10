@@ -7,6 +7,7 @@ mod decay;
 mod embedding;
 mod error;
 mod export;
+mod format;
 mod memory;
 mod summarize;
 mod tools;
@@ -14,7 +15,7 @@ mod tools;
 use db::Database;
 use embedding::EmbeddingService;
 use error::MemoryError;
-use memory::{Memory, MemoryType, RelationType, Relationship};
+use memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship};
 use summarize::{generate_summary, should_auto_summarize};
 
 #[derive(Parser)]
@@ -208,6 +209,92 @@ enum Commands {
     Insights,
     /// Show actionable memory health report
     Health,
+    /// Session handoff management
+    Handoff {
+        #[command(subcommand)]
+        cmd: HandoffCmd,
+    },
+}
+
+/// Subcommands for `engram-cli handoff`.
+#[derive(Subcommand)]
+enum HandoffCmd {
+    /// Create a session handoff (interactive or from a markdown file)
+    Create {
+        /// High-level session summary
+        #[arg(long)]
+        summary: Option<String>,
+        /// Key decisions made (can be repeated or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        decisions: Vec<String>,
+        /// Outstanding todo items (can be repeated or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        todos: Vec<String>,
+        /// Known blockers (can be repeated or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        blockers: Vec<String>,
+        /// Architecture/context needed by the next session
+        #[arg(long)]
+        mental_model: Option<String>,
+        /// Concrete next steps (can be repeated or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        next_steps: Vec<String>,
+        /// Freeform notes (optional)
+        #[arg(long)]
+        notes: Option<String>,
+        /// Git branch to scope the handoff to (defaults to current branch)
+        #[arg(long)]
+        branch: Option<String>,
+        /// ID of the handoff this session continues from
+        #[arg(long)]
+        continues_from: Option<String>,
+        /// Importance score (0.0-1.0, default 0.85)
+        #[arg(long, default_value = "0.85")]
+        importance: f64,
+        /// Do NOT pin this handoff (it will be pinned by default)
+        #[arg(long)]
+        no_pin: bool,
+        /// Do NOT auto-link to related memories
+        #[arg(long)]
+        no_auto_link: bool,
+        /// Read sections from a markdown file instead of interactive prompts
+        #[arg(long)]
+        from_file: Option<std::path::PathBuf>,
+    },
+    /// Resume a session by loading context from recent handoffs
+    Resume {
+        /// Branch to load handoffs from (defaults to current branch)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Query string for section scoring (defaults to latest handoff summary)
+        #[arg(long)]
+        query: Option<String>,
+        /// Maximum number of top sections to show (default 5)
+        #[arg(long, default_value = "5")]
+        max: usize,
+        /// Include handoffs from all branches
+        #[arg(long)]
+        include_off_branch: bool,
+    },
+    /// Search handoff sections by content
+    Search {
+        /// Search query
+        query: String,
+        /// Limit results to this branch (omit for all branches)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Only show these sections (comma-separated, e.g. blockers,todos)
+        #[arg(long, value_delimiter = ',')]
+        section: Vec<String>,
+        /// Maximum results (default 10)
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Show a handoff memory by ID
+    Show {
+        /// Memory ID of the handoff
+        id: String,
+    },
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -317,15 +404,19 @@ fn get_current_branch() -> Option<String> {
 
 /// Check if command needs embedding service (lazy initialization).
 fn needs_embedding_service(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
+    match cmd {
         Commands::Query { .. }
-            | Commands::Store { .. }
-            | Commands::Update { .. }
-            | Commands::Import { .. }
-            | Commands::Dedup { .. }
-            | Commands::Context { .. }
-    )
+        | Commands::Store { .. }
+        | Commands::Update { .. }
+        | Commands::Import { .. }
+        | Commands::Dedup { .. }
+        | Commands::Context { .. } => true,
+        Commands::Handoff { cmd: handoff_cmd } => matches!(
+            handoff_cmd,
+            HandoffCmd::Create { .. } | HandoffCmd::Resume { .. } | HandoffCmd::Search { .. }
+        ),
+        _ => false,
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -525,6 +616,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Health => {
             cmd_health(&db, &project_id)?;
+        }
+        Commands::Handoff { cmd: handoff_cmd } => {
+            cmd_handoff(
+                &db,
+                &project_id,
+                embedding_service.as_ref(),
+                current_branch.as_deref(),
+                handoff_cmd,
+            )?;
         }
     }
 
@@ -955,7 +1055,36 @@ fn cmd_export(
         None
     };
 
-    let export_data = export::create_export(project_id, memories, relationships, embeddings, None);
+    // Collect handoff sidecar data for Handoff memories.
+    let mut handoff_sidecars: std::collections::HashMap<String, export::HandoffSidecar> =
+        std::collections::HashMap::new();
+    for memory in &memories {
+        if memory.memory_type == MemoryType::Handoff
+            && let Some((sections, section_vecs)) = db.get_handoff_sections(&memory.id)?
+        {
+            let key_strings: Vec<String> = section_vecs.iter().map(|(k, _)| k.clone()).collect();
+            let keys: Vec<&str> = key_strings.iter().map(|s| s.as_str()).collect();
+            let vecs: Vec<Vec<f32>> = section_vecs.into_iter().map(|(_, v)| v).collect();
+            let (keys_str, bytes) = db::encode_section_embeddings(&keys, &vecs);
+            handoff_sidecars.insert(
+                memory.id.clone(),
+                export::HandoffSidecar {
+                    sections,
+                    keys: keys_str,
+                    bytes,
+                },
+            );
+        }
+    }
+
+    let export_data = export::create_export(
+        project_id,
+        memories,
+        relationships,
+        embeddings,
+        handoff_sidecars,
+        None,
+    );
 
     let json = serde_json::to_string_pretty(&export_data)?;
 
@@ -994,6 +1123,10 @@ fn cmd_import(
 
     for exported in export_data.memories {
         let mut memory = exported.memory;
+        let encoded_embedding = exported.embedding;
+        let sections = exported.sections;
+        let section_embedding_keys = exported.section_embedding_keys;
+        let encoded_section_embeddings = exported.section_embeddings;
         memory.project_id = project_id.to_string();
         memory.updated_at = now;
 
@@ -1005,13 +1138,61 @@ fn cmd_import(
         db.store_memory(&memory)?;
 
         // Handle embedding
-        if let Some(encoded) = exported.embedding {
+        if let Some(encoded) = encoded_embedding {
             if let Ok(vector) = export::decode_embedding(&encoded) {
                 db.store_embedding(&memory.id, &vector, embedding_service.model_version())?;
             }
         } else {
             let embedding = embedding_service.embed_memory(memory.memory_type, &memory.content)?;
             db.store_embedding(&memory.id, &embedding, embedding_service.model_version())?;
+        }
+
+        // Import handoff sidecar if present.
+        // Old exports without sidecar fields skip this step silently.
+        if memory.memory_type == MemoryType::Handoff {
+            match (sections, section_embedding_keys, encoded_section_embeddings) {
+                (Some(sections_data), Some(keys), Some(encoded_bytes)) => {
+                    match export::decode_section_embedding_bytes(&encoded_bytes) {
+                        Ok(bytes) => {
+                            let key_count = if keys.is_empty() {
+                                0
+                            } else {
+                                keys.split(',').count()
+                            };
+                            if bytes.len() == key_count * 256 * 4 {
+                                if let Err(e) = db.insert_handoff_sections(
+                                    &memory.id,
+                                    &sections_data,
+                                    &keys,
+                                    &bytes,
+                                ) {
+                                    eprintln!(
+                                        "Warning: failed to import handoff sidecar for {}: {}",
+                                        memory.id, e
+                                    );
+                                }
+                            } else {
+                                eprintln!(
+                                    "Warning: skipping handoff sidecar for {} — byte length mismatch",
+                                    memory.id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: skipping handoff sidecar for {} — decode error: {}",
+                                memory.id, e
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "Notice: handoff {} imported without sidecar (old export format).",
+                        memory.id
+                    );
+                }
+            }
         }
 
         imported += 1;
@@ -1043,6 +1224,14 @@ fn cmd_stats(db: &Database, project_id: &str) -> Result<(), MemoryError> {
     println!("Memories: {}", stats.memory_count);
     println!("Relationships: {}", stats.relationship_count);
     println!("Avg relevance: {:.3}", stats.avg_relevance);
+    println!("Handoffs: {}", stats.handoff_count);
+    if let Some(ts) = stats.latest_handoff_at {
+        use chrono::{TimeZone, Utc};
+        let dt = Utc.timestamp_opt(ts, 0).single();
+        if let Some(dt) = dt {
+            println!("Latest handoff: {}", dt.format("%Y-%m-%d %H:%M UTC"));
+        }
+    }
 
     Ok(())
 }
@@ -1280,6 +1469,11 @@ fn cmd_dedup(
             None => continue,
         };
 
+        // Handoffs are session snapshots; never auto-merge.
+        if mem_i.memory_type == MemoryType::Handoff {
+            continue;
+        }
+
         let mut group = vec![(id_i.clone(), 1.0_f32)];
 
         for (id_j, vec_j) in all_embeddings.iter().skip(i + 1) {
@@ -1291,6 +1485,7 @@ fn cmd_dedup(
             if similarity >= threshold
                 && let Some(mem_j) = db.get_memory(id_j)?
                 && mem_j.memory_type == mem_i.memory_type
+                && mem_j.memory_type != MemoryType::Handoff
             {
                 group.push((id_j.clone(), similarity));
             }
@@ -1458,4 +1653,310 @@ fn format_timestamp(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Prompt the user for a line of text on stdin. Returns empty string on EOF or blank.
+fn prompt_line(label: &str) -> String {
+    use std::io::{self, BufRead, Write};
+    print!("{}: ", label);
+    io::stdout().flush().ok();
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line).ok();
+    line.trim().to_string()
+}
+
+/// Prompt for a list of items, one per line, until the user enters a blank line.
+fn prompt_list(label: &str) -> Vec<String> {
+    use std::io::{self, BufRead, Write};
+    println!("{} (enter one per line, blank line to finish):", label);
+    let stdin = io::stdin();
+    let mut items = Vec::new();
+    loop {
+        print!("  > ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_err() {
+            break;
+        }
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            break;
+        }
+        items.push(trimmed);
+    }
+    items
+}
+
+/// Dispatch handoff subcommands.
+fn cmd_handoff(
+    db: &Database,
+    project_id: &str,
+    embedding_service: Option<&EmbeddingService>,
+    current_branch: Option<&str>,
+    cmd: HandoffCmd,
+) -> Result<(), MemoryError> {
+    match cmd {
+        HandoffCmd::Create {
+            summary,
+            decisions,
+            todos,
+            blockers,
+            mental_model,
+            next_steps,
+            notes,
+            branch,
+            continues_from,
+            importance,
+            no_pin,
+            no_auto_link,
+            from_file,
+        } => {
+            let embedding = embedding_service.ok_or_else(|| {
+                MemoryError::InvalidType("embedding service required".to_string())
+            })?;
+
+            let sections = if let Some(path) = from_file {
+                let content = std::fs::read_to_string(&path)?;
+                let mut s = HandoffSections::parse_markdown(&content)?;
+                if continues_from.is_some() {
+                    s.continues_from = continues_from.clone();
+                }
+                s
+            } else {
+                // Use flags if provided; otherwise prompt interactively for missing required fields.
+                let summary_text = if let Some(s) = summary {
+                    s
+                } else {
+                    let s = prompt_line("Summary");
+                    if s.is_empty() {
+                        return Err(MemoryError::InvalidType(
+                            "handoff: summary is required".to_string(),
+                        ));
+                    }
+                    s
+                };
+
+                let decisions_list = if !decisions.is_empty() {
+                    decisions
+                } else {
+                    prompt_list("Decisions")
+                };
+
+                let todos_list = if !todos.is_empty() {
+                    todos
+                } else {
+                    prompt_list("Todos")
+                };
+
+                let blockers_list = if !blockers.is_empty() {
+                    blockers
+                } else {
+                    prompt_list("Blockers")
+                };
+
+                let mental_model_text = if let Some(m) = mental_model {
+                    m
+                } else {
+                    prompt_line("Mental model")
+                };
+
+                let next_steps_list = if !next_steps.is_empty() {
+                    next_steps
+                } else {
+                    prompt_list("Next steps")
+                };
+
+                let notes_text = if let Some(n) = notes {
+                    Some(n)
+                } else {
+                    let n = prompt_line("Notes (optional, blank to skip)");
+                    if n.is_empty() { None } else { Some(n) }
+                };
+
+                HandoffSections {
+                    summary: summary_text,
+                    decisions: decisions_list,
+                    todos: todos_list,
+                    blockers: blockers_list,
+                    mental_model: mental_model_text,
+                    next_steps: next_steps_list,
+                    notes: notes_text,
+                    continues_from,
+                }
+            };
+
+            // Resolve branch: CLI arg > current branch > error
+            let resolved_branch = branch.as_deref().or(current_branch).map(str::to_string);
+
+            let result = tools::create_handoff(
+                db,
+                embedding,
+                project_id,
+                resolved_branch.as_deref(),
+                sections,
+                importance,
+                !no_pin,
+                !no_auto_link,
+            )?;
+
+            println!("Handoff created: {}", result.id);
+            if let Some(ref cf) = result.continues_from {
+                println!("Continues from: {}", cf);
+            }
+            if !result.linked_memory_ids.is_empty() {
+                println!(
+                    "Auto-linked {} memor{}:",
+                    result.linked_memory_ids.len(),
+                    if result.linked_memory_ids.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                );
+                for id in &result.linked_memory_ids {
+                    println!("  {}", id);
+                }
+            }
+        }
+        HandoffCmd::Resume {
+            branch,
+            query,
+            max,
+            include_off_branch,
+        } => {
+            let embedding = embedding_service.ok_or_else(|| {
+                MemoryError::InvalidType("embedding service required".to_string())
+            })?;
+
+            let resolved_branch = branch.as_deref().or(current_branch);
+
+            let result = tools::resume_handoff(
+                db,
+                embedding,
+                project_id,
+                resolved_branch,
+                query.as_deref(),
+                max,
+                include_off_branch,
+            )?;
+
+            if let Some(ref msg) = result.message {
+                println!("Note: {}", msg);
+            }
+
+            if result.latest_handoff_id.is_none() {
+                println!("No handoffs found.");
+                return Ok(());
+            }
+
+            println!(
+                "Branch: {}",
+                result.branch.as_deref().unwrap_or("(all branches)")
+            );
+            println!(
+                "Latest handoff: {}",
+                result.latest_handoff_id.as_deref().unwrap_or("none")
+            );
+
+            if result.chain.len() > 1 {
+                println!("Chain ({} handoffs, oldest to newest):", result.chain.len());
+                for id in &result.chain {
+                    println!("  {}", id);
+                }
+            }
+
+            if !result.top_sections.is_empty() {
+                println!("\nTop sections:");
+                for section in &result.top_sections {
+                    println!("─────────────────────────────────────────");
+                    println!(
+                        "[{}] {} (score: {:.2})",
+                        section.handoff_id, section.section_name, section.score
+                    );
+                    println!("{}", section.section_text);
+                }
+                println!("─────────────────────────────────────────");
+            }
+
+            if !result.linked_memories.is_empty() {
+                println!("\nLinked memories:");
+                for mem in &result.linked_memories {
+                    let preview: String = mem.content.chars().take(80).collect();
+                    println!("  [{}] ({:?}) {}", mem.id, mem.memory_type, preview);
+                }
+            }
+        }
+        HandoffCmd::Search {
+            query,
+            branch,
+            section,
+            limit,
+        } => {
+            let embedding = embedding_service.ok_or_else(|| {
+                MemoryError::InvalidType("embedding service required".to_string())
+            })?;
+
+            let section_filter: Option<Vec<String>> = if section.is_empty() {
+                None
+            } else {
+                Some(section)
+            };
+
+            let result = tools::search_handoffs(
+                db,
+                embedding,
+                project_id,
+                &query,
+                branch.as_deref(),
+                limit,
+                section_filter.as_deref(),
+            )?;
+
+            if result.matches.is_empty() {
+                println!("No matching handoff sections found.");
+                return Ok(());
+            }
+
+            println!("{} match(es):", result.matches.len());
+            for m in &result.matches {
+                println!("─────────────────────────────────────────");
+                println!(
+                    "[{}] {} (score: {:.2})",
+                    m.handoff_id, m.section_name, m.score
+                );
+                println!("{}", m.section_text);
+            }
+            println!("─────────────────────────────────────────");
+        }
+        HandoffCmd::Show { id } => {
+            let memory = db
+                .get_memory(&id)?
+                .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
+
+            if memory.memory_type != MemoryType::Handoff {
+                println!(
+                    "Warning: memory {} is type {:?}, not handoff",
+                    id, memory.memory_type
+                );
+            }
+
+            // Render via format_handoff if sidecar is available
+            match db.get_handoff_sections(&id)? {
+                Some((sections, _)) => {
+                    println!("{}", format::format_handoff(&memory, &sections));
+                }
+                None => {
+                    // Fall back to plain content display
+                    println!("ID: {}", memory.id);
+                    println!("Branch: {}", memory.branch.as_deref().unwrap_or("(global)"));
+                    println!("Importance: {:.2}", memory.importance);
+                    println!("Created: {}", format_timestamp(memory.created_at));
+                    println!("\nContent:\n{}", memory.content);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

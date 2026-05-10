@@ -35,3 +35,7 @@ Use `memory_query` when you need to recall a specific piece of knowledge -- "wha
 - Duplicates are automatically detected and merged when stored.
 - Use `memory_prune` periodically to clean up low-relevance memories.
 - Use `memory_dedup` to find and merge similar memories that weren't caught automatically.
+
+# Session handoffs
+
+Use `handoff_create` at session end and `handoff_resume` at session start to preserve and restore working context across sessions. Handoffs capture structured sections (summary, decisions, todos, blockers, mental model, next steps, notes) and are pinned so they never decay. Use `handoff_search` to find specific section content across past sessions.

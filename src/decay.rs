@@ -130,4 +130,87 @@ mod tests {
         assert_eq!(reinforced.last_accessed_at, now);
         assert!(reinforced.relevance_score > 1.0 - 0.001); // Should be boosted to 1.0
     }
+
+    /// Pinned Handoff memories must not have their relevance_score changed by decay.
+    ///
+    /// The DB-level decay query (`update_relevance_scores`) filters `WHERE pinned = 0`,
+    /// so pinned memories are exempt.  This test calls the real production function to
+    /// verify that invariant end-to-end.  rusqlite's bundled SQLite supports `EXP()` and
+    /// `LN()`, so no stub is needed.
+    #[test]
+    fn decay_skips_pinned_handoff() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let project = crate::memory::Project {
+            id: "test-project".to_string(),
+            name: "Test Project".to_string(),
+            root_path: None,
+            decay_rate: 0.5,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.create_project(&project).unwrap();
+
+        // Place last_accessed_at 1 year in the past so decay meaningfully reduces the score.
+        let far_past = chrono::Utc::now().timestamp() - 365 * 86400;
+
+        // Pinned Handoff — must survive decay unchanged.
+        let pinned = Memory {
+            id: "handoff_pinned".to_string(),
+            project_id: "test-project".to_string(),
+            memory_type: MemoryType::Handoff,
+            content: "## Summary\n\nSession ended here.".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.85,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: far_past,
+            updated_at: far_past,
+            last_accessed_at: far_past,
+            branch: None,
+            merged_from: None,
+            pinned: true,
+            global: false,
+        };
+
+        // Non-pinned Handoff — decay must reduce its score.
+        let unpinned = Memory {
+            id: "handoff_unpinned".to_string(),
+            project_id: "test-project".to_string(),
+            memory_type: MemoryType::Handoff,
+            content: "## Summary\n\nAnother session.".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.85,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: far_past,
+            updated_at: far_past,
+            last_accessed_at: far_past,
+            branch: None,
+            merged_from: None,
+            pinned: false,
+            global: false,
+        };
+
+        db.store_memory(&pinned).unwrap();
+        db.store_memory(&unpinned).unwrap();
+
+        // Call the real production decay function.
+        db.update_relevance_scores("test-project", 0.01).unwrap();
+
+        // Pinned Handoff must be unchanged at its initial value.
+        let after_pinned = db.get_memory("handoff_pinned").unwrap().unwrap();
+        assert_eq!(
+            after_pinned.relevance_score, 1.0,
+            "pinned handoff relevance_score must not change when decay skips pinned = 1"
+        );
+
+        // Non-pinned Handoff must have had its score reduced by the decay formula.
+        let after_unpinned = db.get_memory("handoff_unpinned").unwrap().unwrap();
+        assert!(
+            after_unpinned.relevance_score < 1.0,
+            "unpinned handoff relevance_score ({}) should have been reduced by decay",
+            after_unpinned.relevance_score
+        );
+    }
 }

@@ -4,11 +4,12 @@
 //! - Version header for compatibility
 //! - Optional embedding export (base64 encoded)
 //! - Import with merge/replace modes
+//! - Handoff sidecar round-trip (sections + section_embeddings, base64 encoded)
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::{Memory, Relationship};
+use crate::memory::{HandoffSections, Memory, Relationship};
 
 /// Current export format version
 pub const EXPORT_VERSION: &str = "1.1";
@@ -34,14 +35,29 @@ pub struct ExportData {
     pub model_version: Option<String>,
 }
 
-/// A memory with optional embedding data
+/// A memory with optional embedding data.
+///
+/// For `MemoryType::Handoff` memories, the three handoff sidecar fields are populated
+/// when the export was created from a DB that has the sidecar row.  Older exports that
+/// pre-date the handoff feature will have these fields absent; importers must tolerate
+/// their absence and skip the sidecar insert (memory row is still imported normally).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportedMemory {
     #[serde(flatten)]
     pub memory: Memory,
-    /// Base64-encoded embedding vector (optional)
+    /// Base64-encoded full-content embedding vector (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<String>,
+    /// Structured handoff sections (Handoff memories only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<HandoffSections>,
+    /// Comma-separated section names matching `section_embeddings` (Handoff memories only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_embedding_keys: Option<String>,
+    /// Base64-encoded concatenated per-section embedding bytes (Handoff memories only).
+    /// Format: 256 dims × N sections × 4 bytes (little-endian f32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_embeddings: Option<String>,
 }
 
 /// Import mode for handling existing memories
@@ -109,12 +125,26 @@ pub fn decode_embedding(encoded: &str) -> Result<Vec<f32>, String> {
     Ok(vector)
 }
 
-/// Create export data from memories and relationships
+/// Per-handoff sidecar data for export.
+///
+/// `keys` is the comma-separated section names, `bytes` the raw section embedding blob.
+pub struct HandoffSidecar {
+    pub sections: HandoffSections,
+    pub keys: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Create export data from memories and relationships.
+///
+/// `handoff_sidecars` maps handoff memory IDs to their sidecar data.  Pass an empty map
+/// or omit sidecars for non-handoff exports; this parameter is additive and does not
+/// affect non-Handoff memories.
 pub fn create_export(
     project_id: &str,
     memories: Vec<Memory>,
     relationships: Vec<Relationship>,
     embeddings: Option<Vec<(String, Vec<f32>)>>,
+    handoff_sidecars: std::collections::HashMap<String, HandoffSidecar>,
     model_version: Option<String>,
 ) -> ExportData {
     let embedding_map: std::collections::HashMap<String, Vec<f32>> =
@@ -124,7 +154,26 @@ pub fn create_export(
         .into_iter()
         .map(|memory| {
             let embedding = embedding_map.get(&memory.id).map(|v| encode_embedding(v));
-            ExportedMemory { memory, embedding }
+
+            // For Handoff memories, include sidecar data if available.
+            let (sections, section_embedding_keys, section_embeddings) =
+                if let Some(sidecar) = handoff_sidecars.get(&memory.id) {
+                    (
+                        Some(sidecar.sections.clone()),
+                        Some(sidecar.keys.clone()),
+                        Some(BASE64.encode(&sidecar.bytes)),
+                    )
+                } else {
+                    (None, None, None)
+                };
+
+            ExportedMemory {
+                memory,
+                embedding,
+                sections,
+                section_embedding_keys,
+                section_embeddings,
+            }
         })
         .collect();
 
@@ -136,6 +185,13 @@ pub fn create_export(
         exported_at: chrono::Utc::now().timestamp(),
         model_version,
     }
+}
+
+/// Decode a base64-encoded section embeddings blob back to raw bytes.
+pub fn decode_section_embedding_bytes(encoded: &str) -> Result<Vec<u8>, String> {
+    BASE64
+        .decode(encoded)
+        .map_err(|e| format!("Failed to decode section_embeddings: {}", e))
 }
 
 /// Validate import data version compatibility

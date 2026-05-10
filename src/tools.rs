@@ -11,12 +11,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::cache::{QueryEmbeddingCache, SearchResultCache};
-use crate::db::Database;
+use crate::db::{Database, encode_section_embeddings};
 use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
-use crate::export::{self, ExportData, ExportedMemory, ImportMode, ImportStats};
+use crate::export::{self, ExportData, ExportedMemory, HandoffSidecar, ImportMode, ImportStats};
 use crate::memory::{
-    Memory, MemoryType, MemoryWithScore, ProjectStats, RelationType, Relationship,
+    HandoffSections, Memory, MemoryType, MemoryWithScore, ProjectStats, RelationType, Relationship,
 };
 use crate::summarize::{generate_summary, should_auto_summarize};
 
@@ -220,6 +220,104 @@ fn default_dedup_threshold() -> f32 {
     0.90
 }
 
+// ============================================
+// Handoff create / resume structs (Task 3A.1, 3A.5)
+// ============================================
+
+fn default_handoff_importance() -> f64 {
+    0.85
+}
+
+fn default_handoff_pinned() -> bool {
+    true
+}
+
+fn default_auto_link() -> bool {
+    true
+}
+
+fn default_max_sections() -> usize {
+    5
+}
+
+fn default_include_off_branch() -> bool {
+    false
+}
+
+/// Input for the `handoff_create` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffCreateInput {
+    /// Git branch to scope this handoff to. Defaults to the current branch.
+    pub branch: Option<String>,
+    /// Structured session sections.
+    pub sections: HandoffSections,
+    /// Importance score in [0, 1]. Default 0.85.
+    #[serde(default = "default_handoff_importance")]
+    pub importance: f64,
+    /// Pin this handoff so it is exempt from decay and auto-prune. Default true.
+    #[serde(default = "default_handoff_pinned")]
+    pub pinned: bool,
+    /// Auto-link this handoff to related decisions/patterns/debug memories. Default true.
+    #[serde(default = "default_auto_link")]
+    pub auto_link: bool,
+}
+
+/// Result returned by `handoff_create`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffCreateResult {
+    /// ID of the newly created handoff memory.
+    pub id: String,
+    /// IDs of memories that were auto-linked to this handoff.
+    pub linked_memory_ids: Vec<String>,
+    /// The `continues_from` field from the sections (sidecar-only, not a graph edge).
+    pub continues_from: Option<String>,
+}
+
+/// A scored section match returned by `handoff_resume`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffSectionMatch {
+    /// ID of the handoff memory that contains this section.
+    pub handoff_id: String,
+    /// Section name, e.g. "summary", "blockers".
+    pub section_name: String,
+    /// Full text of the section.
+    pub section_text: String,
+    /// Cosine similarity score against the query embedding.
+    pub score: f32,
+}
+
+/// Input for the `handoff_resume` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffResumeInput {
+    /// Branch to fetch handoffs for. Defaults to the current branch.
+    pub branch: Option<String>,
+    /// Query string for scoring sections. Defaults to the latest handoff summary.
+    pub query: Option<String>,
+    /// Maximum number of top sections to return. Default 5.
+    #[serde(default = "default_max_sections")]
+    pub max_sections: usize,
+    /// When true, include handoffs from all branches even if a branch was resolved. Default false.
+    #[serde(default = "default_include_off_branch")]
+    pub include_off_branch: bool,
+}
+
+/// Result returned by `handoff_resume`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffResumeResult {
+    /// Resolved branch, or None if no branch could be determined.
+    pub branch: Option<String>,
+    /// ID of the most recent handoff on the branch.
+    pub latest_handoff_id: Option<String>,
+    /// Ordered chain of handoff IDs, oldest to newest, via `continues_from`.
+    pub chain: Vec<String>,
+    /// Top-scoring section excerpts across all handoffs in the chain.
+    pub top_sections: Vec<HandoffSectionMatch>,
+    /// Memories auto-linked (derived_from) from the latest handoff.
+    pub linked_memories: Vec<Memory>,
+    /// Explanatory message, e.g. when no branch was detected.
+    pub message: Option<String>,
+}
+
 /// Read dedup threshold from ENGRAM_DEDUP_THRESHOLD env var, clamped to [0.5, 1.0].
 fn dedup_threshold() -> f32 {
     std::env::var("ENGRAM_DEDUP_THRESHOLD")
@@ -227,6 +325,545 @@ fn dedup_threshold() -> f32 {
         .and_then(|s| s.parse::<f32>().ok())
         .map(|v| v.clamp(0.5, 1.0))
         .unwrap_or(0.90)
+}
+
+// ============================================
+// Handoff free functions (Tasks 3A.2, 3A.3, 3A.6)
+// ============================================
+
+/// Create a session handoff memory with per-section embeddings and optional auto-linking.
+///
+/// The `branch` parameter should be the resolved current branch (or an explicit override).
+/// If `None`, the function returns `MemoryError::InvalidType` — handoffs require a branch.
+#[allow(clippy::too_many_arguments)]
+pub fn create_handoff(
+    db: &Database,
+    embedding: &EmbeddingService,
+    project_id: &str,
+    branch: Option<&str>,
+    sections: HandoffSections,
+    importance: f64,
+    pinned: bool,
+    auto_link: bool,
+) -> Result<HandoffCreateResult, MemoryError> {
+    // Step 1: resolve branch.
+    let resolved_branch = match branch {
+        Some(b) => b.to_string(),
+        None => {
+            return Err(MemoryError::InvalidType(
+                "handoff requires a branch; detached HEAD or non-git workspace not supported"
+                    .to_string(),
+            ));
+        }
+    };
+
+    // Step 2: render markdown for the main memory content.
+    let content = sections.render_markdown();
+
+    // Step 3: build the Memory struct.
+    let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+    let now = chrono::Utc::now().timestamp();
+    let summary = if should_auto_summarize(&content, None) {
+        Some(generate_summary(&content))
+    } else {
+        None
+    };
+
+    let memory = Memory {
+        id: id.clone(),
+        project_id: project_id.to_string(),
+        memory_type: MemoryType::Handoff,
+        content: content.clone(),
+        summary,
+        tags: vec![],
+        importance: importance.clamp(0.0, 1.0),
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: now,
+        updated_at: now,
+        last_accessed_at: now,
+        branch: Some(resolved_branch),
+        merged_from: None,
+        pinned,
+        global: false,
+    };
+
+    // Step 4: generate full-content embedding.
+    let full_embedding = embedding.embed_memory(MemoryType::Handoff, &content)?;
+
+    // Step 5: generate per-section embeddings (prefix-free query path).
+    // Section embeddings use the prefix-free query path so resume scoring stays in one vector space.
+    let section_texts = handoff_section_key_texts(&sections);
+
+    let mut section_keys: Vec<&str> = Vec::new();
+    let mut section_vecs: Vec<Vec<f32>> = Vec::new();
+    for (key, text) in &section_texts {
+        let vec = embedding.embed(text)?;
+        section_keys.push(key);
+        section_vecs.push(vec);
+    }
+
+    // Step 6: encode section embeddings into wire format.
+    let (section_keys_str, section_bytes) = encode_section_embeddings(&section_keys, &section_vecs);
+
+    // Step 7: single transaction — insert memory, embedding, handoff_sections sidecar atomically.
+    // continues_from is sidecar-only; single source of truth in handoff_sections.
+    db.store_handoff_atomic(
+        &memory,
+        &full_embedding,
+        embedding.model_version(),
+        &sections,
+        &section_keys_str,
+        &section_bytes,
+    )?;
+
+    // Step 8: continues_from is stored only in the sidecar (above). No derived_from relationship.
+
+    // Step 9: auto-link to related memories.
+    let linked_memory_ids = if auto_link {
+        auto_link_handoff_sections(db, embedding, &id, &sections, project_id)?
+    } else {
+        Vec::new()
+    };
+
+    // Step 10: return result.
+    let continues_from = sections.continues_from.clone();
+    Ok(HandoffCreateResult {
+        id,
+        linked_memory_ids,
+        continues_from,
+    })
+}
+
+/// Build the ordered list of (section_key, section_text) pairs for a `HandoffSections`.
+///
+/// Order matches `HandoffSections::render_markdown` exactly. Only non-empty sections are
+/// included. This is the single canonical source for the key/text pairing used when
+/// generating and encoding per-section embeddings.
+fn handoff_section_key_texts(sections: &HandoffSections) -> Vec<(&'static str, String)> {
+    let mut v = Vec::new();
+    if !sections.summary.is_empty() {
+        v.push(("summary", sections.summary.clone()));
+    }
+    if !sections.decisions.is_empty() {
+        v.push(("decisions", sections.decisions.join("\n")));
+    }
+    if !sections.todos.is_empty() {
+        v.push(("todos", sections.todos.join("\n")));
+    }
+    if !sections.blockers.is_empty() {
+        v.push(("blockers", sections.blockers.join("\n")));
+    }
+    if !sections.mental_model.is_empty() {
+        v.push(("mental_model", sections.mental_model.clone()));
+    }
+    if !sections.next_steps.is_empty() {
+        v.push(("next_steps", sections.next_steps.join("\n")));
+    }
+    if let Some(ref notes) = sections.notes
+        && !notes.is_empty()
+    {
+        v.push(("notes", notes.clone()));
+    }
+    v
+}
+
+/// Auto-link a handoff to related decisions, patterns, and debug memories via `derived_from`.
+///
+/// For each non-empty section text, candidates of types Decision, Pattern, and Debug are
+/// scored using `embed_memory_text` (same document prefix used at storage time) so the
+/// comparison lives in the same vector space as the stored embeddings.  The prefix-free
+/// `embed` vectors stored in the sidecar are NOT used here — those are for resume scoring.
+///
+/// At most 10 links are created across all sections, preferring highest similarity (>= 0.75).
+pub fn auto_link_handoff_sections(
+    db: &Database,
+    embedding: &EmbeddingService,
+    handoff_id: &str,
+    sections: &HandoffSections,
+    project_id: &str,
+) -> Result<Vec<String>, MemoryError> {
+    const AUTO_LINK_THRESHOLD: f32 = 0.75;
+    const AUTO_LINK_CAP: usize = 10;
+    let target_types = [MemoryType::Decision, MemoryType::Pattern, MemoryType::Debug];
+
+    // Collect candidate memories of the target types.
+    let candidates: Vec<Memory> =
+        db.query_memories(project_id, Some(&target_types), None, None, 1000)?;
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Fetch stored embeddings for candidates (batch).
+    let candidate_ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+    let stored_embeddings = db.get_embeddings_batch(&candidate_ids)?;
+    let embedding_map: std::collections::HashMap<String, Vec<f32>> =
+        stored_embeddings.into_iter().collect();
+    let candidate_map: std::collections::HashMap<String, &Memory> =
+        candidates.iter().map(|m| (m.id.clone(), m)).collect();
+
+    // Collect non-empty section texts.
+    let section_texts = handoff_section_key_texts(sections);
+
+    // For each section × each target type, embed using the document prefix and score candidates.
+    // Collect (similarity, memory_id) across all combinations.
+    let mut scored: Vec<(f32, String)> = Vec::new();
+    let mut already_linked: HashSet<String> = HashSet::new();
+
+    for (_section_name, section_text) in &section_texts {
+        for &target_type in &target_types {
+            let section_vec = embedding.embed_memory_text(target_type, section_text)?;
+            for m in &candidates {
+                if m.memory_type != target_type {
+                    continue;
+                }
+                if let Some(stored_vec) = embedding_map.get(&m.id) {
+                    let sim = cosine_similarity(&section_vec, stored_vec);
+                    if sim >= AUTO_LINK_THRESHOLD {
+                        scored.push((sim, m.id.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by similarity descending, deduplicate by memory ID, cap at 10.
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut linked_ids: Vec<String> = Vec::new();
+    let now = chrono::Utc::now().timestamp();
+
+    for (_, candidate_id) in scored {
+        if linked_ids.len() >= AUTO_LINK_CAP {
+            break;
+        }
+        if already_linked.contains(&candidate_id) {
+            continue;
+        }
+        // Verify the candidate still exists in our map.
+        if !candidate_map.contains_key(&candidate_id) {
+            continue;
+        }
+        let rel = Relationship {
+            id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
+            source_id: handoff_id.to_string(),
+            target_id: candidate_id.clone(),
+            relation_type: RelationType::DerivedFrom,
+            strength: 1.0,
+            created_at: now,
+        };
+        db.create_relationship(&rel)?;
+        already_linked.insert(candidate_id.clone());
+        linked_ids.push(candidate_id);
+    }
+
+    Ok(linked_ids)
+}
+
+/// Core of `resume_handoff` that accepts a pre-computed query embedding.
+///
+/// Separated from the embedding step so the scoring logic can be exercised in tests
+/// without a real `EmbeddingService`.  Pass `query_vec=None` to skip scoring (returns
+/// no section matches); pass `Some(vec)` to score all sections.
+pub fn resume_handoff_with_vec(
+    db: &Database,
+    project_id: &str,
+    branch: Option<&str>,
+    query_vec: Option<Vec<f32>>,
+    max_sections: usize,
+    include_off_branch: bool,
+) -> Result<HandoffResumeResult, MemoryError> {
+    // Step 1: resolve branch; if unresolved, serve off-branch handoffs with explanatory message.
+    let (resolved_branch, message, fetch_all) = match branch {
+        Some(b) if !b.is_empty() => (Some(b.to_string()), None, include_off_branch),
+        _ => (
+            None,
+            Some("No current branch detected; returning off-branch handoffs only.".to_string()),
+            true,
+        ),
+    };
+
+    // Step 2: fetch latest handoffs.
+    let latest_list = if fetch_all {
+        db.list_recent_handoffs(project_id, 10)?
+    } else {
+        db.query_handoffs_by_branch(project_id, resolved_branch.as_deref(), 10)?
+    };
+
+    let Some(latest) = latest_list.into_iter().next() else {
+        return Ok(HandoffResumeResult {
+            branch: resolved_branch,
+            latest_handoff_id: None,
+            chain: Vec::new(),
+            top_sections: Vec::new(),
+            linked_memories: Vec::new(),
+            message,
+        });
+    };
+
+    let latest_id = latest.id.clone();
+
+    // Step 3: walk continues_from chain backwards from latest (up to depth 5).
+    let mut chain_ids: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut current_id = latest_id.clone();
+
+    loop {
+        if visited.contains(&current_id) {
+            break; // Cycle detected.
+        }
+        if chain_ids.len() >= 5 {
+            break; // Depth cap.
+        }
+        visited.insert(current_id.clone());
+        chain_ids.push(current_id.clone());
+
+        // Follow continues_from link.
+        match db.get_handoff_sections(&current_id)? {
+            Some((sections, _)) => match sections.continues_from {
+                Some(prev_id) => {
+                    current_id = prev_id;
+                }
+                None => break,
+            },
+            None => break,
+        }
+    }
+
+    // Reverse to oldest-first order.
+    chain_ids.reverse();
+
+    // Step 4: score every section across all chain handoffs (only when a query vec is available).
+    // Load Memory structs for the chain so score_handoff_sections can iterate them.
+    let chain_memories: Vec<Memory> = chain_ids
+        .iter()
+        .filter_map(|hid| db.get_memory(hid).ok().flatten())
+        .collect();
+
+    let top_sections = if let Some(ref qvec) = query_vec {
+        let mut all_matches = score_handoff_sections(qvec, &chain_memories, db)?;
+        all_matches.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_matches.into_iter().take(max_sections).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Step 5: fetch derived_from linked memories for the latest handoff.
+    let derived_rels = db.get_relationships_from(&latest_id)?;
+    let derived_target_ids: Vec<String> = derived_rels
+        .into_iter()
+        .filter(|r| r.relation_type == RelationType::DerivedFrom)
+        .map(|r| r.target_id)
+        .collect();
+
+    let linked_memories_map = db.get_memories_batch(&derived_target_ids)?;
+    let linked_memories: Vec<Memory> = derived_target_ids
+        .iter()
+        .filter_map(|id| linked_memories_map.get(id).cloned())
+        .collect();
+
+    // Step 6: record access on latest handoff.
+    let _ = db.record_access(&latest_id);
+
+    Ok(HandoffResumeResult {
+        branch: resolved_branch,
+        latest_handoff_id: Some(latest_id),
+        chain: chain_ids,
+        top_sections,
+        linked_memories,
+        message,
+    })
+}
+
+/// Resume a session by retrieving top sections from recent handoffs and linked memories.
+///
+/// Resolves the branch, fetches the handoff chain (up to depth 5), scores sections
+/// against the query embedding, and returns the top `max_sections` matches along with
+/// auto-linked memories from the latest handoff.
+pub fn resume_handoff(
+    db: &Database,
+    embedding: &EmbeddingService,
+    project_id: &str,
+    branch: Option<&str>,
+    query: Option<&str>,
+    max_sections: usize,
+    include_off_branch: bool,
+) -> Result<HandoffResumeResult, MemoryError> {
+    // Resolve the query text, embed it, then delegate to the core implementation.
+    // We need the latest handoff to derive a fallback query text when query=None.
+    // Peek at the DB to get the fallback before calling the inner function.
+    let (resolved_branch_peek, _, fetch_all_peek) = match branch {
+        Some(b) if !b.is_empty() => (Some(b.to_string()), None::<String>, include_off_branch),
+        _ => (
+            None,
+            Some("No current branch detected; returning off-branch handoffs only.".to_string()),
+            true,
+        ),
+    };
+
+    // Determine query text for embedding.
+    let query_vec = if let Some(q) = query
+        && !q.is_empty()
+    {
+        Some(embedding.embed(q)?)
+    } else {
+        // Fallback: use latest handoff summary.
+        let latest_list = if fetch_all_peek {
+            db.list_recent_handoffs(project_id, 1)?
+        } else {
+            db.query_handoffs_by_branch(project_id, resolved_branch_peek.as_deref(), 1)?
+        };
+        if let Some(latest) = latest_list.into_iter().next() {
+            let fallback_text = match db.get_handoff_sections(&latest.id)? {
+                Some((s, _)) => s.summary,
+                None => latest
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| latest.content.chars().take(200).collect()),
+            };
+            Some(embedding.embed(&fallback_text)?)
+        } else {
+            // No handoffs exist; inner function will return an empty result.
+            None
+        }
+    };
+
+    resume_handoff_with_vec(
+        db,
+        project_id,
+        branch,
+        query_vec,
+        max_sections,
+        include_off_branch,
+    )
+}
+
+/// Extract the text content for a named section from `HandoffSections`.
+fn get_section_text(sections: &HandoffSections, section_name: &str) -> String {
+    match section_name {
+        "summary" => sections.summary.clone(),
+        "decisions" => sections.decisions.join("\n"),
+        "todos" => sections.todos.join("\n"),
+        "blockers" => sections.blockers.join("\n"),
+        "mental_model" => sections.mental_model.clone(),
+        "next_steps" => sections.next_steps.join("\n"),
+        "notes" => sections.notes.clone().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Score every section of the given handoff memories against a query vector.
+///
+/// Returns all matches (unsorted, unfiltered). The caller decides limit, ordering,
+/// and any section name filtering. Uses the same loop structure as the inner scoring
+/// in `resume_handoff_with_vec` to keep behaviour identical post-refactor.
+pub fn score_handoff_sections(
+    query_vec: &[f32],
+    handoffs: &[Memory],
+    db: &Database,
+) -> Result<Vec<HandoffSectionMatch>, MemoryError> {
+    let mut all_matches: Vec<HandoffSectionMatch> = Vec::new();
+
+    for handoff in handoffs {
+        if let Some((sections_struct, section_vecs)) = db.get_handoff_sections(&handoff.id)? {
+            // section_vecs from get_handoff_sections are the prefix-free stored embeddings.
+            for (section_name, section_vec) in section_vecs {
+                let score = cosine_similarity(query_vec, &section_vec);
+                let section_text = get_section_text(&sections_struct, &section_name);
+                all_matches.push(HandoffSectionMatch {
+                    handoff_id: handoff.id.clone(),
+                    section_name,
+                    section_text,
+                    score,
+                });
+            }
+        }
+    }
+
+    Ok(all_matches)
+}
+
+// ============================================
+// Handoff search structs and free functions (Tasks 3B.1, 3B.2)
+// ============================================
+
+/// Input for the `handoff_search` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffSearchInput {
+    /// Query text to score sections against.
+    pub query: String,
+    /// Branch to filter handoffs by. `None` means all branches.
+    pub branch: Option<String>,
+    /// Maximum number of matches to return. Default 10.
+    pub limit: Option<usize>,
+    /// Filter results to these section names only (e.g. `["blockers", "todos"]`).
+    /// Case-insensitive. `None` means all sections.
+    pub section_filter: Option<Vec<String>>,
+}
+
+/// Result returned by `handoff_search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffSearchResult {
+    /// Scored section matches, sorted by similarity descending.
+    pub matches: Vec<HandoffSectionMatch>,
+}
+
+/// Core of `handoff_search` that accepts a pre-computed query vector.
+///
+/// Separated from the embedding step so the scoring logic can be exercised in tests
+/// without a real `EmbeddingService`.
+pub fn search_handoffs_with_vec(
+    db: &Database,
+    project_id: &str,
+    query_vec: Vec<f32>,
+    branch: Option<&str>,
+    limit: usize,
+    section_filter: Option<&[String]>,
+) -> Result<HandoffSearchResult, MemoryError> {
+    // Fetch handoffs matching the branch filter. branch=None means all branches.
+    let handoffs = if let Some(b) = branch {
+        db.query_handoffs_by_branch(project_id, Some(b), 200)?
+    } else {
+        db.list_recent_handoffs(project_id, 200)?
+    };
+
+    // Score all sections against the query vector.
+    let mut all_matches = score_handoff_sections(&query_vec, &handoffs, db)?;
+
+    // Apply section_filter if present (case-insensitive match against section names).
+    if let Some(filter) = section_filter {
+        let filter_lower: Vec<String> = filter.iter().map(|s| s.to_lowercase()).collect();
+        all_matches.retain(|m| filter_lower.contains(&m.section_name.to_lowercase()));
+    }
+
+    // Sort by score descending and take top limit.
+    all_matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let matches = all_matches.into_iter().take(limit).collect();
+
+    Ok(HandoffSearchResult { matches })
+}
+
+/// Search session handoffs by section content, embedding the query via prefix-free `embed`.
+pub fn search_handoffs(
+    db: &Database,
+    embedding: &EmbeddingService,
+    project_id: &str,
+    query: &str,
+    branch: Option<&str>,
+    limit: usize,
+    section_filter: Option<&[String]>,
+) -> Result<HandoffSearchResult, MemoryError> {
+    let query_vec = embedding.embed(query)?;
+    search_handoffs_with_vec(db, project_id, query_vec, branch, limit, section_filter)
 }
 
 /// Compute a scoring boost based on query word overlap with memory tags.
@@ -346,6 +983,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "What to remember. Be specific and self-contained -- this will be retrieved by semantic search later."},
+                    // "handoff" is intentionally excluded; use handoff_create.
                     "type": {"type": "string", "enum": ["fact", "decision", "preference", "pattern", "debug", "entity"], "description": "fact=objective info, decision=choices made and why, preference=how the user likes things, pattern=recurring approaches/solutions, debug=troubleshooting findings, entity=people/systems/services"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "2-5 short lowercase tags for the topic. Tags improve search ranking -- use domain terms like 'database', 'auth', 'deployment'."},
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "How critical this is. 0.3=minor detail, 0.5=normal (default), 0.7=important, 0.9=critical decision or constraint."},
@@ -543,6 +1181,93 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 }
             })),
         ),
+        // === Handoff tools ===
+        Tool::new(
+            "handoff_create",
+            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup and contradiction detection.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "branch": {
+                        "type": "string",
+                        "description": "Git branch to scope this handoff to. Defaults to the current branch."
+                    },
+                    "sections": {
+                        "type": "object",
+                        "description": "Structured session sections.",
+                        "properties": {
+                            "summary": {"type": "string", "description": "High-level summary of the session."},
+                            "decisions": {"type": "array", "items": {"type": "string"}, "description": "Key decisions made."},
+                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Outstanding action items."},
+                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Known blockers."},
+                            "mental_model": {"type": "string", "description": "Architecture or context the next session needs."},
+                            "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Concrete next steps."},
+                            "notes": {"type": "string", "description": "Freeform notes (optional)."},
+                            "continues_from": {"type": "string", "description": "ID of the handoff this continues from (optional)."}
+                        },
+                        "required": ["summary"]
+                    },
+                    "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Importance score (default 0.85)."},
+                    "pinned": {"type": "boolean", "description": "Pin this handoff (exempt from decay/prune). Default true."},
+                    "auto_link": {"type": "boolean", "description": "Auto-link to related decisions/patterns/debug memories. Default true."}
+                },
+                "required": ["sections"]
+            })),
+        ),
+        Tool::new(
+            "handoff_resume",
+            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to fetch handoffs for. Defaults to the current branch."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Query string for scoring sections. Defaults to the latest handoff summary."
+                    },
+                    "max_sections": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum number of top sections to return (default 5)."
+                    },
+                    "include_off_branch": {
+                        "type": "boolean",
+                        "description": "Include handoffs from all branches (default false)."
+                    }
+                }
+            })),
+        ),
+        Tool::new(
+            "handoff_search",
+            "Search session handoffs by section content. Filter by branch and/or section name.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for across handoff sections."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Limit results to this branch. Omit to search all branches."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of matches to return (default 10)."
+                    },
+                    "section_filter": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only return matches from these section names (e.g. [\"blockers\", \"todos\"]). Case-insensitive."
+                    }
+                },
+                "required": ["query"]
+            })),
+        ),
     ]
 }
 
@@ -664,6 +1389,9 @@ impl ToolHandler {
             "memory_prune" => self.memory_prune(arguments),
             "memory_promote" => self.memory_promote(arguments),
             "memory_dedup" => self.memory_dedup(arguments),
+            "handoff_create" => self.handoff_create(arguments),
+            "handoff_resume" => self.handoff_resume(arguments),
+            "handoff_search" => self.handoff_search(arguments),
             _ => Ok(json!({"error": format!("Unknown tool: {}", name)})),
         }
     }
@@ -734,14 +1462,19 @@ impl ToolHandler {
             .collect();
 
         // Check for duplicates (configurable via ENGRAM_DEDUP_THRESHOLD, default 0.90)
+        // Handoffs are session snapshots; never auto-merge.
         let dedup_threshold = dedup_threshold();
-        let duplicates = self.find_duplicates(
-            &embedding,
-            memory_type,
-            dedup_threshold,
-            &pre_store_embeddings,
-            &pre_store_memories,
-        )?;
+        let duplicates = if memory_type != MemoryType::Handoff {
+            self.find_duplicates(
+                &embedding,
+                memory_type,
+                dedup_threshold,
+                &pre_store_embeddings,
+                &pre_store_memories,
+            )?
+        } else {
+            Vec::new()
+        };
 
         // Store the new memory
         self.db.store_memory(&memory)?;
@@ -779,31 +1512,34 @@ impl ToolHandler {
         }
 
         // Check for contradictions using pre-fetched embeddings, excluding self and any merged duplicate
+        // Handoffs encode evolving session state; suppress contradiction warnings.
         let mut potential_contradictions: Vec<PotentialContradiction> = Vec::new();
         const CONTRADICTION_THRESHOLD: f32 = 0.85;
         let merged_id: Option<&str> = merge_info.as_ref().map(|mi| mi.merged_with.as_str());
 
-        for (existing_id, existing_vec) in &pre_store_embeddings {
-            if existing_id.as_str() == id.as_str() {
-                continue; // Skip self
+        if memory_type != MemoryType::Handoff {
+            for (existing_id, existing_vec) in &pre_store_embeddings {
+                if existing_id.as_str() == id.as_str() {
+                    continue; // Skip self
+                }
+                if merged_id == Some(existing_id.as_str()) {
+                    continue; // Skip the merged-away duplicate
+                }
+                let similarity = cosine_similarity(&embedding, existing_vec);
+                if similarity >= CONTRADICTION_THRESHOLD
+                    && let Some(existing_memory) = pre_store_memories.get(existing_id)
+                {
+                    potential_contradictions.push(PotentialContradiction {
+                        memory_id: existing_id.clone(),
+                        summary: existing_memory
+                            .summary
+                            .clone()
+                            .unwrap_or_else(|| existing_memory.content.chars().take(100).collect()),
+                        similarity: similarity as f64,
+                    });
+                }
             }
-            if merged_id == Some(existing_id.as_str()) {
-                continue; // Skip the merged-away duplicate
-            }
-            let similarity = cosine_similarity(&embedding, existing_vec);
-            if similarity >= CONTRADICTION_THRESHOLD
-                && let Some(existing_memory) = pre_store_memories.get(existing_id)
-            {
-                potential_contradictions.push(PotentialContradiction {
-                    memory_id: existing_id.clone(),
-                    summary: existing_memory
-                        .summary
-                        .clone()
-                        .unwrap_or_else(|| existing_memory.content.chars().take(100).collect()),
-                    similarity: similarity as f64,
-                });
-            }
-        }
+        } // end if memory_type != MemoryType::Handoff (contradiction check)
 
         // Create relationships to related memories
         for related_id in input.related_to {
@@ -1132,17 +1868,50 @@ impl ToolHandler {
         let now = chrono::Utc::now().timestamp();
         memory.updated_at = now;
 
-        if let Some(content) = input.content {
-            memory.content = content.clone();
-            // Re-generate embedding
-            let embedding = self.embedding.embed_memory(memory.memory_type, &content)?;
-            self.db
-                .store_embedding(&memory.id, &embedding, self.embedding.model_version())?;
+        // Handoff update invalidates and rebuilds section embeddings; sidecar must stay in sync
+        // with content. Validate and rebuild BEFORE any DB write so a parse failure is a clean
+        // abort — the memory row and sidecar are left untouched on error.
+        //
+        // The tuple carries: (new_sections, full_content_embedding, section_vecs).
+        // All three are needed for the atomic update so they are computed together here.
+        let handoff_sidecar_update: Option<(HandoffSections, Vec<f32>, Vec<Vec<f32>>)> =
+            if memory.memory_type == MemoryType::Handoff {
+                if let Some(ref new_content) = input.content {
+                    // (a) Re-parse to validate; reject malformed content before touching the DB.
+                    let new_sections = HandoffSections::parse_markdown(new_content)?;
 
+                    // (b) Regenerate full-content embedding.
+                    let full_embedding = self
+                        .embedding
+                        .embed_memory(MemoryType::Handoff, new_content)?;
+
+                    // (c) Regenerate per-section embeddings via prefix-free embed.
+                    let section_texts = handoff_section_key_texts(&new_sections);
+                    let mut section_vecs: Vec<Vec<f32>> = Vec::new();
+                    for (_, text) in &section_texts {
+                        section_vecs.push(self.embedding.embed(text)?);
+                    }
+
+                    Some((new_sections, full_embedding, section_vecs))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(ref content) = input.content {
+            memory.content = content.clone();
+            // For non-Handoff types, store the embedding now (Handoff uses the atomic path below).
+            if memory.memory_type != MemoryType::Handoff {
+                let embedding = self.embedding.embed_memory(memory.memory_type, content)?;
+                self.db
+                    .store_embedding(&memory.id, &embedding, self.embedding.model_version())?;
+            }
             // Regenerate summary if content changed and no explicit summary provided
-            if input.summary.is_none() && should_auto_summarize(&content, memory.summary.as_deref())
+            if input.summary.is_none() && should_auto_summarize(content, memory.summary.as_deref())
             {
-                memory.summary = Some(generate_summary(&content));
+                memory.summary = Some(generate_summary(content));
             }
         }
 
@@ -1162,7 +1931,25 @@ impl ToolHandler {
             memory.pinned = pinned;
         }
 
-        self.db.update_memory(&memory)?;
+        // (d) For Handoff memories with new content: write memory row + full-content embedding +
+        // sidecar in one transaction so a partial failure cannot leave them out of sync.
+        // For all other cases fall back to the regular single-table update.
+        if let Some((new_sections, full_embedding, section_vecs)) = handoff_sidecar_update {
+            use crate::db::encode_section_embeddings;
+            let section_texts = handoff_section_key_texts(&new_sections);
+            let keys: Vec<&str> = section_texts.iter().map(|(k, _)| *k).collect();
+            let (section_keys_str, section_bytes) = encode_section_embeddings(&keys, &section_vecs);
+            self.db.update_memory_and_handoff_sidecar(
+                &memory,
+                &full_embedding,
+                self.embedding.model_version(),
+                &new_sections,
+                &section_keys_str,
+                &section_bytes,
+            )?;
+        } else {
+            self.db.update_memory(&memory)?;
+        }
 
         // Invalidate search cache since we updated data
         self.invalidate_search_cache();
@@ -1512,11 +2299,37 @@ impl ToolHandler {
             None
         };
 
+        // Collect handoff sidecar data for all Handoff-type memories.
+        let mut handoff_sidecars: std::collections::HashMap<String, HandoffSidecar> =
+            std::collections::HashMap::new();
+        for memory in &memories {
+            if memory.memory_type == MemoryType::Handoff
+                && let Some((sections, section_vecs)) = self.db.get_handoff_sections(&memory.id)?
+            {
+                // Re-encode the sections embeddings to raw bytes for export.
+                // Collect key strings first so we can borrow them as &str slices.
+                let key_strings: Vec<String> =
+                    section_vecs.iter().map(|(k, _)| k.clone()).collect();
+                let keys: Vec<&str> = key_strings.iter().map(|s| s.as_str()).collect();
+                let vecs: Vec<Vec<f32>> = section_vecs.into_iter().map(|(_, v)| v).collect();
+                let (keys_str, bytes) = encode_section_embeddings(&keys, &vecs);
+                handoff_sidecars.insert(
+                    memory.id.clone(),
+                    HandoffSidecar {
+                        sections,
+                        keys: keys_str,
+                        bytes,
+                    },
+                );
+            }
+        }
+
         let export_data = export::create_export(
             &self.project_id,
             memories,
             relationships,
             embeddings,
+            handoff_sidecars,
             Some(self.embedding.model_version().to_string()),
         );
 
@@ -1561,6 +2374,9 @@ impl ToolHandler {
             let ExportedMemory {
                 mut memory,
                 embedding: encoded_embedding,
+                sections,
+                section_embedding_keys,
+                section_embeddings: encoded_section_embeddings,
             } = exported;
 
             // Update project_id to current project
@@ -1591,6 +2407,63 @@ impl ToolHandler {
                 self.db
                     .store_embedding(&memory.id, &embedding, self.embedding.model_version())?;
                 stats.embeddings_imported += 1;
+            }
+
+            // Import handoff sidecar if present (Handoff memories only).
+            // Old exports that lack sidecar fields are still imported as memory rows;
+            // the sidecar is simply skipped (a subsequent handoff_resume will notice
+            // no sections are available).
+            if memory.memory_type == MemoryType::Handoff {
+                match (sections, section_embedding_keys, encoded_section_embeddings) {
+                    (Some(sections_data), Some(keys), Some(encoded_bytes)) => {
+                        match export::decode_section_embedding_bytes(&encoded_bytes) {
+                            Ok(bytes) => {
+                                // Validate byte length before inserting.
+                                let key_count = if keys.is_empty() {
+                                    0
+                                } else {
+                                    keys.split(',').count()
+                                };
+                                if bytes.len() == key_count * 256 * 4 {
+                                    if let Err(e) = self.db.insert_handoff_sections(
+                                        &memory.id,
+                                        &sections_data,
+                                        &keys,
+                                        &bytes,
+                                    ) {
+                                        // Log but don't fail the import.
+                                        tracing::warn!(
+                                            "failed to import handoff sidecar for {}: {}",
+                                            memory.id,
+                                            e
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "skipping handoff sidecar for {} — section_embeddings byte length mismatch ({} bytes, expected {})",
+                                        memory.id,
+                                        bytes.len(),
+                                        key_count * 256 * 4
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "skipping handoff sidecar for {} — could not decode section_embeddings: {}",
+                                    memory.id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        // Old export without sidecar fields — skip sidecar, import memory row only.
+                        tracing::info!(
+                            "handoff {} imported without sidecar (old export format; sections not available)",
+                            memory.id
+                        );
+                    }
+                }
             }
         }
 
@@ -1638,6 +2511,8 @@ impl ToolHandler {
             "cluster_count": clusters.len(),
             "pinned_count": stats.pinned_count,
             "global_count": stats.global_count,
+            "handoff_count": stats.handoff_count,
+            "latest_handoff_at": stats.latest_handoff_at,
         }))
     }
 
@@ -2041,6 +2916,11 @@ impl ToolHandler {
                 None => continue,
             };
 
+            // Handoffs are session snapshots; never auto-merge.
+            if mem_i.memory_type == MemoryType::Handoff {
+                continue;
+            }
+
             let mut group = vec![(id_i.clone(), 1.0_f32)];
 
             for (id_j, vec_j) in all_embeddings.iter().skip(i + 1) {
@@ -2052,6 +2932,7 @@ impl ToolHandler {
                 if similarity >= threshold
                     && let Some(mem_j) = all_memories.get(id_j)
                     && mem_j.memory_type == mem_i.memory_type
+                    && mem_j.memory_type != MemoryType::Handoff
                 {
                     group.push((id_j.clone(), similarity));
                 }
@@ -2155,6 +3036,68 @@ impl ToolHandler {
                 "groups": group_info
             }))
         }
+    }
+
+    fn handoff_create(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: HandoffCreateInput = serde_json::from_value(arguments)?;
+
+        // Resolve branch: explicit input branch, then current branch from ToolHandler.
+        let resolved_branch = input.branch.as_deref().or(self.current_branch.as_deref());
+
+        let result = create_handoff(
+            &self.db,
+            &self.embedding,
+            &self.project_id,
+            resolved_branch,
+            input.sections,
+            input.importance,
+            input.pinned,
+            input.auto_link,
+        )?;
+
+        // Invalidate search cache since we added new data.
+        self.invalidate_search_cache();
+
+        Ok(json!(result))
+    }
+
+    fn handoff_resume(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: HandoffResumeInput = serde_json::from_value(arguments)?;
+
+        // Resolve branch: explicit input branch, then current branch from ToolHandler.
+        let resolved_branch = input.branch.as_deref().or(self.current_branch.as_deref());
+
+        let result = resume_handoff(
+            &self.db,
+            &self.embedding,
+            &self.project_id,
+            resolved_branch,
+            input.query.as_deref(),
+            input.max_sections,
+            input.include_off_branch,
+        )?;
+
+        Ok(json!(result))
+    }
+
+    fn handoff_search(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: HandoffSearchInput = serde_json::from_value(arguments)?;
+
+        let limit = input.limit.unwrap_or(10);
+        let branch = input.branch.as_deref();
+        let section_filter = input.section_filter.as_deref();
+
+        let result = search_handoffs(
+            &self.db,
+            &self.embedding,
+            &self.project_id,
+            &input.query,
+            branch,
+            limit,
+            section_filter,
+        )?;
+
+        Ok(json!(result))
     }
 
     /// Generate a cluster summary from member memories.
@@ -2298,5 +3241,636 @@ impl ToolHandler {
             }
             s
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, encode_section_embeddings};
+    use crate::memory::{HandoffSections, Memory, MemoryType};
+
+    /// Build a dummy 256-element embedding vector for use in tests that need
+    /// pre-computed vectors without a real `EmbeddingService`.
+    ///
+    /// Uses a simple pattern so different seeds produce genuinely different directions.
+    fn dummy_vec(seed: f32) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..256)
+            .map(|i| seed * (i as f32 + 1.0).cos() + (i as f32 * 0.1).sin())
+            .collect();
+        // L2-normalize so cosine similarity is well-defined.
+        let norm = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    /// Insert a handoff directly into the DB (no `EmbeddingService` required).
+    fn insert_test_handoff(
+        db: &Database,
+        project_id: &str,
+        id: &str,
+        branch: &str,
+        sections: &HandoffSections,
+        section_vecs: &[(&str, Vec<f32>)],
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        let memory = Memory {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            memory_type: MemoryType::Handoff,
+            content: sections.render_markdown(),
+            summary: None,
+            tags: vec![],
+            importance: 0.85,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: Some(branch.to_string()),
+            merged_from: None,
+            pinned: true,
+            global: false,
+        };
+        db.store_memory(&memory).unwrap();
+
+        // Store a dummy full-content embedding.
+        let full_emb = dummy_vec(1.0);
+        db.store_embedding(id, &full_emb, "test-model").unwrap();
+
+        let keys: Vec<&str> = section_vecs.iter().map(|(k, _)| *k).collect();
+        let vecs: Vec<Vec<f32>> = section_vecs.iter().map(|(_, v)| v.clone()).collect();
+        let (keys_str, bytes) = encode_section_embeddings(&keys, &vecs);
+        db.insert_handoff_sections(id, sections, &keys_str, &bytes)
+            .unwrap();
+    }
+
+    fn test_sections(summary: &str, continues_from: Option<String>) -> HandoffSections {
+        HandoffSections {
+            summary: summary.to_string(),
+            decisions: vec!["Use SQLite".to_string()],
+            todos: vec!["Write tests".to_string()],
+            blockers: vec!["Awaiting review".to_string()],
+            mental_model: "Layered architecture".to_string(),
+            next_steps: vec!["Deploy".to_string()],
+            notes: Some("Extra note".to_string()),
+            continues_from,
+        }
+    }
+
+    /// 3A.8 test 1: handoff_create_basic
+    /// Verifies memory row, sidecar row, and section embedding round-trip using DB helpers.
+    #[test]
+    fn handoff_create_basic() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "test-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let sections = test_sections("Worked on the DB layer", None);
+        let section_vecs = vec![
+            ("summary", dummy_vec(0.1)),
+            ("decisions", dummy_vec(0.2)),
+            ("todos", dummy_vec(0.3)),
+            ("blockers", dummy_vec(0.4)),
+            ("mental_model", dummy_vec(0.5)),
+            ("next_steps", dummy_vec(0.6)),
+            ("notes", dummy_vec(0.7)),
+        ];
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-basic",
+            "main",
+            &sections,
+            &section_vecs,
+        );
+
+        // Verify memory row exists with correct type and branch.
+        let memory = db.get_memory("ho-basic").unwrap().unwrap();
+        assert_eq!(memory.memory_type, MemoryType::Handoff);
+        assert_eq!(memory.branch.as_deref(), Some("main"));
+        assert!(memory.pinned);
+
+        // Verify sidecar row round-trips correctly.
+        let (retrieved_sections, retrieved_vecs) =
+            db.get_handoff_sections("ho-basic").unwrap().unwrap();
+        assert_eq!(retrieved_sections.summary, "Worked on the DB layer");
+        assert_eq!(retrieved_sections.decisions, vec!["Use SQLite"]);
+        assert_eq!(retrieved_vecs.len(), 7);
+
+        // Verify section embedding round-trip (spot-check first vector).
+        let (first_key, first_vec) = &retrieved_vecs[0];
+        assert_eq!(first_key, "summary");
+        assert!((first_vec[0] - dummy_vec(0.1)[0]).abs() < 1e-5);
+    }
+
+    /// 3A.8 test 2: handoff_create_rejects_detached_head
+    /// When branch=None is passed to create_handoff, it must return InvalidType.
+    #[test]
+    fn handoff_create_rejects_detached_head() {
+        let db = Database::open_in_memory().unwrap();
+        db.get_or_create_project("proj", "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let sections = HandoffSections {
+            summary: "test".to_string(),
+            decisions: vec![],
+            todos: vec![],
+            blockers: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+
+        // branch=None simulates a detached HEAD or non-git workspace.
+        // create_handoff rejects this before making any embedding call.
+        let result = create_handoff(&db, &embedding, "proj", None, sections, 0.85, true, false);
+
+        assert!(
+            matches!(result, Err(MemoryError::InvalidType(ref msg)) if msg.contains("handoff requires a branch")),
+            "Expected InvalidType error for detached HEAD, got: {:?}",
+            result
+        );
+    }
+
+    /// 3A.8 test 3: handoff_create_chain
+    /// Create handoff A, then B with continues_from=A.id.
+    /// Verify sidecar field is set and NO derived_from relationship was created for the link.
+    #[test]
+    fn handoff_create_chain() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "chain-proj";
+        db.get_or_create_project(project_id, "Chain Test").unwrap();
+
+        let sections_a = test_sections("Session A summary", None);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-a",
+            "feat/x",
+            &sections_a,
+            &[("summary", dummy_vec(0.1))],
+        );
+
+        let sections_b = test_sections("Session B summary", Some("ho-a".to_string()));
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-b",
+            "feat/x",
+            &sections_b,
+            &[("summary", dummy_vec(0.2))],
+        );
+
+        // Verify sidecar continues_from on B points to A.
+        let (sidecar_b, _) = db.get_handoff_sections("ho-b").unwrap().unwrap();
+        assert_eq!(sidecar_b.continues_from.as_deref(), Some("ho-a"));
+
+        // Verify NO derived_from relationship was created for the chain link.
+        let rels = db.get_relationships_from("ho-b").unwrap();
+        let has_derived_from_to_a = rels
+            .iter()
+            .any(|r| r.relation_type == RelationType::DerivedFrom && r.target_id == "ho-a");
+        assert!(
+            !has_derived_from_to_a,
+            "continues_from must not create a derived_from relationship"
+        );
+    }
+
+    /// 3A.8 test 4: handoff_resume_returns_top_sections
+    /// Create a handoff with 4 sections, resume with a query, assert top sections sorted by score.
+    #[test]
+    fn handoff_resume_returns_top_sections() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "resume-proj";
+        db.get_or_create_project(project_id, "Resume Test").unwrap();
+
+        // Seed section embeddings with different directions relative to the query vector.
+        // query = dummy_vec(0.9), so "summary" (also dummy_vec(0.9)) will score ~1.0.
+        let section_vecs = vec![
+            ("summary", dummy_vec(0.9)), // highest similarity to query
+            ("decisions", dummy_vec(0.5)),
+            ("blockers", dummy_vec(0.1)),
+            ("next_steps", dummy_vec(0.3)),
+        ];
+        let sections = HandoffSections {
+            summary: "Very relevant summary".to_string(),
+            decisions: vec!["A key decision".to_string()],
+            todos: vec![],
+            blockers: vec!["A blocker".to_string()],
+            mental_model: String::new(),
+            next_steps: vec!["A next step".to_string()],
+            notes: None,
+            continues_from: None,
+        };
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-resume",
+            "main",
+            &sections,
+            &section_vecs,
+        );
+
+        // Call the inner function with a pre-computed query vector so no EmbeddingService
+        // is required.  dummy_vec(0.9) matches the "summary" section exactly.
+        let query_vec = dummy_vec(0.9);
+        let result =
+            resume_handoff_with_vec(&db, project_id, Some("main"), Some(query_vec), 5, false)
+                .expect("resume_handoff_with_vec must succeed");
+
+        assert!(
+            !result.top_sections.is_empty(),
+            "must return scored sections"
+        );
+
+        // First result should be "summary" with score ~1.0 (identical vector).
+        assert_eq!(
+            result.top_sections[0].section_name, "summary",
+            "summary section must rank first"
+        );
+        assert!(
+            (result.top_sections[0].score - 1.0).abs() < 1e-4,
+            "summary should score ~1.0, got {}",
+            result.top_sections[0].score
+        );
+
+        // Scores must be in descending order.
+        for i in 0..result.top_sections.len() - 1 {
+            assert!(
+                result.top_sections[i].score >= result.top_sections[i + 1].score,
+                "sections must be sorted by score descending"
+            );
+        }
+    }
+
+    /// 3A.8 test 5: handoff_resume_detached_head_message
+    /// When no branch is resolvable, resume_handoff must set message and branch=None.
+    #[test]
+    fn handoff_resume_detached_head_message() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "detach-proj";
+        db.get_or_create_project(project_id, "Detach Test").unwrap();
+
+        // Insert a handoff on an explicit branch so we know what would be returned.
+        let sections = test_sections("Some session", None);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-detach",
+            "main",
+            &sections,
+            &[("summary", dummy_vec(0.5))],
+        );
+
+        // Call resume_handoff_with_vec with branch=None, simulating a detached-HEAD workspace.
+        // No EmbeddingService is required because the query vec is pre-computed.
+        let result = resume_handoff_with_vec(
+            &db,
+            project_id,
+            None, // branch=None → detached HEAD
+            Some(dummy_vec(0.5)),
+            5,
+            false,
+        )
+        .expect("resume_handoff_with_vec must succeed");
+
+        assert!(
+            result.branch.is_none(),
+            "branch must be None for detached HEAD"
+        );
+        assert!(
+            result.message.is_some(),
+            "message must be set for detached HEAD"
+        );
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("No current branch"),
+            "message must explain the situation"
+        );
+    }
+
+    // ============================================
+    // 3B.6 unit tests
+    // ============================================
+
+    /// 3B.6 test 1: handoff_search_filters_by_section
+    /// Store multiple handoffs with content in different sections.
+    /// Search with section_filter=["blockers"]; assert only blocker matches are returned.
+    #[test]
+    fn handoff_search_filters_by_section() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "search-filter-proj";
+        db.get_or_create_project(project_id, "Search Filter Test")
+            .unwrap();
+
+        // Two handoffs: one with a blockers section, one with only a todos section.
+        let sections_with_blocker = HandoffSections {
+            summary: "session with blocker".to_string(),
+            decisions: vec![],
+            todos: vec![],
+            blockers: vec!["DB migration blocking deploy".to_string()],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let sections_todos_only = HandoffSections {
+            summary: "session with todos".to_string(),
+            decisions: vec![],
+            todos: vec!["Write more tests".to_string()],
+            blockers: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+
+        // Use distinct vectors so blockers section clearly outscores everything else.
+        let blocker_vec = dummy_vec(0.9);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-blocker",
+            "main",
+            &sections_with_blocker,
+            &[
+                ("summary", dummy_vec(0.2)),
+                ("blockers", blocker_vec.clone()),
+            ],
+        );
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-todos",
+            "main",
+            &sections_todos_only,
+            &[("summary", dummy_vec(0.3)), ("todos", dummy_vec(0.4))],
+        );
+
+        // Query with the blockers vector so blockers section scores highest.
+        let filter = vec!["blockers".to_string()];
+        let result =
+            search_handoffs_with_vec(&db, project_id, blocker_vec, None, 10, Some(&filter))
+                .expect("search must succeed");
+
+        // Only the blockers section should appear.
+        assert!(!result.matches.is_empty(), "must return at least one match");
+        for m in &result.matches {
+            assert_eq!(
+                m.section_name, "blockers",
+                "only blockers sections should be in results, got {}",
+                m.section_name
+            );
+        }
+    }
+
+    /// 3B.6 test 2: handoff_search_cross_branch
+    /// Handoffs on feat/a and feat/b; search with branch=None; assert both appear.
+    #[test]
+    fn handoff_search_cross_branch() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "cross-branch-proj";
+        db.get_or_create_project(project_id, "Cross Branch Test")
+            .unwrap();
+
+        let sections_a = HandoffSections {
+            summary: "feat/a session".to_string(),
+            decisions: vec![],
+            todos: vec![],
+            blockers: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let sections_b = HandoffSections {
+            summary: "feat/b session".to_string(),
+            decisions: vec![],
+            todos: vec![],
+            blockers: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+
+        let query_vec = dummy_vec(0.5);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-feat-a",
+            "feat/a",
+            &sections_a,
+            &[("summary", dummy_vec(0.5))],
+        );
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-feat-b",
+            "feat/b",
+            &sections_b,
+            &[("summary", dummy_vec(0.5))],
+        );
+
+        // branch=None means all branches.
+        let result = search_handoffs_with_vec(&db, project_id, query_vec, None, 10, None)
+            .expect("search must succeed");
+
+        let handoff_ids: Vec<&str> = result
+            .matches
+            .iter()
+            .map(|m| m.handoff_id.as_str())
+            .collect();
+        assert!(
+            handoff_ids.contains(&"ho-feat-a"),
+            "feat/a handoff must appear"
+        );
+        assert!(
+            handoff_ids.contains(&"ho-feat-b"),
+            "feat/b handoff must appear"
+        );
+    }
+
+    /// 3B.6 test 3: handoff_update_rebuilds_sections
+    /// Create a handoff, call memory_update with new section content, assert sidecar is rebuilt
+    /// and section_embeddings byte length matches new section count * 256 * 4.
+    #[test]
+    fn handoff_update_rebuilds_sections() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-rebuild-proj";
+        db.get_or_create_project(project_id, "Update Rebuild Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        // Create a handoff with two non-empty sections (summary + decisions).
+        let sections = HandoffSections {
+            summary: "Original summary".to_string(),
+            decisions: vec!["Original decision".to_string()],
+            todos: vec![],
+            blockers: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let _ = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections,
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed");
+
+        // Retrieve the ID we just created.
+        let handoffs = db.list_recent_handoffs(project_id, 1).unwrap();
+        let handoff_id = handoffs[0].id.clone();
+
+        // Build new content with three non-empty sections (summary + decisions + blockers).
+        let new_sections = HandoffSections {
+            summary: "Updated summary".to_string(),
+            decisions: vec!["Updated decision".to_string()],
+            todos: vec![],
+            blockers: vec!["A new blocker".to_string()],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let new_content = new_sections.render_markdown();
+
+        // Build a minimal ToolHandler to call memory_update.
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+        );
+
+        handler
+            .memory_update(json!({"id": handoff_id, "content": new_content}))
+            .expect("update must succeed");
+
+        // Verify sidecar was rebuilt: 3 sections now (summary, decisions, blockers).
+        let (updated_sections, _) = db
+            .get_handoff_sections(&handoff_id)
+            .unwrap()
+            .expect("sidecar must exist");
+        assert_eq!(updated_sections.summary, "Updated summary");
+        assert_eq!(updated_sections.blockers, vec!["A new blocker"]);
+
+        // Verify raw byte length: 3 sections * 256 dims * 4 bytes.
+        // We check via decode: the returned vecs length should be 3.
+        let (_, section_vecs) = db
+            .get_handoff_sections(&handoff_id)
+            .unwrap()
+            .expect("sidecar must exist");
+        assert_eq!(
+            section_vecs.len(),
+            3,
+            "should have 3 section embeddings after update"
+        );
+        for (_, vec) in &section_vecs {
+            assert_eq!(vec.len(), 256, "each section embedding must be 256-dim");
+        }
+    }
+
+    /// 3B.6 test 4: handoff_update_malformed_rejects
+    /// Call memory_update on a Handoff with non-parseable content.
+    /// Assert MemoryError::InvalidType, original sidecar unchanged, original content unchanged.
+    #[test]
+    fn handoff_update_malformed_rejects() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-malformed-proj";
+        db.get_or_create_project(project_id, "Update Malformed Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let sections = HandoffSections {
+            summary: "Original summary content".to_string(),
+            decisions: vec!["Original decision".to_string()],
+            todos: vec![],
+            blockers: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let original_content = sections.render_markdown();
+
+        let _ = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections.clone(),
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed");
+
+        let handoffs = db.list_recent_handoffs(project_id, 1).unwrap();
+        let handoff_id = handoffs[0].id.clone();
+
+        // Capture original sidecar state.
+        let (orig_sections, orig_vecs) = db
+            .get_handoff_sections(&handoff_id)
+            .unwrap()
+            .expect("sidecar must exist");
+
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+        );
+
+        // A string that parse_markdown cannot map to a valid HandoffSections with a summary.
+        let malformed = "this is not valid handoff markdown at all !!!";
+        let result = handler.memory_update(json!({"id": handoff_id, "content": malformed}));
+
+        assert!(
+            matches!(result, Err(MemoryError::InvalidType(_))),
+            "must return InvalidType for malformed content, got {:?}",
+            result
+        );
+
+        // Original memory content must be unchanged.
+        let stored = db.get_memory(&handoff_id).unwrap().unwrap();
+        assert_eq!(
+            stored.content, original_content,
+            "content must not be modified on parse failure"
+        );
+
+        // Original sidecar must be unchanged.
+        let (post_sections, post_vecs) = db
+            .get_handoff_sections(&handoff_id)
+            .unwrap()
+            .expect("sidecar must still exist");
+        assert_eq!(
+            post_sections.summary, orig_sections.summary,
+            "sidecar summary must be unchanged"
+        );
+        assert_eq!(
+            post_vecs.len(),
+            orig_vecs.len(),
+            "sidecar section count must be unchanged"
+        );
     }
 }

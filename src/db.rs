@@ -1,12 +1,24 @@
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use crate::error::MemoryError;
 use crate::memory::{
-    Memory, MemoryCluster, MemoryType, Project, ProjectStats, RelationType, Relationship,
+    HandoffSections, Memory, MemoryCluster, MemoryType, Project, ProjectStats, RelationType,
+    Relationship,
 };
+
+/// Parse a memory type string from a DB row, propagating an error on unknown values.
+///
+/// Used in `query_map` closures that return `rusqlite::Result<T>` so the error type
+/// matches without requiring a full `MemoryError` conversion at every call site.
+fn parse_memory_type_col(s: &str, col: usize) -> rusqlite::Result<MemoryType> {
+    MemoryType::from_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
 
 const SCHEMA: &str = r#"
 -- Core memory storage
@@ -122,6 +134,27 @@ impl Database {
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // The bundled SQLite is not compiled with SQLITE_ENABLE_MATH_FUNCTIONS, so EXP()
+        // and LN() are unavailable.  Register them as custom scalar functions so that
+        // update_relevance_scores works correctly in test builds.
+        conn.create_scalar_function(
+            "EXP",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let x: f64 = ctx.get(0)?;
+                Ok(x.exp())
+            },
+        )?;
+        conn.create_scalar_function(
+            "LN",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let x: f64 = ctx.get(0)?;
+                Ok(x.ln())
+            },
+        )?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -293,6 +326,43 @@ impl Database {
             )?;
         }
 
+        // Migration 4: add handoff_sections sidecar table and continuation index.
+        //
+        // Wire format for section_embeddings:
+        //   section_embedding_keys: comma-separated section names in canonical order,
+        //     omitting empty sections (matches render_markdown order).
+        //   section_embeddings: concatenated little-endian f32 bytes,
+        //     256 dims × N sections × 4 bytes per float.
+        //   Decoder validates bytes.len() == count * 256 * 4.
+        if current_version < 4 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS handoff_sections (
+                    memory_id TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL,
+                    decisions TEXT NOT NULL,
+                    todos TEXT NOT NULL,
+                    blockers TEXT NOT NULL,
+                    mental_model TEXT NOT NULL,
+                    next_steps TEXT NOT NULL,
+                    notes TEXT,
+                    continues_from TEXT,
+                    section_embedding_keys TEXT NOT NULL,
+                    section_embeddings BLOB NOT NULL,
+                    FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_handoff_continues
+                    ON handoff_sections(continues_from);
+                "#,
+            )?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![4],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -390,7 +460,8 @@ impl Database {
             Ok(Some(Memory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
+                memory_type: MemoryType::from_str(&memory_type_str)
+                    .map_err(|_| MemoryError::InvalidType(memory_type_str.clone()))?,
                 content: row.get(3)?,
                 summary: row.get(4)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
@@ -437,6 +508,13 @@ impl Database {
 
     pub fn delete_memory(&self, id: &str) -> Result<bool, MemoryError> {
         let conn = self.conn.lock().unwrap();
+        // Belt-and-suspenders: explicitly delete sidecar row before deleting the memory
+        // so that the handoff_sections row is removed even if FOREIGN KEY CASCADE is
+        // disabled or the constraint fires in an unexpected order.
+        conn.execute(
+            "DELETE FROM handoff_sections WHERE memory_id = ?1",
+            params![id],
+        )?;
         let rows_affected = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         Ok(rows_affected > 0)
     }
@@ -516,7 +594,7 @@ impl Database {
             Ok(Memory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
+                memory_type: parse_memory_type_col(&memory_type_str, 2)?,
                 content: row.get(3)?,
                 summary: row.get(4)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
@@ -977,12 +1055,26 @@ impl Database {
             |row| row.get(0),
         )?;
 
+        let handoff_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE project_id = ?1 AND memory_type = 'handoff'",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+
+        let latest_handoff_at: Option<i64> = conn.query_row(
+            "SELECT MAX(created_at) FROM memories WHERE project_id = ?1 AND memory_type = 'handoff'",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+
         Ok(ProjectStats {
             memory_count: memory_count as usize,
             relationship_count: relationship_count as usize,
             avg_relevance,
             pinned_count: pinned_count as usize,
             global_count: global_count as usize,
+            handoff_count: handoff_count as usize,
+            latest_handoff_at,
         })
     }
 
@@ -1027,7 +1119,7 @@ impl Database {
             Ok(Memory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
+                memory_type: parse_memory_type_col(&memory_type_str, 2)?,
                 content: row.get(3)?,
                 summary: row.get(4)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
@@ -1631,7 +1723,7 @@ impl Database {
             Ok(Memory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
-                memory_type: memory_type_str.parse().unwrap_or(MemoryType::Fact),
+                memory_type: parse_memory_type_col(&memory_type_str, 2)?,
                 content: row.get(3)?,
                 summary: row.get(4)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
@@ -1796,6 +1888,479 @@ impl Database {
 
         Ok(result)
     }
+
+    // ============================================
+    // Handoff sidecar helpers (Task 1.8)
+    // ============================================
+
+    /// Insert a handoff sidecar row linking to the given memory.
+    ///
+    /// `section_keys` is a comma-separated list of section names in canonical order
+    /// (produced by `encode_section_embeddings`).  `section_embeddings` is the
+    /// concatenated little-endian f32 byte blob (256 dims × N sections × 4 bytes).
+    #[allow(dead_code)] // Used by handoff_create tool (Phase 3)
+    pub fn insert_handoff_sections(
+        &self,
+        memory_id: &str,
+        sections: &HandoffSections,
+        section_keys: &str,
+        section_embeddings: &[u8],
+    ) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let decisions_json = serde_json::to_string(&sections.decisions)?;
+        let todos_json = serde_json::to_string(&sections.todos)?;
+        let blockers_json = serde_json::to_string(&sections.blockers)?;
+        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
+        conn.execute(
+            "INSERT INTO handoff_sections (
+                memory_id, summary, decisions, todos, blockers,
+                mental_model, next_steps, notes, continues_from,
+                section_embedding_keys, section_embeddings
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                memory_id,
+                sections.summary,
+                decisions_json,
+                todos_json,
+                blockers_json,
+                sections.mental_model,
+                next_steps_json,
+                sections.notes,
+                sections.continues_from,
+                section_keys,
+                section_embeddings,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Store a handoff memory, its embedding, and the sidecar row atomically.
+    ///
+    /// All three inserts run inside a single SQLite transaction.  If any step fails
+    /// the entire operation is rolled back, leaving the DB in a consistent state.
+    pub fn store_handoff_atomic(
+        &self,
+        memory: &Memory,
+        embedding: &[f32],
+        model_version: &str,
+        sections: &HandoffSections,
+        section_keys: &str,
+        section_embeddings: &[u8],
+    ) -> Result<(), MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Insert memory row.
+        let tags_json = serde_json::to_string(&memory.tags)?;
+        let merged_from_json = memory
+            .merged_from
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        tx.execute(
+            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                memory.id,
+                memory.project_id,
+                memory.memory_type.as_str(),
+                memory.content,
+                memory.summary,
+                tags_json,
+                memory.importance,
+                memory.relevance_score,
+                memory.access_count,
+                memory.created_at,
+                memory.updated_at,
+                memory.last_accessed_at,
+                memory.branch,
+                merged_from_json,
+                memory.pinned as i64,
+                memory.global as i64,
+            ],
+        )?;
+
+        // Insert embedding row.
+        let vector_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        tx.execute(
+            "INSERT OR REPLACE INTO embeddings (memory_id, vector, model_version) VALUES (?1, ?2, ?3)",
+            params![memory.id, vector_bytes, model_version],
+        )?;
+
+        // Insert handoff sidecar row.
+        let decisions_json = serde_json::to_string(&sections.decisions)?;
+        let todos_json = serde_json::to_string(&sections.todos)?;
+        let blockers_json = serde_json::to_string(&sections.blockers)?;
+        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
+        tx.execute(
+            "INSERT INTO handoff_sections (
+                memory_id, summary, decisions, todos, blockers,
+                mental_model, next_steps, notes, continues_from,
+                section_embedding_keys, section_embeddings
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                memory.id,
+                sections.summary,
+                decisions_json,
+                todos_json,
+                blockers_json,
+                sections.mental_model,
+                next_steps_json,
+                sections.notes,
+                sections.continues_from,
+                section_keys,
+                section_embeddings,
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fetch a handoff sidecar row plus decoded section embeddings.
+    ///
+    /// Returns `Ok(None)` if no sidecar exists for the given memory ID.
+    /// Returns `(HandoffSections, Vec<(section_name, embedding_vector)>)` on success.
+    #[allow(clippy::type_complexity)]
+    #[allow(dead_code)] // Used by handoff_resume/search tools (Phase 3)
+    pub fn get_handoff_sections(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<(HandoffSections, Vec<(String, Vec<f32>)>)>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT summary, decisions, todos, blockers, mental_model, next_steps,
+                    notes, continues_from, section_embedding_keys, section_embeddings
+             FROM handoff_sections WHERE memory_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![memory_id])?;
+
+        if let Some(row) = rows.next()? {
+            let summary: String = row.get(0)?;
+            let decisions: Vec<String> =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?)?;
+            let todos: Vec<String> =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?)?;
+            let blockers: Vec<String> =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?)?;
+            let mental_model: String = row.get(4)?;
+            let next_steps: Vec<String> =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(5)?)?;
+            let notes: Option<String> = row.get(6)?;
+            let continues_from: Option<String> = row.get(7)?;
+            let keys: String = row.get(8)?;
+            let embedding_bytes: Vec<u8> = row.get(9)?;
+
+            let sections = HandoffSections {
+                summary,
+                decisions,
+                todos,
+                blockers,
+                mental_model,
+                next_steps,
+                notes,
+                continues_from,
+            };
+            let section_vecs = decode_section_embeddings(&keys, &embedding_bytes)?;
+            Ok(Some((sections, section_vecs)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update a memory row, its full-content embedding, and the handoff sidecar atomically.
+    ///
+    /// All three writes share a single transaction so a failure in any step leaves the
+    /// database unchanged — no partial updates where `memories.content` diverges from the
+    /// sidecar sections or embeddings.
+    #[allow(dead_code)] // Used by handoff update hook (Phase 3B)
+    pub fn update_memory_and_handoff_sidecar(
+        &self,
+        memory: &Memory,
+        new_full_embedding: &[f32],
+        model_version: &str,
+        sections: &HandoffSections,
+        section_keys: &str,
+        section_embeddings: &[u8],
+    ) -> Result<(), MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Update memory row (same fields as update_memory).
+        let tags_json = serde_json::to_string(&memory.tags)?;
+        tx.execute(
+            "UPDATE memories SET content = ?1, summary = ?2, tags = ?3, importance = ?4, relevance_score = ?5, access_count = ?6, updated_at = ?7, last_accessed_at = ?8, pinned = ?9, global = ?10
+             WHERE id = ?11",
+            params![
+                memory.content,
+                memory.summary,
+                tags_json,
+                memory.importance,
+                memory.relevance_score,
+                memory.access_count,
+                memory.updated_at,
+                memory.last_accessed_at,
+                memory.pinned as i64,
+                memory.global as i64,
+                memory.id,
+            ],
+        )?;
+
+        // Update full-content embedding.
+        let vector_bytes: Vec<u8> = new_full_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        tx.execute(
+            "INSERT OR REPLACE INTO embeddings (memory_id, vector, model_version) VALUES (?1, ?2, ?3)",
+            params![memory.id, vector_bytes, model_version],
+        )?;
+
+        // Update handoff sidecar.
+        let decisions_json = serde_json::to_string(&sections.decisions)?;
+        let todos_json = serde_json::to_string(&sections.todos)?;
+        let blockers_json = serde_json::to_string(&sections.blockers)?;
+        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
+        tx.execute(
+            "UPDATE handoff_sections SET
+                summary = ?2, decisions = ?3, todos = ?4, blockers = ?5,
+                mental_model = ?6, next_steps = ?7, notes = ?8, continues_from = ?9,
+                section_embedding_keys = ?10, section_embeddings = ?11
+             WHERE memory_id = ?1",
+            params![
+                memory.id,
+                sections.summary,
+                decisions_json,
+                todos_json,
+                blockers_json,
+                sections.mental_model,
+                next_steps_json,
+                sections.notes,
+                sections.continues_from,
+                section_keys,
+                section_embeddings,
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Overwrite the handoff sidecar row for an existing memory (used when content is updated).
+    #[allow(dead_code)] // Used by handoff update hook (Phase 3B)
+    pub fn update_handoff_sections(
+        &self,
+        memory_id: &str,
+        sections: &HandoffSections,
+        section_keys: &str,
+        section_embeddings: &[u8],
+    ) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let decisions_json = serde_json::to_string(&sections.decisions)?;
+        let todos_json = serde_json::to_string(&sections.todos)?;
+        let blockers_json = serde_json::to_string(&sections.blockers)?;
+        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
+        conn.execute(
+            "UPDATE handoff_sections SET
+                summary = ?2, decisions = ?3, todos = ?4, blockers = ?5,
+                mental_model = ?6, next_steps = ?7, notes = ?8, continues_from = ?9,
+                section_embedding_keys = ?10, section_embeddings = ?11
+             WHERE memory_id = ?1",
+            params![
+                memory_id,
+                sections.summary,
+                decisions_json,
+                todos_json,
+                blockers_json,
+                sections.mental_model,
+                next_steps_json,
+                sections.notes,
+                sections.continues_from,
+                section_keys,
+                section_embeddings,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch memories of type `handoff` for a project, filtered by branch.
+    ///
+    /// When `branch` is `Some(b)`, returns handoffs on branch `b` and global ones
+    /// (branch IS NULL).  When `branch` is `None`, returns all handoffs regardless of
+    /// branch.  Results are ordered by `created_at DESC`.
+    #[allow(dead_code)] // Used by handoff_resume/search tools (Phase 3)
+    pub fn query_handoffs_by_branch(
+        &self,
+        project_id: &str,
+        branch: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let rows: Vec<Memory> = match branch {
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, project_id, memory_type, content, summary, tags, importance,
+                            relevance_score, access_count, created_at, updated_at,
+                            last_accessed_at, branch, merged_from, pinned, global
+                     FROM memories
+                     WHERE project_id = ?1 AND memory_type = 'handoff'
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )?;
+                stmt.query_map(params![project_id, limit as i64], |row| {
+                    let memory_type_str: String = row.get(2)?;
+                    let tags_json: String = row.get(5)?;
+                    Ok(Memory {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        memory_type: parse_memory_type_col(&memory_type_str, 2)?,
+                        content: row.get(3)?,
+                        summary: row.get(4)?,
+                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                        importance: row.get(6)?,
+                        relevance_score: row.get(7)?,
+                        access_count: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        last_accessed_at: row.get(11)?,
+                        branch: row.get(12)?,
+                        merged_from: row
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        pinned: row.get::<_, i64>(14)? != 0,
+                        global: row.get::<_, i64>(15)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(MemoryError::from)?
+            }
+            Some(b) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, project_id, memory_type, content, summary, tags, importance,
+                            relevance_score, access_count, created_at, updated_at,
+                            last_accessed_at, branch, merged_from, pinned, global
+                     FROM memories
+                     WHERE project_id = ?1 AND memory_type = 'handoff'
+                       AND (branch IS NULL OR branch = ?3)
+                     ORDER BY created_at DESC
+                     LIMIT ?2",
+                )?;
+                stmt.query_map(params![project_id, limit as i64, b], |row| {
+                    let memory_type_str: String = row.get(2)?;
+                    let tags_json: String = row.get(5)?;
+                    Ok(Memory {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        memory_type: parse_memory_type_col(&memory_type_str, 2)?,
+                        content: row.get(3)?,
+                        summary: row.get(4)?,
+                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                        importance: row.get(6)?,
+                        relevance_score: row.get(7)?,
+                        access_count: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        last_accessed_at: row.get(11)?,
+                        branch: row.get(12)?,
+                        merged_from: row
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        pinned: row.get::<_, i64>(14)? != 0,
+                        global: row.get::<_, i64>(15)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(MemoryError::from)?
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Fetch the most recently created handoffs for a project across all branches.
+    #[allow(dead_code)] // Used by handoff_resume tool (Phase 3)
+    pub fn list_recent_handoffs(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Memory>, MemoryError> {
+        self.query_handoffs_by_branch(project_id, None, limit)
+    }
+}
+
+// ============================================
+// Section-embedding wire format helpers (Task 1.7)
+// ============================================
+
+/// Encode per-section embeddings into the wire format stored in `handoff_sections`.
+///
+/// Wire format:
+///   `keys` — comma-separated section names in the canonical order they appear in
+///     `render_markdown`, containing only non-empty sections.
+///   returned bytes — concatenated little-endian f32 values: 256 dims × N sections × 4 bytes.
+///
+/// `keys` and `vectors` must have the same length.  Each vector must have exactly 256 elements.
+#[allow(dead_code)] // Used by handoff_create and handoff update hook (Phase 3)
+pub fn encode_section_embeddings(keys: &[&str], vectors: &[Vec<f32>]) -> (String, Vec<u8>) {
+    let keys_str = keys.join(",");
+    let bytes: Vec<u8> = vectors
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    (keys_str, bytes)
+}
+
+/// Decode the wire format produced by `encode_section_embeddings`.
+///
+/// Returns a vec of `(section_name, embedding_vector)` pairs in the same order as
+/// `section_embedding_keys`.
+///
+/// Returns `MemoryError::Database` (wrapped string) if the byte length does not equal
+/// `count * 256 * 4` where `count` is the number of comma-separated keys.
+#[allow(dead_code)] // Used by get_handoff_sections and handoff resume scoring (Phase 3)
+pub fn decode_section_embeddings(
+    keys: &str,
+    bytes: &[u8],
+) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
+    if keys.is_empty() {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(MemoryError::Database(
+            rusqlite::Error::InvalidParameterName(
+                "section_embeddings byte length mismatch: keys are empty but bytes are not"
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let key_list: Vec<&str> = keys.split(',').collect();
+    let expected_bytes = key_list.len() * 256 * 4;
+    if bytes.len() != expected_bytes {
+        return Err(MemoryError::Database(
+            rusqlite::Error::InvalidParameterName(format!(
+                "section_embeddings byte length mismatch: expected {} bytes ({} sections × 256 dims × 4 bytes) but got {}",
+                expected_bytes,
+                key_list.len(),
+                bytes.len()
+            )),
+        ));
+    }
+
+    let result = key_list
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let start = i * 256 * 4;
+            let end = start + 256 * 4;
+            let vec: Vec<f32> = bytes[start..end]
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            (key.to_string(), vec)
+        })
+        .collect();
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1851,7 +2416,7 @@ mod tests {
     fn test_migration_creates_tables() {
         let db = Database::open_in_memory().unwrap();
 
-        // Verify schema_version table exists and has version 3
+        // Verify schema_version table exists and has version 4
         let conn = db.conn.lock().unwrap();
         let version: i64 = conn
             .query_row(
@@ -1860,7 +2425,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         // Verify memory_clusters table exists
         let count: i64 = conn
@@ -1885,6 +2450,14 @@ mod tests {
             .filter_map(|r| r.ok())
             .any(|name| name == "merged_from");
         assert!(has_merged_from);
+
+        // Verify handoff_sections table exists (migration 4)
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM handoff_sections", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -1902,6 +2475,51 @@ mod tests {
         db.create_project(&project).unwrap();
         let p = db.get_project("test").unwrap();
         assert!(p.is_some());
+    }
+
+    #[test]
+    fn test_run_migrations_twice_is_idempotent() {
+        // Verify that calling run_migrations a second time on an already-migrated
+        // populated DB does not fail or corrupt data.
+        let db = Database::open_in_memory().unwrap();
+        let project = crate::memory::Project {
+            id: "mig2".to_string(),
+            name: "mig2".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&project).unwrap();
+
+        // Store a memory so the DB is non-empty before the second migration run.
+        let now = chrono::Utc::now().timestamp();
+        db.store_memory(&Memory {
+            id: "mig2-mem".to_string(),
+            project_id: "mig2".to_string(),
+            memory_type: MemoryType::Fact,
+            content: "Persists across migrations".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.5,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: None,
+            merged_from: None,
+            pinned: false,
+            global: false,
+        })
+        .unwrap();
+
+        // Call run_migrations explicitly a second time; must not error.
+        db.run_migrations().unwrap();
+
+        // Data must still be intact.
+        let mem = db.get_memory("mig2-mem").unwrap();
+        assert!(mem.is_some());
+        assert_eq!(mem.unwrap().content, "Persists across migrations");
     }
 
     #[test]
@@ -2256,5 +2874,373 @@ mod tests {
         assert_eq!(stats.pinned_count, 2, "expected 2 pinned memories");
         // global_count queries all projects (WHERE global = 1), so 2 global memories total
         assert_eq!(stats.global_count, 2, "expected 2 global memories");
+    }
+
+    // ---- Section-embedding helpers ----
+
+    #[test]
+    fn test_encode_decode_section_embeddings_round_trip() {
+        let keys = ["summary", "decisions", "todos"];
+        let vectors: Vec<Vec<f32>> = (0..3).map(|i| vec![i as f32 * 0.1; 256]).collect();
+
+        let (keys_str, bytes) = encode_section_embeddings(&keys, &vectors);
+        assert_eq!(keys_str, "summary,decisions,todos");
+        assert_eq!(bytes.len(), 3 * 256 * 4);
+
+        let decoded = decode_section_embeddings(&keys_str, &bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].0, "summary");
+        assert_eq!(decoded[1].0, "decisions");
+        assert_eq!(decoded[2].0, "todos");
+        // Verify float values round-trip correctly
+        assert!((decoded[0].1[0] - 0.0_f32).abs() < 1e-6);
+        assert!((decoded[1].1[0] - 0.1_f32).abs() < 1e-6);
+        assert!((decoded[2].1[0] - 0.2_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_section_embeddings_byte_length_validation() {
+        // Wrong number of bytes for 2 keys
+        let result = decode_section_embeddings("a,b", &[0u8; 100]);
+        assert!(
+            matches!(result, Err(MemoryError::Database(_))),
+            "expected Database error for byte length mismatch"
+        );
+    }
+
+    #[test]
+    fn test_decode_section_embeddings_empty() {
+        let decoded = decode_section_embeddings("", &[]).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    // ---- Handoff sidecar DB helpers ----
+
+    fn make_handoff_memory(id: &str, project_id: &str, branch: Option<&str>) -> Memory {
+        let now = chrono::Utc::now().timestamp();
+        Memory {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            memory_type: MemoryType::Handoff,
+            content: "## Summary\n\nTest handoff".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.85,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: branch.map(str::to_string),
+            merged_from: None,
+            pinned: true,
+            global: false,
+        }
+    }
+
+    fn make_sections(summary: &str) -> HandoffSections {
+        HandoffSections {
+            summary: summary.to_string(),
+            decisions: vec!["Use Rust".to_string()],
+            todos: vec!["Write tests".to_string()],
+            blockers: vec![],
+            mental_model: "Layered architecture".to_string(),
+            next_steps: vec!["Deploy".to_string()],
+            notes: Some("Extra notes".to_string()),
+            continues_from: None,
+        }
+    }
+
+    #[test]
+    fn test_handoff_sections_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        let proj = crate::memory::Project {
+            id: "ho-proj".to_string(),
+            name: "ho-proj".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&proj).unwrap();
+
+        let mem = make_handoff_memory("ho-1", "ho-proj", Some("main"));
+        db.store_memory(&mem).unwrap();
+
+        let sections = make_sections("Session ended well");
+        let keys = [
+            "summary",
+            "decisions",
+            "todos",
+            "mental_model",
+            "next_steps",
+            "notes",
+        ];
+        let vecs: Vec<Vec<f32>> = keys.iter().map(|_| vec![0.5_f32; 256]).collect();
+        let (keys_str, bytes) = encode_section_embeddings(&keys, &vecs);
+
+        db.insert_handoff_sections("ho-1", &sections, &keys_str, &bytes)
+            .unwrap();
+
+        let result = db.get_handoff_sections("ho-1").unwrap().unwrap();
+        let (retrieved_sections, retrieved_vecs) = result;
+
+        assert_eq!(retrieved_sections.summary, "Session ended well");
+        assert_eq!(retrieved_sections.decisions, vec!["Use Rust"]);
+        assert_eq!(retrieved_sections.todos, vec!["Write tests"]);
+        assert!(retrieved_sections.blockers.is_empty());
+        assert_eq!(retrieved_sections.mental_model, "Layered architecture");
+        assert_eq!(retrieved_sections.next_steps, vec!["Deploy"]);
+        assert_eq!(retrieved_sections.notes, Some("Extra notes".to_string()));
+        assert_eq!(retrieved_vecs.len(), 6);
+        assert_eq!(retrieved_vecs[0].0, "summary");
+        assert!((retrieved_vecs[0].1[0] - 0.5_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_handoff_sections_cascade_delete() {
+        let db = Database::open_in_memory().unwrap();
+        let proj = crate::memory::Project {
+            id: "ho-cascade".to_string(),
+            name: "ho-cascade".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&proj).unwrap();
+
+        let mem = make_handoff_memory("ho-del", "ho-cascade", None);
+        db.store_memory(&mem).unwrap();
+
+        let sections = make_sections("Will be deleted");
+        let (keys_str, bytes) = encode_section_embeddings(&["summary"], &[vec![0.1_f32; 256]]);
+        db.insert_handoff_sections("ho-del", &sections, &keys_str, &bytes)
+            .unwrap();
+
+        // Verify sidecar exists
+        assert!(db.get_handoff_sections("ho-del").unwrap().is_some());
+
+        // delete_memory should remove both the memory and the sidecar
+        db.delete_memory("ho-del").unwrap();
+
+        assert!(db.get_memory("ho-del").unwrap().is_none());
+        assert!(db.get_handoff_sections("ho-del").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_handoff_sections_update() {
+        let db = Database::open_in_memory().unwrap();
+        let proj = crate::memory::Project {
+            id: "ho-upd".to_string(),
+            name: "ho-upd".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&proj).unwrap();
+
+        let mem = make_handoff_memory("ho-upd-1", "ho-upd", Some("feat/x"));
+        db.store_memory(&mem).unwrap();
+
+        let sections = make_sections("Original summary");
+        let (keys_str, bytes) = encode_section_embeddings(&["summary"], &[vec![0.1_f32; 256]]);
+        db.insert_handoff_sections("ho-upd-1", &sections, &keys_str, &bytes)
+            .unwrap();
+
+        // Update with new sections
+        let updated = HandoffSections {
+            summary: "Updated summary".to_string(),
+            ..sections.clone()
+        };
+        let (new_keys_str, new_bytes) = encode_section_embeddings(
+            &["summary", "decisions"],
+            &[vec![0.2_f32; 256], vec![0.3_f32; 256]],
+        );
+        db.update_handoff_sections("ho-upd-1", &updated, &new_keys_str, &new_bytes)
+            .unwrap();
+
+        let (result, vecs) = db.get_handoff_sections("ho-upd-1").unwrap().unwrap();
+        assert_eq!(result.summary, "Updated summary");
+        // New embedding byte count matches 2 sections
+        assert_eq!(new_bytes.len(), 2 * 256 * 4);
+        assert_eq!(vecs.len(), 2);
+    }
+
+    #[test]
+    fn test_handoff_sections_update_with_continues_from() {
+        // Verify that `continues_from: Some(...)` survives an update round-trip.
+        let db = Database::open_in_memory().unwrap();
+        let proj = crate::memory::Project {
+            id: "ho-cf".to_string(),
+            name: "ho-cf".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&proj).unwrap();
+
+        let mem = make_handoff_memory("ho-cf-1", "ho-cf", Some("main"));
+        db.store_memory(&mem).unwrap();
+
+        // Insert with continues_from = None initially.
+        let sections = make_sections("Initial summary");
+        let (keys_str, bytes) = encode_section_embeddings(&["summary"], &[vec![0.1_f32; 256]]);
+        db.insert_handoff_sections("ho-cf-1", &sections, &keys_str, &bytes)
+            .unwrap();
+
+        // Update to set continues_from = Some("prev-handoff-id").
+        let updated = HandoffSections {
+            summary: "Continued summary".to_string(),
+            continues_from: Some("prev-handoff-id".to_string()),
+            ..sections
+        };
+        let (new_keys_str, new_bytes) =
+            encode_section_embeddings(&["summary"], &[vec![0.5_f32; 256]]);
+        db.update_handoff_sections("ho-cf-1", &updated, &new_keys_str, &new_bytes)
+            .unwrap();
+
+        let (result, _vecs) = db.get_handoff_sections("ho-cf-1").unwrap().unwrap();
+        assert_eq!(result.summary, "Continued summary");
+        assert_eq!(
+            result.continues_from.as_deref(),
+            Some("prev-handoff-id"),
+            "continues_from must survive update"
+        );
+    }
+
+    #[test]
+    fn test_query_handoffs_by_branch() {
+        let db = Database::open_in_memory().unwrap();
+        let proj = crate::memory::Project {
+            id: "ho-branch".to_string(),
+            name: "ho-branch".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&proj).unwrap();
+
+        // Store handoffs on two branches and one fact
+        db.store_memory(&make_handoff_memory("ho-a1", "ho-branch", Some("feat/a")))
+            .unwrap();
+        db.store_memory(&make_handoff_memory("ho-b1", "ho-branch", Some("feat/b")))
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.store_memory(&Memory {
+            id: "fact-1".to_string(),
+            project_id: "ho-branch".to_string(),
+            memory_type: MemoryType::Fact,
+            content: "A fact".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.5,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: Some("feat/a".to_string()),
+            merged_from: None,
+            pinned: false,
+            global: false,
+        })
+        .unwrap();
+
+        // Branch filter: feat/a should return ho-a1 only
+        let results = db
+            .query_handoffs_by_branch("ho-branch", Some("feat/a"), 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "ho-a1");
+
+        // No branch filter: both handoffs returned
+        let results = db.query_handoffs_by_branch("ho-branch", None, 10).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_query_handoffs_unknown_type_propagates_error() {
+        // Verify that parse_memory_type_col (used in query_handoffs_by_branch) returns
+        // a rusqlite error for unknown type strings, and that the collect chain
+        // propagates it instead of silently dropping rows.
+        //
+        // The SQL WHERE clause pre-filters to memory_type = 'handoff', so we cannot
+        // inject a row that passes the filter yet fails parsing via a normal INSERT.
+        // Instead we verify the error-propagation mechanism directly: the helper
+        // parse_memory_type_col must return Err for unknown input.
+        let err = parse_memory_type_col("not_a_valid_type", 2);
+        assert!(
+            err.is_err(),
+            "parse_memory_type_col must return Err for unknown type"
+        );
+
+        // Additionally verify via a raw query that bypasses the handoff filter.
+        // Build a DB with a corrupt row (memory_type = 'unknown_xyz') and query
+        // all memories using query_map + collect to confirm errors surface.
+        let db = Database::open_in_memory().unwrap();
+        let proj = crate::memory::Project {
+            id: "ho-bad".to_string(),
+            name: "ho-bad".to_string(),
+            root_path: None,
+            decay_rate: 0.01,
+            created_at: 0,
+        };
+        db.create_project(&proj).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        {
+            let conn = db.conn.lock().unwrap();
+            // Insert with an invalid type directly — bypasses all Rust type safety.
+            conn.execute(
+                "INSERT INTO memories
+                 (id, project_id, memory_type, content, summary, tags, importance,
+                  relevance_score, access_count, created_at, updated_at,
+                  last_accessed_at, branch, merged_from, pinned, global)
+                 VALUES (?1, ?2, 'unknown_xyz', ?3, NULL, '[]', 0.5, 1.0, 0,
+                         ?4, ?4, ?4, NULL, NULL, 0, 0)",
+                params!["ho-bad-1", "ho-bad", "corrupt row", now],
+            )
+            .unwrap();
+
+            // Confirm the collect::<rusqlite::Result<Vec<_>>>() chain propagates errors.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, project_id, memory_type, content, summary, tags, importance,
+                            relevance_score, access_count, created_at, updated_at,
+                            last_accessed_at, branch, merged_from, pinned, global
+                     FROM memories WHERE project_id = ?1",
+                )
+                .unwrap();
+            let result: rusqlite::Result<Vec<Memory>> = stmt
+                .query_map(params!["ho-bad"], |row| {
+                    let memory_type_str: String = row.get(2)?;
+                    let tags_json: String = row.get(5)?;
+                    Ok(Memory {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        memory_type: parse_memory_type_col(&memory_type_str, 2)?,
+                        content: row.get(3)?,
+                        summary: row.get(4)?,
+                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                        importance: row.get(6)?,
+                        relevance_score: row.get(7)?,
+                        access_count: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        last_accessed_at: row.get(11)?,
+                        branch: row.get(12)?,
+                        merged_from: row
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        pinned: row.get::<_, i64>(14)? != 0,
+                        global: row.get::<_, i64>(15)? != 0,
+                    })
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>();
+            assert!(
+                result.is_err(),
+                "collect chain must propagate unknown-type error, not drop the row"
+            );
+        }
     }
 }

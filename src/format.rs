@@ -2,7 +2,147 @@
 //!
 //! Converts JSON tool results into compact text for token-efficient LLM consumption.
 
+use crate::db::Database;
+use crate::memory::{HandoffSections, Memory};
 use serde_json::Value;
+
+/// Render a `Handoff` memory as a human-readable section-aware view.
+///
+/// Produces section headers, `- [ ]` todo checkboxes, and bullet points for blockers.
+/// Called from `format_memory_content` when the memory type is `handoff`.
+pub fn format_handoff(memory: &Memory, sections: &HandoffSections) -> String {
+    let mut out = String::new();
+
+    // Header line with ID and importance
+    out.push_str(&format!(
+        "[handoff] {} (importance: {:.2})\n",
+        memory.id, memory.importance
+    ));
+
+    // Summary
+    out.push_str("\n## Summary\n");
+    out.push_str(&sections.summary);
+    out.push('\n');
+
+    // Decisions
+    if !sections.decisions.is_empty() {
+        out.push_str("\n## Decisions\n");
+        for d in &sections.decisions {
+            out.push_str(&format!("- {}\n", d));
+        }
+    }
+
+    // Todos with checkboxes
+    if !sections.todos.is_empty() {
+        out.push_str("\n## Todos\n");
+        for t in &sections.todos {
+            out.push_str(&format!("- [ ] {}\n", t));
+        }
+    }
+
+    // Blockers with bullet points
+    if !sections.blockers.is_empty() {
+        out.push_str("\n## Blockers\n");
+        for b in &sections.blockers {
+            out.push_str(&format!("- {}\n", b));
+        }
+    }
+
+    // Mental model
+    if !sections.mental_model.is_empty() {
+        out.push_str("\n## Mental Model\n");
+        out.push_str(&sections.mental_model);
+        out.push('\n');
+    }
+
+    // Next steps
+    if !sections.next_steps.is_empty() {
+        out.push_str("\n## Next Steps\n");
+        for s in &sections.next_steps {
+            out.push_str(&format!("- {}\n", s));
+        }
+    }
+
+    // Notes
+    if let Some(notes) = &sections.notes
+        && !notes.is_empty()
+    {
+        out.push_str("\n## Notes\n");
+        out.push_str(notes);
+        out.push('\n');
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Format memory content for display, with section-aware rendering for handoffs.
+///
+/// When `mem_type` is `"handoff"`, attempts to parse structured sections from
+/// `content` via `HandoffSections::parse_markdown` and delegates to `format_handoff`.
+/// Falls back to plain `content` on parse failure or for non-handoff types.
+pub fn format_memory_content(memory: &Memory, max_len: usize) -> String {
+    if memory.memory_type == crate::memory::MemoryType::Handoff {
+        match HandoffSections::parse_markdown(&memory.content) {
+            Ok(sections) => {
+                let rendered = format_handoff(memory, &sections);
+                truncate_str(&rendered, max_len)
+            }
+            Err(_) => truncate_str(&memory.content, max_len),
+        }
+    } else {
+        truncate_str(&memory.content, max_len)
+    }
+}
+
+/// Render a Handoff memory using the sidecar `handoff_sections` DB row.
+///
+/// Calls `db.get_handoff_sections(memory_id)`. On success (`Some`), renders via
+/// `format_handoff`. Falls back to `format_memory_content` on DB miss or error.
+fn format_memory_content_with_db(memory: &Memory, db: &Database, max_len: usize) -> String {
+    if memory.memory_type == crate::memory::MemoryType::Handoff {
+        match db.get_handoff_sections(&memory.id) {
+            Ok(Some((sections, _))) => {
+                let rendered = format_handoff(memory, &sections);
+                truncate_str(&rendered, max_len)
+            }
+            _ => format_memory_content(memory, max_len),
+        }
+    } else {
+        format_memory_content(memory, max_len)
+    }
+}
+
+/// Format handoff memory content from raw JSON fields, without a full `Memory` struct.
+///
+/// Used by JSON-based formatters when a `Database` is available to load the sidecar.
+/// Builds a minimal `Memory` and delegates to `format_memory_content_with_db`.
+fn format_memory_content_from_json_with_db(
+    id: &str,
+    content: &str,
+    importance: f64,
+    max_len: usize,
+    db: &Database,
+) -> String {
+    let memory = Memory {
+        id: id.to_string(),
+        project_id: String::new(),
+        memory_type: crate::memory::MemoryType::Handoff,
+        content: content.to_string(),
+        summary: None,
+        tags: vec![],
+        importance,
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: 0,
+        updated_at: 0,
+        last_accessed_at: 0,
+        branch: None,
+        merged_from: None,
+        pinned: false,
+        global: false,
+    };
+    format_memory_content_with_db(&memory, db, max_len)
+}
 
 /// Truncate a string to a maximum length, adding "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -15,11 +155,39 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Format a tool result as compact text for LLM consumption.
 /// Optimized for readability and token efficiency.
+///
+/// For live tool-handler paths that have access to a `Database`, prefer
+/// `compact_tool_result_with_db` so Handoff memories are rendered via the sidecar.
+#[allow(dead_code)] // Used by lib unit tests; not reached by the engram-cli binary.
 pub fn compact_tool_result(tool_name: &str, result: &Value, content_length: usize) -> String {
     match tool_name {
         "memory_store" => compact_store(result),
-        "memory_query" => compact_query(result, content_length),
-        "memory_context" => compact_context(result, content_length),
+        "memory_query" => compact_query(result, content_length, None),
+        "memory_context" => compact_context(result, content_length, None),
+        "memory_graph" => compact_graph(result),
+        "memory_store_batch" => compact_batch_store(result),
+        "memory_prune" => compact_prune(result),
+        "memory_promote" => compact_promote(result),
+        "memory_dedup" => compact_dedup(result),
+        "memory_stats" => compact_stats(result),
+        "memory_update" | "memory_delete" | "memory_delete_batch" => compact_simple(result),
+        _ => compact_fallback(result),
+    }
+}
+
+/// Like `compact_tool_result` but uses `db` to load handoff sidecar sections for
+/// `memory_query` and `memory_context` results, giving section-aware rendering.
+#[allow(dead_code)] // Used by the engram MCP server binary; not reached by engram-cli.
+pub fn compact_tool_result_with_db(
+    tool_name: &str,
+    result: &Value,
+    content_length: usize,
+    db: &Database,
+) -> String {
+    match tool_name {
+        "memory_store" => compact_store(result),
+        "memory_query" => compact_query(result, content_length, Some(db)),
+        "memory_context" => compact_context(result, content_length, Some(db)),
         "memory_graph" => compact_graph(result),
         "memory_store_batch" => compact_batch_store(result),
         "memory_prune" => compact_prune(result),
@@ -76,7 +244,7 @@ fn compact_store(result: &Value) -> String {
     out
 }
 
-fn compact_query(result: &Value, content_length: usize) -> String {
+fn compact_query(result: &Value, content_length: usize, db: Option<&Database>) -> String {
     let memories = result.get("memories").and_then(|v| v.as_array());
     let Some(arr) = memories else {
         return "No results.".to_string();
@@ -116,7 +284,17 @@ fn compact_query(result: &Value, content_length: usize) -> String {
             }
         }
         out.push('\n');
-        out.push_str(&truncate_str(content, content_length));
+        // Section-aware rendering for handoffs via DB sidecar; plain content for other types.
+        let formatted_content = if mem_type == "handoff" {
+            if let Some(db) = db {
+                format_memory_content_from_json_with_db(id, content, importance, content_length, db)
+            } else {
+                truncate_str(content, content_length)
+            }
+        } else {
+            truncate_str(content, content_length)
+        };
+        out.push_str(&formatted_content);
         out.push('\n');
     }
 
@@ -140,7 +318,7 @@ fn compact_query(result: &Value, content_length: usize) -> String {
     out
 }
 
-fn compact_context(result: &Value, content_length: usize) -> String {
+fn compact_context(result: &Value, content_length: usize, db: Option<&Database>) -> String {
     let memories = result.get("memories").and_then(|v| v.as_array());
     let Some(arr) = memories else {
         return "No relevant memories.".to_string();
@@ -167,6 +345,10 @@ fn compact_context(result: &Value, content_length: usize) -> String {
             .get("similarity")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
+        let importance = mem
+            .get("importance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let tags = mem.get("tags").and_then(|v| v.as_array());
 
         out.push_str(&format!("\n[{}] {} ({})", id, mem_type, format_score(sim)));
@@ -179,7 +361,17 @@ fn compact_context(result: &Value, content_length: usize) -> String {
             }
         }
         out.push('\n');
-        out.push_str(&truncate_str(content, content_length));
+        // Section-aware rendering for handoffs via DB sidecar; plain content for other types.
+        let formatted_content = if mem_type == "handoff" {
+            if let Some(db) = db {
+                format_memory_content_from_json_with_db(id, content, importance, content_length, db)
+            } else {
+                truncate_str(content, content_length)
+            }
+        } else {
+            truncate_str(content, content_length)
+        };
+        out.push_str(&formatted_content);
         out.push('\n');
     }
 

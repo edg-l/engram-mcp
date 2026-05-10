@@ -150,6 +150,19 @@ impl EmbeddingService {
         self.embed_raw(&text)
     }
 
+    /// Embed text using the same document prefix as `embed_memory` for a given type.
+    ///
+    /// Used by `auto_link_handoff_sections` to compare section text against target-type
+    /// memory embeddings in a shared vector space.  The prefix matches the one applied
+    /// during storage so similarity scores are meaningful across types.
+    pub fn embed_memory_text(
+        &self,
+        memory_type: MemoryType,
+        text: &str,
+    ) -> Result<Vec<f32>, MemoryError> {
+        self.embed_memory(memory_type, text)
+    }
+
     #[allow(dead_code)] // Used by MCP server batch tools
     pub fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MemoryError> {
         let prefixed: Vec<String> = texts

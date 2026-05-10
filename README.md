@@ -131,6 +131,7 @@ Works in non-git directories (falls back to directory name). Exits silently if `
 | `pattern` | Recurring approaches | "All handlers return Result<Json<T>, AppError>" |
 | `debug` | Past issues and solutions | "OOM was caused by unbounded channel buffer" |
 | `entity` | People, systems, services | "UserService handles all auth logic" |
+| `handoff` | Session snapshots with structured sections | Created via `handoff_create`; not available in `memory_store` |
 
 ## MCP Tools
 
@@ -151,6 +152,9 @@ Works in non-git directories (falls back to directory name). Exits silently if `
 | `memory_prune` | Remove low-relevance memories (dry run by default) |
 | `memory_dedup` | Find and merge duplicate memories (dry run by default) |
 | `memory_promote` | Promote a branch-local memory to global scope |
+| `handoff_create` | Capture a session handoff with structured sections (summary, decisions, todos, blockers, mental model, next steps, notes) |
+| `handoff_resume` | Retrieve the most relevant sections from recent handoffs on the current branch, plus linked memories |
+| `handoff_search` | Search handoff sections by content; filter by branch or section name |
 
 ### Storing memories
 
@@ -294,6 +298,28 @@ WHERE memory_id IN (
 ```
 
 The cap is configurable via `ENGRAM_MAX_CANDIDATES`. `memory_query` always does a full scan for comprehensive results.
+
+### Handoffs
+
+Handoffs capture structured session state for high-fidelity resume across sessions. Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blockers`, `mental_model`, `next_steps`, `notes`. Sections are stored in a `handoff_sections` sidecar table with per-section embeddings (256-dim f32, prefix-free) alongside the full markdown in the main `memories` row.
+
+**Branch chaining**: `continues_from` in the sidecar links a handoff to its predecessor on the same branch. This is sidecar-only; no graph edge is created. `handoff_resume` walks the chain up to depth 5 and returns the top-scoring sections against your query.
+
+**Auto-linking**: on creation, each section is scored against existing `decision`, `pattern`, and `debug` memories. Matches at cosine similarity >= 0.75 get a `derived_from` edge, capped at 10 links per handoff.
+
+**Bypass rules**: handoffs skip dedup and contradiction detection entirely. They are pinned by default (exempt from decay and prune).
+
+**MCP prompts**: The `handoff` and `resume` MCP prompts surface as `/mcp__engram__handoff` and `/mcp__engram__resume` in Claude Code (other MCP clients may surface them differently). `/mcp__engram__handoff` guides the model through capturing a handoff; `/mcp__engram__resume` calls `handoff_resume` and proposes the next action. The existing `/mcp__engram__recall_context` prompt is unchanged.
+
+**CLI**:
+```bash
+engram-cli handoff create                        # interactive section prompts
+engram-cli handoff create --from-file session.md # ingest pre-written markdown
+engram-cli handoff resume --branch feat/x        # load context from recent handoffs
+engram-cli handoff search "auth refactor" --section blockers,todos
+```
+
+Cross-PC sync is not supported (local SQLite only).
 
 ## Architecture
 

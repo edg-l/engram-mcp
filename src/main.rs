@@ -346,6 +346,11 @@ fn dedup_within_clusters(db: &Database, project_id: &str) -> Result<usize, Memor
                 continue;
             };
 
+            // Handoffs are session snapshots; never auto-merge.
+            if mem_i.memory_type == crate::memory::MemoryType::Handoff {
+                continue;
+            }
+
             for id_j in member_ids.iter().skip(i + 1) {
                 if consumed.contains(id_j) {
                     continue;
@@ -528,7 +533,12 @@ impl ServerHandler for MemoryServer {
                 .handle_tool(&request.name, args_value)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            let formatted = format::compact_tool_result(&request.name, &result, content_length);
+            let formatted = format::compact_tool_result_with_db(
+                &request.name,
+                &result,
+                content_length,
+                handler.database(),
+            );
             Ok(CallToolResult::success(vec![Content::text(formatted)]))
         }
     }
@@ -643,16 +653,34 @@ impl ServerHandler for MemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
-            Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
-                "recall_context",
-                Some("Recall relevant memories for a given context or question"),
-                Some(vec![
-                    PromptArgument::new("context")
-                        .with_title("Context")
-                        .with_description("The context or question to find relevant memories for")
-                        .with_required(true),
-                ]),
-            )]))
+            Ok(ListPromptsResult::with_all_items(vec![
+                Prompt::new(
+                    "recall_context",
+                    Some("Recall relevant memories for a given context or question"),
+                    Some(vec![
+                        PromptArgument::new("context")
+                            .with_title("Context")
+                            .with_description(
+                                "The context or question to find relevant memories for",
+                            )
+                            .with_required(true),
+                    ]),
+                ),
+                Prompt::new(
+                    "handoff",
+                    Some(
+                        "Gather session state and call handoff_create to preserve it for the next session",
+                    ),
+                    None,
+                ),
+                Prompt::new(
+                    "resume",
+                    Some(
+                        "Call handoff_resume to load context from recent handoffs and propose the next action",
+                    ),
+                    None,
+                ),
+            ]))
         }
     }
 
@@ -662,78 +690,97 @@ impl ServerHandler for MemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
         async move {
-            if request.name != "recall_context" {
-                return Err(McpError::invalid_params(
+            match request.name.as_str() {
+                "recall_context" => {
+                    // Get context argument
+                    let context = request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("context"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            McpError::invalid_params("Missing 'context' argument", None)
+                        })?;
+
+                    // Ensure initialized (reuses existing ToolHandler with its EmbeddingService)
+                    self.ensure_initialized().await?;
+
+                    let handler = self.tool_handler.read().await;
+                    let handler = handler
+                        .as_ref()
+                        .ok_or_else(|| McpError::internal_error("Server not initialized", None))?;
+
+                    let db = handler.database();
+                    let embedding_service = handler.embedding_service();
+
+                    // Generate query embedding (reuses initialized EmbeddingService)
+                    let query_embedding = embedding_service
+                        .embed(context)
+                        .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
+
+                    // Get all embeddings for the project
+                    let embeddings = db
+                        .get_all_embeddings_for_project(&self.project_id)
+                        .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
+
+                    // Calculate similarities and sort
+                    use crate::embedding::cosine_similarity;
+                    let mut scored_ids: Vec<(String, f32)> = embeddings
+                        .iter()
+                        .map(|(id, vec)| (id.clone(), cosine_similarity(&query_embedding, vec)))
+                        .collect();
+                    scored_ids
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                    // Get top 5 relevant memories
+                    let mut memories_text = String::new();
+                    for (id, score) in scored_ids.into_iter().take(5) {
+                        if score < 0.3 {
+                            break;
+                        }
+                        if let Ok(Some(memory)) = db.get_memory(&id) {
+                            memories_text.push_str(&format!(
+                                "---\n**[{:?}]** (relevance: {:.2}, similarity: {:.2})\n{}\n",
+                                memory.memory_type, memory.relevance_score, score, memory.content
+                            ));
+                            // Record access for reinforcement
+                            let _ = db.record_access(&id);
+                        }
+                    }
+
+                    if memories_text.is_empty() {
+                        memories_text =
+                            "No relevant memories found for this context.".to_string();
+                    }
+
+                    Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                        PromptMessageRole::User,
+                        format!(
+                            "Here are relevant memories from the project knowledge base:\n\n{}\n\nUse these memories to inform your response about: {}",
+                            memories_text, context
+                        ),
+                    )])
+                    .with_description(format!("Relevant memories for: {}", context)))
+                }
+                "handoff" => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    PromptMessageRole::User,
+                    include_str!("prompts/handoff.md"),
+                )])
+                .with_description(
+                    "Gather session state and call handoff_create to preserve it for the next session",
+                )),
+                "resume" => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    PromptMessageRole::User,
+                    include_str!("prompts/resume.md"),
+                )])
+                .with_description(
+                    "Call handoff_resume to load context from recent handoffs and propose the next action",
+                )),
+                _ => Err(McpError::invalid_params(
                     format!("Unknown prompt: {}", request.name),
                     None,
-                ));
+                )),
             }
-
-            // Get context argument
-            let context = request
-                .arguments
-                .as_ref()
-                .and_then(|args| args.get("context"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| McpError::invalid_params("Missing 'context' argument", None))?;
-
-            // Ensure initialized (reuses existing ToolHandler with its EmbeddingService)
-            self.ensure_initialized().await?;
-
-            let handler = self.tool_handler.read().await;
-            let handler = handler
-                .as_ref()
-                .ok_or_else(|| McpError::internal_error("Server not initialized", None))?;
-
-            let db = handler.database();
-            let embedding_service = handler.embedding_service();
-
-            // Generate query embedding (reuses initialized EmbeddingService)
-            let query_embedding = embedding_service
-                .embed(context)
-                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
-
-            // Get all embeddings for the project
-            let embeddings = db
-                .get_all_embeddings_for_project(&self.project_id)
-                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
-
-            // Calculate similarities and sort
-            use crate::embedding::cosine_similarity;
-            let mut scored_ids: Vec<(String, f32)> = embeddings
-                .iter()
-                .map(|(id, vec)| (id.clone(), cosine_similarity(&query_embedding, vec)))
-                .collect();
-            scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Get top 5 relevant memories
-            let mut memories_text = String::new();
-            for (id, score) in scored_ids.into_iter().take(5) {
-                if score < 0.3 {
-                    break;
-                }
-                if let Ok(Some(memory)) = db.get_memory(&id) {
-                    memories_text.push_str(&format!(
-                        "---\n**[{:?}]** (relevance: {:.2}, similarity: {:.2})\n{}\n",
-                        memory.memory_type, memory.relevance_score, score, memory.content
-                    ));
-                    // Record access for reinforcement
-                    let _ = db.record_access(&id);
-                }
-            }
-
-            if memories_text.is_empty() {
-                memories_text = "No relevant memories found for this context.".to_string();
-            }
-
-            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                PromptMessageRole::User,
-                format!(
-                    "Here are relevant memories from the project knowledge base:\n\n{}\n\nUse these memories to inform your response about: {}",
-                    memories_text, context
-                ),
-            )])
-            .with_description(format!("Relevant memories for: {}", context)))
         }
     }
 }
