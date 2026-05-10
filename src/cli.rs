@@ -612,13 +612,9 @@ fn cmd_query(
 
             // Apply branch filter
             match branch_filter {
-                None => {} // All branches - no filter
-                Some(None) => {
-                    // Global only
-                    if memory.branch.is_some() {
-                        continue;
-                    }
-                }
+                None => {}                                         // All branches - no filter
+                Some(None) if memory.branch.is_some() => continue, // Global only
+                Some(None) => {}
                 Some(Some(branch)) => {
                     // Global + specific branch
                     if let Some(ref mem_branch) = memory.branch
@@ -1342,7 +1338,7 @@ fn cmd_dedup(
                         .map(|m| (id.clone(), *sim, m.updated_at))
                 })
                 .collect();
-            with_time.sort_by(|a, b| b.2.cmp(&a.2));
+            with_time.sort_by_key(|(_, _, updated_at)| std::cmp::Reverse(*updated_at));
 
             if with_time.len() < 2 {
                 continue;

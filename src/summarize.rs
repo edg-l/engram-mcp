@@ -128,7 +128,7 @@ pub fn extract_keywords(content: &str, n: usize) -> Vec<String> {
 
     // Sort by count descending
     let mut word_vec: Vec<(String, usize)> = word_counts.into_iter().collect();
-    word_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    word_vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
     // Return top N
     word_vec.into_iter().take(n).map(|(word, _)| word).collect()

@@ -30,7 +30,7 @@ fn setup() -> (ToolHandler, tempfile::TempDir) {
 fn call(handler: &ToolHandler, tool: &str, args: Value) -> Value {
     handler
         .handle_tool(tool, args)
-        .expect(&format!("{} failed", tool))
+        .unwrap_or_else(|_| panic!("{} failed", tool))
 }
 
 /// A memory to store in the corpus.
@@ -436,7 +436,7 @@ fn bench_retrieval_quality() {
     }
 
     // Print results
-    eprintln!("\n{:<25} {:<6} {}", "QUERY", "RANK", "TOP RESULT");
+    eprintln!("\n{:<25} {:<6} TOP RESULT", "QUERY", "RANK");
     eprintln!("{}", "-".repeat(80));
 
     let mut hit_at_1 = 0usize;
@@ -530,14 +530,14 @@ fn bench_retrieval_quality() {
     }
 
     // Optional threshold gate
-    if let Ok(min_mrr_str) = std::env::var("ENGRAM_BENCH_MIN_MRR") {
-        if let Ok(min_mrr) = min_mrr_str.parse::<f64>() {
-            assert!(
-                mrr >= min_mrr,
-                "MRR {:.3} is below minimum threshold {:.3}",
-                mrr,
-                min_mrr
-            );
-        }
+    if let Ok(min_mrr_str) = std::env::var("ENGRAM_BENCH_MIN_MRR")
+        && let Ok(min_mrr) = min_mrr_str.parse::<f64>()
+    {
+        assert!(
+            mrr >= min_mrr,
+            "MRR {:.3} is below minimum threshold {:.3}",
+            mrr,
+            min_mrr
+        );
     }
 }

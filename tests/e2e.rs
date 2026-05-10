@@ -24,7 +24,7 @@ fn setup(branch: Option<&str>) -> (ToolHandler, tempfile::TempDir) {
 fn call(handler: &ToolHandler, tool: &str, args: Value) -> Value {
     handler
         .handle_tool(tool, args)
-        .expect(&format!("{} failed", tool))
+        .unwrap_or_else(|_| panic!("{} failed", tool))
 }
 
 // ---------------------------------------------------------------------------

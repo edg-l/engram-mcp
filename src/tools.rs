@@ -987,13 +987,9 @@ impl ToolHandler {
 
             // Filter by branch
             match branch_filter {
-                None => {} // "all" - no filtering
-                Some(None) => {
-                    // "global" - only global memories
-                    if memory.branch.is_some() {
-                        continue;
-                    }
-                }
+                None => {}                                         // "all" - no filtering
+                Some(None) if memory.branch.is_some() => continue, // "global" - skip non-global
+                Some(None) => {}
                 Some(Some(branch)) => {
                     // specific branch - global + that branch
                     if let Some(ref mem_branch) = memory.branch
@@ -1755,11 +1751,8 @@ impl ToolHandler {
                         let branch_filter = self.branch_mode_to_filter("current");
                         match branch_filter {
                             None => {}
-                            Some(None) => {
-                                if memory.branch.is_some() {
-                                    continue;
-                                }
-                            }
+                            Some(None) if memory.branch.is_some() => continue,
+                            Some(None) => {}
                             Some(Some(branch)) => {
                                 if let Some(ref mem_branch) = memory.branch
                                     && mem_branch != branch
@@ -1854,11 +1847,8 @@ impl ToolHandler {
                     let branch_filter = self.branch_mode_to_filter("current");
                     match branch_filter {
                         None => {}
-                        Some(None) => {
-                            if memory.branch.is_some() {
-                                continue;
-                            }
-                        }
+                        Some(None) if memory.branch.is_some() => continue,
+                        Some(None) => {}
                         Some(Some(branch)) => {
                             if let Some(ref mem_branch) = memory.branch
                                 && mem_branch != branch
@@ -2124,7 +2114,7 @@ impl ToolHandler {
                     .collect();
 
                 let mut sorted = with_time;
-                sorted.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+                sorted.sort_by_key(|(_, _, updated_at)| std::cmp::Reverse(*updated_at)); // newest first
 
                 if sorted.len() < 2 {
                     continue;
