@@ -15,7 +15,7 @@ src/
   lib.rs       - module exports
   db.rs        - SQLite ops (memories, embeddings, relationships, batch ops)
   memory.rs    - Memory, MemoryType, MergeSource, MemoryCluster, Relationship, RelationType, ProjectStats
-  embedding.rs - fastembed wrapper (384-dim vectors)
+  embedding.rs - mdbr-leaf-ir ONNX wrapper (256-dim MRL vectors)
   decay.rs     - relevance decay algorithm
   tools.rs     - MCP tool handlers + contradiction detection + dedup + clustering
   format.rs    - human-readable output formatting for MCP results
@@ -25,7 +25,7 @@ src/
 ```
 
 ## Key Types
-- `MemoryType`: fact, decision, preference, pattern, debug, entity
+- `MemoryType`: fact, decision, preference, pattern, debug, entity, handoff
 - `RelationType`: relates_to, supersedes, derived_from, contradicts
 - `Memory`: id, project_id, content, tags, importance, relevance_score, timestamps, branch, merged_from
 - `MergeSource`: id, content_preview, merged_at (provenance tracking for dedup merges)
@@ -48,6 +48,9 @@ src/
 - `memory_context` - get relevant memories for context (hierarchical retrieval via clusters, flat fallback)
 - `memory_prune` - remove low-relevance memories (dry run by default)
 - `memory_dedup` - find and merge duplicate memories (dry run by default, threshold configurable)
+- `handoff_create` - create a session handoff with structured sections + per-section embeddings, pinned by default
+- `handoff_resume` - retrieve top sections from recent handoffs on a branch, with linked memories
+- `handoff_search` - search handoff sections by content, with optional branch and section filters
 
 ### Resources
 - `memory://{project}/{id}` - read individual memories
@@ -80,6 +83,10 @@ engram-cli pin <id>                # pin a memory (exempt from decay/prune)
 engram-cli unpin <id>              # unpin a memory
 engram-cli insights                # show memory health insights
 engram-cli health                  # check memory store health
+engram-cli handoff create          # interactive handoff capture (prompts per section)
+engram-cli handoff create --from-file session.md  # ingest pre-written markdown handoff
+engram-cli handoff resume [--branch X] [--query Q] [--max N]  # load context from recent handoffs
+engram-cli handoff search <query> [--branch X] [--section blockers,todos] [--limit N]  # search sections
 ```
 
 ## Features
@@ -94,6 +101,9 @@ engram-cli health                  # check memory store health
 - Batch operations with transactions
 - Query pagination and empty-query optimization
 - Human-readable formatted output (markdown) + JSON in collapsible block
+
+## Handoffs
+Section-based session capture (`summary, decisions, todos, blockers, mental_model, next_steps, notes`). Handoffs are branch-aware `MemoryType::Handoff` memories, pinned by default, with a `handoff_sections` sidecar table holding per-section embeddings (256-dim f32 LE, prefix-free). Branch chaining via `continues_from` lives in the sidecar only (not a graph edge). Auto-links to `decision/pattern/debug` memories at cosine similarity >= 0.75 (cap 10 links). Bypasses dedup and contradiction detection entirely. Two MCP prompts: `handoff` (capture) and `resume` (restore). CLI: `engram-cli handoff create/resume/search`.
 
 ## Config (env vars)
 - `ENGRAM_DB` - SQLite path (default: ~/.local/share/engram/memories.db)
