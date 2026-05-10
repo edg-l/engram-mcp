@@ -261,16 +261,15 @@ Returns: `{project_id, memory_count, relationship_count, avg_relevance}`
 ## Embedding Strategy
 
 ### Local Model
-- **Model**: `all-MiniLM-L6-v2` (384 dimensions, fast, good quality)
+- **Model**: `mdbr-leaf-ir` (256-dim MRL, quantized ONNX via fastembed/hf-hub)
 - **Library**: `fastembed` - actively maintained, simple API, ONNX-based
-- Supports multiple models out of the box
 - No Python dependencies
 
 ### Embedding Process
 1. Concatenate: `{type}: {content}` (type provides context)
 2. Generate embedding
 3. Normalize to unit vector
-4. Store as binary blob (384 × 4 bytes = 1.5KB per memory)
+4. Store as binary blob (256 × 4 bytes = 1KB per memory)
 
 ### Similarity Search
 - Cosine similarity (dot product on normalized vectors)
@@ -356,20 +355,4 @@ When a memory is accessed:
 
 ## Dependencies
 
-```toml
-[dependencies]
-rmcp = { version = "0.14", features = ["server", "transport-io"] }
-tokio = { version = "1.49", features = ["full"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.20", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-fastembed = "5"           # local ONNX-based embeddings (all-MiniLM-L6-v2)
-thiserror = "2.0"
-dirs = "6.0"              # XDG paths
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-base64 = "0.22"           # embedding export encoding
-clap = { version = "4", features = ["derive"] }  # CLI
-```
+See `Cargo.toml` for the authoritative list. Major dependencies: `rmcp` (MCP server), `tokio`, `rusqlite` (bundled SQLite), `fastembed` + `hf-hub` (local ONNX embeddings via mdbr-leaf-ir), `clap` (CLI), `moka` (caching), `chrono`, `serde`/`serde_json`, `uuid`, `thiserror`, `tracing`/`tracing-subscriber`, `dirs`, `base64`.
