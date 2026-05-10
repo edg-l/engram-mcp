@@ -1,15 +1,19 @@
-//! Retrieval quality benchmark for Engram.
+//! Retrieval quality scorecard for Engram.
 //!
-//! Stores a corpus of realistic memories, runs queries, and measures how well
-//! the system retrieves the expected results. Outputs a scorecard with:
+//! This is a Hit@K / MRR recall scorecard, NOT a performance benchmark.
+//! It stores a corpus of realistic memories using real embeddings, runs
+//! semantic queries, and measures how well the system retrieves the expected
+//! results. Outputs a scorecard with:
 //!   - Hit@1, Hit@3, Hit@5 (was the expected memory in the top K?)
 //!   - MRR (Mean Reciprocal Rank)
 //!   - Per-query breakdown
 //!
-//! Run with: cargo test --test bench_retrieval -- --nocapture
+//! Run with: cargo test --test retrieval_quality -- --nocapture
 //!
 //! This is NOT a pass/fail test by default. It prints a report. Set the env var
 //! ENGRAM_BENCH_MIN_MRR=0.6 to fail if MRR drops below that threshold.
+//!
+//! For latency / throughput benchmarks, see benches/ (criterion harness).
 
 use engram_mcp::db::Database;
 use engram_mcp::embedding::EmbeddingService;
