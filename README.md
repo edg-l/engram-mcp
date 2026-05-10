@@ -367,7 +367,7 @@ Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blocker
 
 ## Status and limits
 
-- 165+ tests across 9 binaries; clippy clean; fmt clean.
+- 100+ tests across 8 binaries; clippy clean; fmt clean.
 - Single-node, single-user. No auth (it's a local MCP server).
 - Embedding model: mdbr-leaf-ir, 256-dim MRL.
 - Hybrid retrieval: SQLite FTS5 keyword + cosine.

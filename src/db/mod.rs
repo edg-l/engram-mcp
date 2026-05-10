@@ -14,8 +14,7 @@ mod memories;
 mod migrations;
 mod relationships;
 
-#[allow(unused_imports)]
-pub use handoffs::{decode_section_embeddings, encode_section_embeddings};
+pub use handoffs::encode_section_embeddings;
 
 #[cfg(test)]
 mod tests;
