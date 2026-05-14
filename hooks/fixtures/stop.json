@@ -1,0 +1,4 @@
+{
+  "stop_hook_active": false,
+  "last_assistant_message": "Completed the rate-limiting middleware implementation. Added a token-bucket algorithm in `src/middleware/rate_limit.rs` with per-user and per-IP buckets stored in a DashMap. The bucket capacity and refill interval are configurable via `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_SECS`. Tests cover burst behavior, refill timing, and the 429 response format. The integration test suite passes. Next step is wiring the middleware into the router in `src/main.rs` and documenting the configuration options in the README."
+}

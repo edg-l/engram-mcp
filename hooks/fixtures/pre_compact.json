@@ -1,0 +1,4 @@
+{
+  "trigger": "manual",
+  "custom_instructions": "Focus on the database migration layer and connection pool configuration; we are debugging connection exhaustion under load"
+}

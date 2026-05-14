@@ -1,0 +1,5 @@
+{
+  "prompt": "We decided to use Postgres because the writes are contended and SQLite's WAL mode was causing lock timeouts under load",
+  "session_id": "sess_abc123",
+  "cwd": "/home/user/dev/myproject"
+}

@@ -94,6 +94,20 @@ Add to your config file:
 }
 ```
 
+### Auto-capture decisions and failures (Claude Code)
+
+Passively capture decisions, tool failures, and session summaries into Engram
+without any explicit tool calls. One-liner install:
+
+```bash
+engram-cli hooks install
+```
+
+This registers handlers for `UserPromptSubmit`, `PostToolUse`, `Stop`,
+`PreCompact`, `SessionEnd`, and `SubagentStop`. See
+[hooks/README.md](hooks/README.md) for the full per-event reference, env vars,
+and secret redaction details.
+
 ### Auto-load context on session start (Claude Code)
 
 A hook script loads relevant memories at the start of every conversation, building a semantic query from recent git activity so the LLM gets context without needing to call `memory_context`.

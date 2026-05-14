@@ -8,6 +8,7 @@ mod embedding;
 mod error;
 mod export;
 mod format;
+mod hooks;
 mod memory;
 mod summarize;
 mod tools;
@@ -15,6 +16,7 @@ mod tools;
 use db::Database;
 use embedding::EmbeddingService;
 use error::MemoryError;
+use hooks::HookEvent;
 use memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship};
 use summarize::{generate_summary, should_auto_summarize};
 
@@ -214,6 +216,22 @@ enum Commands {
         #[command(subcommand)]
         cmd: HandoffCmd,
     },
+    /// Process a Claude Code lifecycle hook event
+    HookEvent {
+        /// Hook event name (e.g. SessionStart, UserPromptSubmit, PostToolUse)
+        event: String,
+        /// JSON payload (reads from stdin if omitted)
+        #[arg(long)]
+        payload: Option<String>,
+        /// Print outcome to stdout instead of persisting
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage engram-cli entries in ~/.claude/settings.json
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
 }
 
 /// Subcommands for `engram-cli handoff`.
@@ -295,6 +313,17 @@ enum HandoffCmd {
         /// Memory ID of the handoff
         id: String,
     },
+}
+
+/// Subcommands for `engram-cli hooks`.
+#[derive(Subcommand)]
+enum HooksCmd {
+    /// Install engram-cli hook entries into ~/.claude/settings.json
+    Install,
+    /// Remove engram-cli hook entries from ~/.claude/settings.json
+    Uninstall,
+    /// Show which events are managed by engram-cli
+    Status,
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -415,6 +444,8 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
             handoff_cmd,
             HandoffCmd::Create { .. } | HandoffCmd::Resume { .. } | HandoffCmd::Search { .. }
         ),
+        Commands::HookEvent { .. } => true,
+        Commands::Hooks { .. } => false,
         _ => false,
     }
 }
@@ -625,6 +656,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_branch.as_deref(),
                 handoff_cmd,
             )?;
+        }
+        Commands::HookEvent {
+            event,
+            payload,
+            dry_run,
+        } => {
+            cmd_hook_event(
+                event,
+                payload,
+                dry_run,
+                &db,
+                embedding_service.as_ref(),
+                &project_id,
+            );
+        }
+        Commands::Hooks { cmd } => {
+            cmd_hooks(cmd);
         }
     }
 
@@ -1959,4 +2007,131 @@ fn cmd_handoff(
     }
 
     Ok(())
+}
+
+fn cmd_hooks(cmd: HooksCmd) {
+    match cmd {
+        HooksCmd::Install => match hooks::install::install() {
+            Ok(report) => {
+                if report.added.is_empty() && report.skipped.is_empty() {
+                    println!("No events to manage.");
+                } else {
+                    if !report.added.is_empty() {
+                        println!(
+                            "Installed {} managed entries to {}",
+                            report.added.len(),
+                            report.settings_path.display()
+                        );
+                        for ev in &report.added {
+                            println!("  + {}", ev);
+                        }
+                    }
+                    if !report.skipped.is_empty() {
+                        println!("Already present (skipped):");
+                        for ev in &report.skipped {
+                            println!("  = {}", ev);
+                        }
+                    }
+                    if let Some(bak) = &report.backup_path {
+                        println!("Backup: {}", bak.display());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("hooks install failed: {}", e);
+                eprintln!("error: hooks install failed: {}", e);
+            }
+        },
+        HooksCmd::Uninstall => match hooks::install::uninstall() {
+            Ok(report) => {
+                if report.removed.is_empty() {
+                    println!(
+                        "No engram-cli entries found in {}.",
+                        report.settings_path.display()
+                    );
+                } else {
+                    println!(
+                        "Removed {} entries from {}:",
+                        report.removed.len(),
+                        report.settings_path.display()
+                    );
+                    for ev in &report.removed {
+                        println!("  - {}", ev);
+                    }
+                    if let Some(bak) = &report.backup_path {
+                        println!("Backup: {}", bak.display());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("hooks uninstall failed: {}", e);
+                eprintln!("error: hooks uninstall failed: {}", e);
+            }
+        },
+        HooksCmd::Status => match hooks::install::status() {
+            Ok(report) => {
+                println!("Settings: {}", report.settings_path.display());
+                if report.managed.is_empty() {
+                    println!("No engram-cli entries installed.");
+                } else {
+                    println!("Managed events ({}):", report.managed.len());
+                    for ev in &report.managed {
+                        println!("  {}", ev);
+                    }
+                }
+                if !report.shadowed.is_empty() {
+                    println!("Shadowed (other hooks also registered for these events):");
+                    for ev in &report.shadowed {
+                        println!("  {}", ev);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("hooks status failed: {}", e);
+                eprintln!("error: hooks status failed: {}", e);
+            }
+        },
+    }
+}
+
+fn cmd_hook_event(
+    event: String,
+    payload: Option<String>,
+    dry_run: bool,
+    db: &Database,
+    embedding_service: Option<&EmbeddingService>,
+    project_id: &str,
+) {
+    use std::io::Read;
+
+    let hook_event = match event.parse::<HookEvent>() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("hook-event: unknown event name '{}': {}", event, e);
+            return;
+        }
+    };
+
+    let raw = match payload {
+        Some(s) => s,
+        None => {
+            let mut buf = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                tracing::warn!("hook-event: failed to read stdin: {}", e);
+                return;
+            }
+            buf
+        }
+    };
+
+    match hooks::dispatch::dispatch(hook_event, &raw, dry_run, db, embedding_service, project_id) {
+        Ok(outcome) => {
+            if dry_run && let hooks::dispatch::DispatchOutcome::DryRun(_) = &outcome {
+                println!("{:?}", outcome);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("hook-event dispatch error: {}", e);
+        }
+    }
 }

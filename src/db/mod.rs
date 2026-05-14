@@ -121,7 +121,11 @@ pub struct Database {
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MemoryError> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 3000;",
+        )?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -132,7 +136,10 @@ impl Database {
     #[allow(dead_code)] // Used in tests
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 3000;",
+        )?;
         // The bundled SQLite is not compiled with SQLITE_ENABLE_MATH_FUNCTIONS, so EXP()
         // and LN() are unavailable.  Register them as custom scalar functions so that
         // update_relevance_scores works correctly in test builds.
