@@ -18,6 +18,7 @@
 use engram_mcp::db::Database;
 use engram_mcp::embedding::EmbeddingService;
 use engram_mcp::tools::ToolHandler;
+use engram_mcp::tools::scoring::SearchMode;
 use serde_json::{Value, json};
 
 fn setup() -> (ToolHandler, tempfile::TempDir) {
@@ -27,7 +28,7 @@ fn setup() -> (ToolHandler, tempfile::TempDir) {
     let embedding = EmbeddingService::new().unwrap();
     let project_id = "bench".to_string();
     db.get_or_create_project(&project_id, &project_id).unwrap();
-    let handler = ToolHandler::new(db, embedding, project_id, None);
+    let handler = ToolHandler::new(db, embedding, project_id, None, SearchMode::default());
     (handler, dir)
 }
 

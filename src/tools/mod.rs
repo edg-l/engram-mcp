@@ -8,12 +8,12 @@
 mod handler;
 mod handoff;
 mod schemas;
-mod scoring;
+pub mod scoring;
 
 #[cfg(test)]
 mod test_utils;
 
-pub use handler::ToolHandler;
+pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
 pub use schemas::{MemoryUpdateInput, get_tool_definitions};
-pub use scoring::{compute_hybrid_score, compute_tag_boost};
+pub use scoring::{SearchMode, compute_hybrid_score, compute_tag_boost};

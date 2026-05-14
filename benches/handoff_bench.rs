@@ -3,7 +3,7 @@ mod common;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use engram_mcp::db::{Database, encode_section_embeddings};
 use engram_mcp::memory::{HandoffSections, Memory, MemoryType};
-use engram_mcp::tools::score_handoff_sections;
+use engram_mcp::tools::{SearchMode, score_handoff_sections};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -144,6 +144,7 @@ fn bench_handoff_resume(c: &mut Criterion) {
             svc,
             "bench".to_string(),
             Some("main".to_string()),
+            SearchMode::default(),
         );
         (handler, f._tempdir)
     };
@@ -155,6 +156,7 @@ fn bench_handoff_resume(c: &mut Criterion) {
             svc,
             "bench".to_string(),
             Some("main".to_string()),
+            SearchMode::default(),
         );
         (handler, f._tempdir)
     };
@@ -166,6 +168,7 @@ fn bench_handoff_resume(c: &mut Criterion) {
             svc,
             "bench".to_string(),
             Some("main".to_string()),
+            SearchMode::default(),
         );
         (handler, f._tempdir)
     };
@@ -201,6 +204,7 @@ fn bench_handoff_search(c: &mut Criterion) {
         svc,
         "bench".to_string(),
         Some("main".to_string()),
+        SearchMode::default(),
     );
     let _dir = fixture._tempdir;
 

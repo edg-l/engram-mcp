@@ -32,7 +32,7 @@ use tracing_subscriber::{self, EnvFilter};
 use crate::db::Database;
 use crate::embedding::EmbeddingService;
 use crate::error::MemoryError;
-use crate::tools::{ToolHandler, get_tool_definitions};
+use crate::tools::{ToolHandler, get_tool_definitions, parse_search_mode};
 
 /// Find the git repository root by walking up from current directory.
 /// Returns None if not in a git repository.
@@ -475,11 +475,13 @@ impl MemoryServer {
             let embedding = EmbeddingService::new()
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
+            let mode = parse_search_mode(std::env::var("ENGRAM_SEARCH_MODE").ok().as_deref());
             *handler = Some(ToolHandler::new(
                 db,
                 embedding,
                 self.project_id.clone(),
                 self.current_branch.clone(),
+                mode,
             ));
         }
         Ok(())

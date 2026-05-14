@@ -18,6 +18,16 @@ pub struct EmbeddingService {
     model_version: String,
 }
 
+impl Clone for EmbeddingService {
+    /// Clone shares the underlying ONNX model via `Arc`, so no model reload occurs.
+    fn clone(&self) -> Self {
+        Self {
+            model: Arc::clone(&self.model),
+            model_version: self.model_version.clone(),
+        }
+    }
+}
+
 struct ModelFiles {
     onnx_model: PathBuf,
     onnx_data: PathBuf,

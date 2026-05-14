@@ -415,12 +415,15 @@ pub struct Project {
 #[allow(dead_code)] // Used by MCP server tools
 pub struct MemoryWithScore {
     pub memory: Memory,
-    /// Combined final score (semantic * weight + keyword * (1-weight))
+    /// Combined final score after tag boost and relevance scaling.
     pub score: f64,
-    /// Raw embedding similarity score (0.0-1.0)
+    /// Raw cosine similarity from the embedding model (0.0-1.0). Diagnostic.
     pub semantic_score: f64,
-    /// FTS5 BM25 keyword score (0.0 if no keyword match, normalized)
+    /// Raw normalized BM25 keyword score (0.0 if no match). Diagnostic.
     pub keyword_score: f64,
+    /// Fused RRF score before tag boost and relevance scaling (0.0 in Vector/Bm25 modes).
+    #[serde(default)]
+    pub rrf_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

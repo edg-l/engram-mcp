@@ -122,8 +122,9 @@ pub struct MemoryQueryInput {
     pub types: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Weight for semantic search (0.0-1.0). Keyword weight = 1 - semantic_weight.
-    /// Default 0.7 means 70% semantic, 30% keyword.
+    /// Deprecated. Ignored in all search modes — Hybrid uses RRF fusion, Vector
+    /// uses cosine only, and Bm25 uses lexical scoring only. Retained for
+    /// backwards compatibility with older callers; new clients should not set it.
     #[serde(default = "default_semantic_weight")]
     pub semantic_weight: f64,
     /// Branch mode: "current" (default) = global + current branch,
@@ -334,10 +335,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "query": {"type": "string", "description": "Natural language question or keywords. E.g. 'what database do we use' or 'authentication decision'."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max results to return (default 10)."},
                     "offset": {"type": "integer", "minimum": 0, "description": "Skip first N results for pagination."},
-                    "min_relevance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Minimum score threshold (default 0.1). Raise to 0.3+ to filter noise."},
+                    "min_relevance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Minimum stored relevance (decay) threshold (default 0.1). Memories with decay below this are excluded regardless of retrieval score. Note: memory_context uses min_score for cosine cutoff — this field gates on stored decay only."},
                     "types": {"type": "array", "items": {"type": "string"}, "description": "Filter by memory type(s): fact, decision, preference, pattern, debug, entity."},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter to memories with any of these tags."},
-                    "semantic_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Balance between meaning (1.0) and keywords (0.0). Default 0.7. Lower for exact-term searches."},
+                    "semantic_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Deprecated and ignored. Retained for backwards compatibility; the active retrieval mode is controlled by the ENGRAM_SEARCH_MODE env var."},
                     "branch_mode": {"type": "string", "description": "'current' (default) = global + current branch, 'all' = all branches, 'global' = global only, or a specific branch name."},
                     "content_length": {"type": "integer", "minimum": 1, "description": "Max characters to show per memory content (default 300)."}
                 },

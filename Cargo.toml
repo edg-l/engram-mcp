@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "engram-cli"
 path = "src/cli.rs"
 
+[[bin]]
+name = "longmemeval-bench"
+path = "benchmarks/longmemeval/src/main.rs"
+
 [dependencies]
 rmcp = { version = "1.6", features = ["server", "transport-io"] }
 tokio = { version = "1.52", features = ["full"] }
@@ -33,9 +37,11 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 moka = { version = "0.12", features = ["sync"] }
 regex = "1"
+anyhow = "1"
+rand = "0.9"
+tempfile = "3.27"
 
 [dev-dependencies]
-tempfile = "3.27"
 criterion = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2"
 

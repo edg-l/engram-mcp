@@ -22,7 +22,10 @@ use super::schemas::{
     MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryPromoteInput, MemoryPruneInput,
     MemoryQueryInput, MemoryStoreBatchInput, MemoryStoreInput, MemoryUpdateInput, dedup_threshold,
 };
-use super::scoring::{compute_hybrid_score, compute_tag_boost};
+use super::scoring::{
+    SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
+    compute_tag_boost, rrf_fuse,
+};
 
 // ============================================
 // Result structs
@@ -87,12 +90,29 @@ pub struct RelatedMemory {
 // ToolHandler
 // ============================================
 
+/// Parse the `ENGRAM_SEARCH_MODE` env value into a `SearchMode`.
+///
+/// - `None` or empty string → `SearchMode::Hybrid` (default).
+/// - Recognized values: "vector", "bm25", "hybrid" (case-insensitive).
+/// - Unrecognized value: logs a warning and returns `SearchMode::Hybrid`.
+pub fn parse_search_mode(env_val: Option<&str>) -> SearchMode {
+    match env_val {
+        None | Some("") => SearchMode::Hybrid,
+        Some(s) => s.parse().unwrap_or_else(|e| {
+            tracing::warn!("ENGRAM_SEARCH_MODE: {e}; falling back to hybrid");
+            SearchMode::Hybrid
+        }),
+    }
+}
+
 pub struct ToolHandler {
     db: Database,
     embedding: EmbeddingService,
     project_id: String,
     /// Current git branch (None if not in git repo)
     current_branch: Option<String>,
+    /// Retrieval strategy: Vector, Bm25, or Hybrid (default).
+    search_mode: SearchMode,
     /// Cache for query embeddings to avoid recomputation
     query_cache: QueryEmbeddingCache,
     /// Cache for search results to avoid repeated similarity computations
@@ -105,12 +125,14 @@ impl ToolHandler {
         embedding: EmbeddingService,
         project_id: String,
         current_branch: Option<String>,
+        search_mode: SearchMode,
     ) -> Self {
         Self {
             db,
             embedding,
             project_id,
             current_branch,
+            search_mode,
             query_cache: QueryEmbeddingCache::new(),
             search_cache: SearchResultCache::new(),
         }
@@ -405,10 +427,6 @@ impl ToolHandler {
         let type_filters: Vec<MemoryType> =
             input.types.iter().filter_map(|t| t.parse().ok()).collect();
 
-        // Clamp semantic_weight to valid range
-        let semantic_weight = input.semantic_weight.clamp(0.0, 1.0);
-        let keyword_weight = 1.0 - semantic_weight;
-
         // Optimization: if query is empty, skip search and use filter-only path
         if input.query.trim().is_empty() {
             let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
@@ -440,6 +458,7 @@ impl ToolHandler {
                         score,
                         semantic_score: 0.0,
                         keyword_score: 0.0,
+                        rrf_score: 0.0,
                     }
                 })
                 .collect();
@@ -451,75 +470,69 @@ impl ToolHandler {
             }));
         }
 
-        // Run semantic search
-        let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
-            cached
-        } else {
-            let embedding = self.embedding.embed(&input.query)?;
-            self.query_cache
-                .insert(input.query.clone(), embedding.clone());
-            embedding
-        };
-
-        // Get semantic scores
-        let semantic_scores: std::collections::HashMap<String, f32> = if let Some(cached_results) =
-            self.search_cache.get(&self.project_id, &query_embedding)
-        {
-            cached_results.into_iter().collect()
-        } else {
-            let embeddings = self
-                .db
-                .get_all_embeddings_for_project_and_global(&self.project_id)?;
-
-            let scored: Vec<(String, f32)> = embeddings
-                .iter()
-                .map(|(id, vec)| {
-                    let similarity = cosine_similarity(&query_embedding, vec);
-                    (id.clone(), similarity)
-                })
-                .collect();
-
-            // Cache the results
-            self.search_cache
-                .insert(&self.project_id, &query_embedding, scored.clone());
-            scored.into_iter().collect()
-        };
-
         let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
 
-        // Run keyword search (FTS5) with branch filtering applied at the DB level
-        let keyword_results = self.db.keyword_search_with_branch(
-            &self.project_id,
-            &input.query,
-            input.limit * 5, // Get more to ensure we have enough after filtering
-            branch_filter,
-        )?;
+        // --- Embedding path (skipped for pure BM25 mode) ---
+        let semantic_scores: std::collections::HashMap<String, f32> = if self.search_mode
+            != SearchMode::Bm25
+        {
+            let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
+                cached
+            } else {
+                let embedding = self.embedding.embed(&input.query)?;
+                self.query_cache
+                    .insert(input.query.clone(), embedding.clone());
+                embedding
+            };
 
-        // Normalize keyword scores (BM25 scores can vary widely)
-        // Find max keyword score for normalization
-        let max_keyword_score = keyword_results
-            .iter()
-            .map(|(_, s)| *s)
-            .fold(0.0_f64, f64::max);
+            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding)
+            {
+                cached_results.into_iter().collect()
+            } else {
+                let embeddings = self
+                    .db
+                    .get_all_embeddings_for_project_and_global(&self.project_id)?;
 
-        let keyword_scores: std::collections::HashMap<String, f64> = if max_keyword_score > 0.0 {
-            keyword_results
-                .into_iter()
-                .map(|(id, score)| (id, score / max_keyword_score))
-                .collect()
+                let scored: Vec<(String, f32)> = embeddings
+                    .iter()
+                    .map(|(id, vec)| {
+                        let similarity = cosine_similarity(&query_embedding, vec);
+                        (id.clone(), similarity)
+                    })
+                    .collect();
+
+                self.search_cache
+                    .insert(&self.project_id, &query_embedding, scored.clone());
+                scored.into_iter().collect()
+            }
         } else {
             std::collections::HashMap::new()
         };
 
-        // Collect all candidate IDs from both searches
-        let mut candidate_ids: HashSet<String> = semantic_scores.keys().cloned().collect();
-        candidate_ids.extend(keyword_scores.keys().cloned());
+        // --- BM25 path (skipped for pure Vector mode) ---
+        // Returns ordered Vec<(id, raw_score)> from FTS5; we keep the ordering for RRF.
+        let bm25_results: Vec<(String, f64)> = if self.search_mode != SearchMode::Vector {
+            self.db.keyword_search_with_branch(
+                &self.project_id,
+                &input.query,
+                input.limit * 5, // over-fetch so we have enough after per-memory filters
+                branch_filter,
+            )?
+        } else {
+            Vec::new()
+        };
 
-        // Batch fetch all candidate memories
+        // Collect candidate IDs from whichever rankers ran.
+        let mut candidate_ids: HashSet<String> = semantic_scores.keys().cloned().collect();
+        for (id, _) in &bm25_results {
+            candidate_ids.insert(id.clone());
+        }
+
+        // Batch fetch all candidate memories once.
         let candidate_ids_vec: Vec<String> = candidate_ids.into_iter().collect();
         let memories_map = self.db.get_memories_batch(&candidate_ids_vec)?;
 
-        // Extract normalized query words for tag boosting
+        // Extract normalized query words for tag boosting.
         let query_words: Vec<String> = input
             .query
             .to_lowercase()
@@ -529,8 +542,38 @@ impl ToolHandler {
             .filter(|w| !w.is_empty())
             .collect();
 
-        // Calculate hybrid scores and build results
-        let mut scored_results: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, combined, semantic, keyword)
+        // Build RRF lookup for Hybrid mode.
+        // For Vector and Bm25 modes this map is empty; scoring uses a direct formula instead.
+        let rrf_map: std::collections::HashMap<String, f64> = if self.search_mode
+            == SearchMode::Hybrid
+        {
+            // Vector ranking: sort semantic scores descending by similarity.
+            let mut vector_ranked: Vec<(&String, f32)> =
+                semantic_scores.iter().map(|(id, &s)| (id, s)).collect();
+            vector_ranked
+                .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let vector_ranks: Vec<String> = vector_ranked
+                .into_iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            // BM25 ranking: already ordered by FTS5 score descending.
+            let bm25_ranks: Vec<String> = bm25_results.iter().map(|(id, _)| id.clone()).collect();
+
+            rrf_fuse(&[vector_ranks.as_slice(), bm25_ranks.as_slice()], 60.0)
+                .into_iter()
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Score, filter, and collect results.
+        // Tuple layout: (id, final_score, raw_semantic, raw_keyword, rrf_score)
+        let mut scored_results: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+
+        // Compute BM25 max once outside the loop; used to normalize the
+        // diagnostic `keyword_score` field per result.
+        let max_bm25 = bm25_results.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
 
         for id in candidate_ids_vec.iter() {
             let Some(memory) = memories_map.get(id) else {
@@ -563,33 +606,76 @@ impl ToolHandler {
                 continue;
             }
 
-            let semantic_score = *semantic_scores.get(id).unwrap_or(&0.0) as f64;
-            let keyword_score = *keyword_scores.get(id).unwrap_or(&0.0);
+            // Raw diagnostic scores (always populated regardless of mode).
+            let raw_semantic = *semantic_scores.get(id).unwrap_or(&0.0) as f64;
+            // Normalize BM25 across the returned set for the diagnostic field.
+            let raw_keyword = if max_bm25 > 0.0 {
+                bm25_results
+                    .iter()
+                    .find(|(bid, _)| bid == id)
+                    .map(|(_, s)| s / max_bm25)
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
 
-            // Hybrid score: weighted combination of semantic and keyword scores
-            let hybrid_score = semantic_weight * semantic_score + keyword_weight * keyword_score;
-
-            // Tag boost: if query words match memory tags, boost the score.
-            // This helps disambiguate memories that share similar embeddings
-            // but differ in their tagged topics.
+            // Tag boost applied uniformly across all modes.
             let tag_boost = compute_tag_boost(&query_words, &memory.tags);
 
-            // Apply relevance decay and tag boost
-            let final_score = (hybrid_score + tag_boost) * memory.relevance_score;
+            let (base_score, rrf_score) = match self.search_mode {
+                SearchMode::Vector => {
+                    // Pure vector: base is cosine similarity.
+                    (raw_semantic, 0.0)
+                }
+                SearchMode::Bm25 => {
+                    // Pure BM25: find 0-based rank in bm25_results for RRF-style pseudo-score.
+                    // Using the RRF pseudo-form keeps this scale consistent with Hybrid mode.
+                    let rank = bm25_results
+                        .iter()
+                        .position(|(bid, _)| bid == id)
+                        .unwrap_or(usize::MAX);
+                    let pseudo = if rank == usize::MAX {
+                        0.0
+                    } else {
+                        1.0 / (60.0 + rank as f64 + 1.0)
+                    };
+                    (pseudo, 0.0)
+                }
+                SearchMode::Hybrid => {
+                    // RRF fused score; 0.0 for IDs absent from both rankers.
+                    let fused = *rrf_map.get(id.as_str()).unwrap_or(&0.0);
+                    (fused, fused)
+                }
+            };
 
-            if final_score >= input.min_relevance {
-                scored_results.push((id.clone(), final_score, semantic_score, keyword_score));
+            // Filter by decay relevance first; this is mode-agnostic.
+            // RRF and BM25-pseudo scores are not on the 0-1 scale that
+            // min_relevance was designed for, so we gate on the stored
+            // relevance_score (the decay value) instead of final_score.
+            if memory.relevance_score < input.min_relevance {
+                continue;
             }
+
+            let final_score =
+                apply_tag_and_relevance(base_score, tag_boost, memory.relevance_score);
+
+            scored_results.push((
+                id.clone(),
+                final_score,
+                raw_semantic,
+                raw_keyword,
+                rrf_score,
+            ));
         }
 
-        // Sort by combined score descending
+        // Sort by final score descending.
         scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply pagination and build final results
+        // Apply pagination and build final results.
         let mut results: Vec<MemoryWithScore> = Vec::new();
         let mut result_ids: Vec<String> = Vec::new();
 
-        for (id, score, semantic_score, keyword_score) in scored_results
+        for (id, score, semantic_score, keyword_score, rrf_score) in scored_results
             .into_iter()
             .skip(input.offset)
             .take(input.limit)
@@ -603,6 +689,7 @@ impl ToolHandler {
                     score,
                     semantic_score,
                     keyword_score,
+                    rrf_score,
                 });
             }
         }
@@ -1372,7 +1459,13 @@ impl ToolHandler {
         };
 
         if let Some(clusters) = should_use_hierarchical {
-            // Hierarchical: query cluster centroids, then fetch members from top clusters
+            // Hierarchical: query cluster centroids, then fetch members from top clusters.
+            //
+            // SearchMode asymmetry for min_score:
+            //   Vector  — gate on cosine similarity (existing behavior).
+            //   Bm25    — gate on memory.relevance_score (decay value), same as memory_query.
+            //   Hybrid  — gate on memory.relevance_score (decay value).
+            // This matches the memory_query precedent from Phase 2.
             let mut cluster_scores: Vec<(String, f32)> = Vec::new();
             for cluster in &clusters {
                 if let Some(ref centroid) = cluster.centroid {
@@ -1398,33 +1491,140 @@ impl ToolHandler {
             let num_top_clusters = cluster_scores.len().min(input.limit).max(1);
             let per_cluster_cap = (input.limit / num_top_clusters).max(1);
 
+            // One FTS query per selected cluster (N clusters, default max 5).
+            // Each call is a single SQLite FTS5 MATCH with an IN-clause restriction.
             for (cluster_id, _cluster_sim) in cluster_scores.iter().take(num_top_clusters) {
                 let member_ids = self.db.get_cluster_member_ids(cluster_id)?;
                 let member_set: std::collections::HashSet<&String> = member_ids.iter().collect();
 
-                // Compute raw similarity for all cluster members present in embedding map
+                // Compute raw cosine similarity for all cluster members in embedding map.
                 let member_raw: Vec<(String, f32)> = embedding_map
                     .iter()
                     .filter(|(id, _)| member_set.contains(id))
                     .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
                     .collect();
 
-                // Batch fetch members to get metadata for hybrid scoring
-                let member_ids_for_batch: Vec<String> =
-                    member_raw.iter().map(|(id, _)| id.clone()).collect();
-                let members_map = self.db.get_memories_batch(&member_ids_for_batch)?;
+                // Build sorted vector ranking for the vector ranker.
+                let mut v_sorted = member_raw.clone();
+                v_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let v_ranks: Vec<String> = v_sorted.iter().map(|(id, _)| id.clone()).collect();
 
-                // Compute hybrid scores and sort by hybrid score
-                let mut member_scores: Vec<(String, f32, f32)> = member_raw
-                    .into_iter()
-                    .filter_map(|(id, similarity)| {
-                        members_map.get(&id).map(|m| {
-                            let hybrid =
-                                compute_hybrid_score(similarity, m.last_accessed_at, m.importance);
-                            (id, similarity, hybrid)
-                        })
-                    })
+                // Fetch BM25 scores for cluster members when needed.
+                let bm25_for_cluster: Vec<(String, f32)> = if matches!(
+                    self.search_mode,
+                    SearchMode::Bm25 | SearchMode::Hybrid
+                ) {
+                    let bm25_res = self.db.keyword_search_within_ids(
+                        &self.project_id,
+                        &input.context,
+                        &member_ids,
+                        member_ids.len().max(1),
+                    )?;
+                    if bm25_res.is_empty()
+                        && matches!(self.search_mode, SearchMode::Bm25 | SearchMode::Hybrid)
+                    {
+                        // FTS returned nothing (short or stop-word query) — fall back to
+                        // vector scoring within this cluster.
+                        tracing::debug!(
+                            cluster_id = %cluster_id,
+                            "keyword_search_within_ids returned empty; falling back to vector for this cluster"
+                        );
+                    }
+                    bm25_res
+                } else {
+                    Vec::new()
+                };
+                let b_ranks: Vec<String> =
+                    bm25_for_cluster.iter().map(|(id, _)| id.clone()).collect();
+
+                // Narrow the per-cluster candidate set by mode.
+                // In BM25 mode: restrict to BM25 result IDs only (mirrors the flat-path logic).
+                let bm25_id_set: std::collections::HashSet<&str> =
+                    b_ranks.iter().map(|s| s.as_str()).collect();
+                let filtered_member_raw: Vec<(String, f32)> = match self.search_mode {
+                    SearchMode::Vector => member_raw.clone(),
+                    SearchMode::Bm25 => member_raw
+                        .iter()
+                        .filter(|(id, _)| bm25_id_set.contains(id.as_str()))
+                        .cloned()
+                        .collect(),
+                    SearchMode::Hybrid => member_raw.clone(),
+                };
+
+                // Batch fetch members to get metadata.
+                let member_ids_for_batch: Vec<String> = filtered_member_raw
+                    .iter()
+                    .map(|(id, _)| id.clone())
                     .collect();
+                let members_map = self.db.get_memories_batch(&member_ids_for_batch)?;
+                let sim_map: std::collections::HashMap<String, f32> =
+                    member_raw.into_iter().collect();
+
+                // Determine per-member final scores according to search mode.
+                let mut member_scores: Vec<(String, f32, f32)> = {
+                    // Build candidate id set from members that passed narrowing.
+                    let all_ids: Vec<&String> = members_map.keys().collect();
+
+                    // Pre-compute RRF fused map for Hybrid mode.
+                    let rrf_map: std::collections::HashMap<String, f64> =
+                        if matches!(self.search_mode, SearchMode::Hybrid) {
+                            let b_empty = b_ranks.is_empty();
+                            if b_empty {
+                                // BM25 returned nothing; fuse with vector only.
+                                rrf_fuse(&[v_ranks.as_slice()], 60.0)
+                            } else {
+                                rrf_fuse(&[v_ranks.as_slice(), b_ranks.as_slice()], 60.0)
+                            }
+                            .into_iter()
+                            .collect()
+                        } else {
+                            std::collections::HashMap::new()
+                        };
+
+                    all_ids
+                        .into_iter()
+                        .filter_map(|id| {
+                            members_map.get(id).map(|m| {
+                                let similarity = *sim_map.get(id).unwrap_or(&0.0);
+                                let base = match self.search_mode {
+                                    SearchMode::Vector => similarity,
+                                    SearchMode::Bm25 => {
+                                        if b_ranks.is_empty() {
+                                            // FTS fallback: use vector score.
+                                            similarity
+                                        } else {
+                                            let rank = b_ranks
+                                                .iter()
+                                                .position(|bid| bid == id)
+                                                .unwrap_or(usize::MAX);
+                                            if rank == usize::MAX {
+                                                0.0_f32
+                                            } else {
+                                                (1.0 / (60.0 + rank as f64 + 1.0)) as f32
+                                            }
+                                        }
+                                    }
+                                    SearchMode::Hybrid => {
+                                        *rrf_map.get(id.as_str()).unwrap_or(&0.0) as f32
+                                    }
+                                };
+                                // Vector: additive form (recency/importance contribute even at low sim).
+                                // Bm25/Hybrid: multiplicative form so base=0 memories score exactly 0.
+                                let final_score = match self.search_mode {
+                                    SearchMode::Vector => {
+                                        compute_hybrid_score(base, m.last_accessed_at, m.importance)
+                                    }
+                                    SearchMode::Bm25 | SearchMode::Hybrid => compute_context_score(
+                                        base,
+                                        m.last_accessed_at,
+                                        m.importance,
+                                    ),
+                                };
+                                (id.clone(), similarity, final_score)
+                            })
+                        })
+                        .collect()
+                };
                 member_scores
                     .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1453,6 +1653,20 @@ impl ToolHandler {
                         }
 
                         if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
+                            continue;
+                        }
+
+                        // min_score gate:
+                        //   Vector  — gate on cosine similarity (same as before).
+                        //   Bm25    — gate on decay relevance_score.
+                        //   Hybrid  — gate on decay relevance_score.
+                        let passes_min_score = match self.search_mode {
+                            SearchMode::Vector => similarity >= input.min_score as f32,
+                            SearchMode::Bm25 | SearchMode::Hybrid => {
+                                memory.relevance_score >= input.min_score
+                            }
+                        };
+                        if !passes_min_score {
                             continue;
                         }
 
@@ -1499,31 +1713,116 @@ impl ToolHandler {
                 "clusters_hit": clusters_hit,
             }))
         } else {
-            // Flat retrieval with pre-filtering and hybrid scoring
+            // Flat retrieval with pre-filtering and mode-aware scoring.
+            //
+            // SearchMode asymmetry for min_score:
+            //   Vector  — gate on cosine similarity (existing behavior).
+            //   Bm25    — gate on memory.relevance_score (decay value), matching memory_query Phase 2.
+            //   Hybrid  — gate on memory.relevance_score (decay value).
             let embeddings = self
                 .db
                 .get_prefiltered_embeddings(&self.project_id, max_candidates)?;
 
-            // Compute raw cosine similarities and filter by min_score
-            let raw_scored: Vec<(String, f32)> = embeddings
+            // Compute raw cosine similarities for all pre-filtered candidates.
+            let all_raw: Vec<(String, f32)> = embeddings
                 .iter()
                 .map(|(id, vec)| (id.clone(), cosine_similarity(&context_embedding, vec)))
-                .filter(|(_, score)| *score >= input.min_score as f32)
                 .collect();
 
-            // Batch fetch candidate memories to get metadata for hybrid scoring
+            let all_candidate_ids: Vec<String> = all_raw.iter().map(|(id, _)| id.clone()).collect();
+
+            // Fetch BM25 scores before narrowing the candidate set (needed for BM25/Hybrid modes).
+            let bm25_results: Vec<(String, f32)> =
+                if matches!(self.search_mode, SearchMode::Bm25 | SearchMode::Hybrid) {
+                    self.db.keyword_search_within_ids(
+                        &self.project_id,
+                        &input.context,
+                        &all_candidate_ids,
+                        all_candidate_ids.len().max(1),
+                    )?
+                } else {
+                    Vec::new()
+                };
+            let b_ranks: Vec<String> = bm25_results.iter().map(|(id, _)| id.clone()).collect();
+
+            // Narrow the candidate set:
+            //   Vector  — filter by min_score on cosine (existing behavior).
+            //   Bm25    — restrict to BM25 result IDs only (mirrors memory_query: non-matching
+            //             memories are not candidates, keeping scoring semantics consistent).
+            //   Hybrid  — union of all embeddings (vector covers semantic; RRF fuses both).
+            let raw_scored: Vec<(String, f32)> = match self.search_mode {
+                SearchMode::Vector => all_raw
+                    .into_iter()
+                    .filter(|(_, score)| *score >= input.min_score as f32)
+                    .collect(),
+                SearchMode::Bm25 => {
+                    let bm25_id_set: std::collections::HashSet<&str> =
+                        b_ranks.iter().map(|s| s.as_str()).collect();
+                    all_raw
+                        .into_iter()
+                        .filter(|(id, _)| bm25_id_set.contains(id.as_str()))
+                        .collect()
+                }
+                SearchMode::Hybrid => all_raw,
+            };
+
             let candidate_ids: Vec<String> = raw_scored.iter().map(|(id, _)| id.clone()).collect();
+
+            // Build vector ranking (sorted by cosine desc) for RRF.
+            let mut v_sorted = raw_scored.clone();
+            v_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let v_ranks: Vec<String> = v_sorted.iter().map(|(id, _)| id.clone()).collect();
+
+            // Pre-compute RRF fused map for Hybrid mode.
+            let rrf_map: std::collections::HashMap<String, f64> =
+                if matches!(self.search_mode, SearchMode::Hybrid) {
+                    if b_ranks.is_empty() {
+                        rrf_fuse(&[v_ranks.as_slice()], 60.0)
+                    } else {
+                        rrf_fuse(&[v_ranks.as_slice(), b_ranks.as_slice()], 60.0)
+                    }
+                    .into_iter()
+                    .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+            // Batch fetch candidate memories to get metadata.
             let candidate_map = self.db.get_memories_batch(&candidate_ids)?;
 
-            // Compute hybrid scores and sort by hybrid score (keep raw similarity for output)
-            let mut scored: Vec<(String, f32, f32)> = raw_scored
-                .into_iter()
-                .filter_map(|(id, similarity)| {
-                    candidate_map.get(&id).map(|m| {
-                        let hybrid =
-                            compute_hybrid_score(similarity, m.last_accessed_at, m.importance);
-                        (id, similarity, hybrid)
-                    })
+            let sim_map: std::collections::HashMap<String, f32> = raw_scored.into_iter().collect();
+
+            // Score each candidate per mode and sort.
+            // Vector: additive form (recency/importance contribute even at low similarity).
+            // Bm25/Hybrid: multiplicative form so base=0 memories score exactly 0.
+            let mut scored: Vec<(String, f32, f32)> = candidate_map
+                .iter()
+                .map(|(id, m)| {
+                    let similarity = *sim_map.get(id).unwrap_or(&0.0);
+                    let base = match self.search_mode {
+                        SearchMode::Vector => similarity,
+                        SearchMode::Bm25 => {
+                            let rank = b_ranks
+                                .iter()
+                                .position(|bid| bid == id)
+                                .unwrap_or(usize::MAX);
+                            if rank == usize::MAX {
+                                0.0_f32
+                            } else {
+                                (1.0 / (60.0 + rank as f64 + 1.0)) as f32
+                            }
+                        }
+                        SearchMode::Hybrid => *rrf_map.get(id.as_str()).unwrap_or(&0.0) as f32,
+                    };
+                    let final_score = match self.search_mode {
+                        SearchMode::Vector => {
+                            compute_hybrid_score(base, m.last_accessed_at, m.importance)
+                        }
+                        SearchMode::Bm25 | SearchMode::Hybrid => {
+                            compute_context_score(base, m.last_accessed_at, m.importance)
+                        }
+                    };
+                    (id.clone(), similarity, final_score)
                 })
                 .collect();
             scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -1549,6 +1848,20 @@ impl ToolHandler {
                     }
 
                     if !type_filters.is_empty() && !type_filters.contains(&memory.memory_type) {
+                        continue;
+                    }
+
+                    // min_score gate:
+                    //   Vector  — cosine similarity (guards applied above already, redundant check).
+                    //   Bm25    — decay relevance_score, matching memory_query Phase 2 behavior.
+                    //   Hybrid  — decay relevance_score.
+                    let passes_min_score = match self.search_mode {
+                        SearchMode::Vector => similarity >= input.min_score as f32,
+                        SearchMode::Bm25 | SearchMode::Hybrid => {
+                            memory.relevance_score >= input.min_score
+                        }
+                    };
+                    if !passes_min_score {
                         continue;
                     }
 
@@ -2066,7 +2379,7 @@ mod tests {
     use super::super::handoff::{
         create_handoff, resume_handoff_with_vec, search_handoffs_with_vec,
     };
-    use super::{Database, EmbeddingService, MemoryError, RelationType, ToolHandler};
+    use super::{Database, EmbeddingService, MemoryError, RelationType, SearchMode, ToolHandler};
     use crate::memory::{HandoffSections, MemoryType};
     use crate::tools::test_utils::{dummy_vec, insert_test_handoff};
 
@@ -2520,6 +2833,7 @@ mod tests {
             embedding,
             project_id.to_string(),
             Some("main".to_string()),
+            SearchMode::default(),
         );
 
         handler
@@ -2600,6 +2914,7 @@ mod tests {
             embedding,
             project_id.to_string(),
             Some("main".to_string()),
+            SearchMode::default(),
         );
 
         // A string that parse_markdown cannot map to a valid HandoffSections with a summary.

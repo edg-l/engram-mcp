@@ -837,6 +837,7 @@ dependencies = [
 name = "engram_mcp"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
  "assert_cmd",
  "base64 0.22.1",
  "chrono",
@@ -846,6 +847,7 @@ dependencies = [
  "fastembed",
  "hf-hub 0.4.3",
  "moka",
+ "rand",
  "regex",
  "rmcp",
  "rusqlite",

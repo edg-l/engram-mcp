@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use engram_mcp::db::Database;
 use engram_mcp::embedding::EmbeddingService;
 use engram_mcp::memory::{Memory, MemoryCluster, MemoryType};
-use engram_mcp::tools::ToolHandler;
+use engram_mcp::tools::{SearchMode, ToolHandler};
 use tempfile::TempDir;
 
 /// Build a dummy 256-element unit vector for use in benches that need pre-computed
@@ -93,7 +93,13 @@ pub fn build_fixture_with_dummy_embeddings(corpus_size: usize) -> BenchFixture {
         .expect("store embeddings");
 
     let svc = EmbeddingService::new().expect("embedding service");
-    let handler = ToolHandler::new(db, svc, "bench".to_string(), Some("main".to_string()));
+    let handler = ToolHandler::new(
+        db,
+        svc,
+        "bench".to_string(),
+        Some("main".to_string()),
+        SearchMode::default(),
+    );
     BenchFixture {
         handler,
         _tempdir: tempdir,
@@ -184,7 +190,13 @@ pub fn build_fixture_with_clusters(corpus_size: usize, num_clusters: usize) -> B
     }
 
     let svc = EmbeddingService::new().expect("embedding service");
-    let handler = ToolHandler::new(db, svc, "bench".to_string(), Some("main".to_string()));
+    let handler = ToolHandler::new(
+        db,
+        svc,
+        "bench".to_string(),
+        Some("main".to_string()),
+        SearchMode::default(),
+    );
     BenchFixture {
         handler,
         _tempdir: tempdir,
@@ -261,7 +273,13 @@ pub fn build_fixture_real_embeddings(corpus_size: usize) -> BenchFixture {
     db.store_embeddings_batch(&emb_triples)
         .expect("store embeddings");
 
-    let handler = ToolHandler::new(db, svc, "bench".to_string(), Some("main".to_string()));
+    let handler = ToolHandler::new(
+        db,
+        svc,
+        "bench".to_string(),
+        Some("main".to_string()),
+        SearchMode::default(),
+    );
     BenchFixture {
         handler,
         _tempdir: tempdir,
