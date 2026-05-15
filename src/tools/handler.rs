@@ -182,34 +182,6 @@ impl ToolHandler {
         self.search_cache.invalidate_project(&self.project_id);
     }
 
-    /// Find memories that are potential duplicates of the given embedding.
-    /// Returns (memory_id, similarity) pairs where similarity >= threshold and same type.
-    fn find_duplicates(
-        &self,
-        embedding: &[f32],
-        memory_type: MemoryType,
-        threshold: f32,
-        existing_embeddings: &[(String, Vec<f32>)],
-        existing_memories: &std::collections::HashMap<String, Memory>,
-    ) -> Result<Vec<(String, f32)>, MemoryError> {
-        let mut duplicates = Vec::new();
-
-        for (existing_id, existing_vec) in existing_embeddings {
-            let similarity = cosine_similarity(embedding, existing_vec);
-            // Check threshold and same memory type using pre-fetched map (avoids N+1 DB queries)
-            if similarity >= threshold
-                && let Some(mem) = existing_memories.get(existing_id)
-                && mem.memory_type == memory_type
-            {
-                duplicates.push((existing_id.clone(), similarity));
-            }
-        }
-
-        // Sort by similarity descending
-        duplicates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(duplicates)
-    }
-
     pub fn handle_tool(&self, name: &str, arguments: Value) -> Result<Value, MemoryError> {
         match name {
             "memory_store" => self.memory_store(arguments),
@@ -235,6 +207,8 @@ impl ToolHandler {
     }
 
     fn memory_store(&self, arguments: Value) -> Result<Value, MemoryError> {
+        use super::store::{StoreOutcome, store_with_dedup};
+
         let input: MemoryStoreInput = serde_json::from_value(arguments)?;
 
         let memory_type: MemoryType = input
@@ -283,73 +257,68 @@ impl ToolHandler {
             global: input.global,
         };
 
-        // Generate embedding first to check for duplicates
+        // Generate embedding locally — needed for both dedup and contradiction scan.
         let embedding = self.embedding.embed_memory(memory_type, &input.content)?;
 
-        // Fetch all embeddings once (reused for both dedup and contradiction checks)
-        // Include global memories from other projects to catch cross-project duplicates
+        // Fetch all embeddings and memories now for the contradiction scan after store.
+        // (store_with_dedup will re-fetch internally for dedup; that's acceptable here.)
         let pre_store_embeddings = self
             .db
             .get_all_embeddings_for_project_and_global(&self.project_id)?;
-
-        // Pre-fetch all memories once (avoids N+1 queries in find_duplicates and contradiction loop)
         let pre_store_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
         let pre_store_memories: std::collections::HashMap<String, Memory> = pre_store_memories_list
             .into_iter()
             .map(|m| (m.id.clone(), m))
             .collect();
 
-        // Check for duplicates (configurable via ENGRAM_DEDUP_THRESHOLD, default 0.90)
-        // Handoffs are session snapshots; never auto-merge.
+        // Handoffs are session snapshots; bypass dedup.
+        // Pass None for embedding_service to skip dedup for handoffs.
         let dedup_thr = dedup_threshold();
-        let duplicates = if memory_type != MemoryType::Handoff {
-            self.find_duplicates(
-                &embedding,
-                memory_type,
+        let outcome = if memory_type != MemoryType::Handoff {
+            store_with_dedup(
+                &self.db,
+                Some(&self.embedding),
+                &self.project_id,
+                memory,
+                Some(&embedding),
                 dedup_thr,
-                &pre_store_embeddings,
-                &pre_store_memories,
+                None, // MCP path never skips — always merges duplicates
             )?
         } else {
-            Vec::new()
+            // Handoff: store directly, bypassing dedup.
+            self.db.store_memory(&memory)?;
+            self.db
+                .store_embedding(&id, &embedding, self.embedding.model_version())?;
+            StoreOutcome::Stored(id.clone())
         };
 
-        // Store the new memory
-        self.db.store_memory(&memory)?;
-        self.db
-            .store_embedding(&id, &embedding, self.embedding.model_version())?;
+        // Map store outcome to MergeInfo.
+        let (final_id, merge_info) = match outcome {
+            StoreOutcome::Stored(stored_id) => (stored_id, None),
+            StoreOutcome::Merged {
+                id: stored_id,
+                merged_with,
+                similarity,
+            } => {
+                let old_preview: String = pre_store_memories
+                    .get(&merged_with)
+                    .map(|m| m.content.chars().take(100).collect())
+                    .unwrap_or_default();
+                (
+                    stored_id,
+                    Some(MergeInfo {
+                        merged_with,
+                        similarity,
+                        old_content_preview: old_preview,
+                    }),
+                )
+            }
+            StoreOutcome::SkippedSimilar { .. } => {
+                unreachable!("MCP path passes skip_above=None; SkippedSimilar cannot occur")
+            }
+        };
 
-        // If duplicate found, merge. Global always survives:
-        // - existing global + new local: merge_memories(global_id, new_id) -> keep global
-        // - existing local + new global: merge_memories(new_id, existing_id) -> keep new global
-        // - both same scope: merge_memories(new_id, existing_id) -> keep new (default)
-        let mut merge_info: Option<MergeInfo> = None;
-        if let Some((dup_id, dup_similarity)) = duplicates.first() {
-            let dup_memory = pre_store_memories.get(dup_id);
-            let old_preview: String = dup_memory
-                .map(|m| m.content.chars().take(100).collect())
-                .unwrap_or_default();
-
-            let existing_is_global = dup_memory.map(|m| m.global).unwrap_or(false);
-            let (survivor_id, consumed_id) = if existing_is_global && !input.global {
-                // Existing global wins: keep existing, consume new local
-                (dup_id.as_str(), id.as_str())
-            } else {
-                // New wins (default): keep new, consume old
-                (id.as_str(), dup_id.as_str())
-            };
-
-            self.db
-                .merge_memories(survivor_id, consumed_id, &old_preview)?;
-
-            merge_info = Some(MergeInfo {
-                merged_with: dup_id.clone(),
-                similarity: *dup_similarity as f64,
-                old_content_preview: old_preview,
-            });
-        }
-
-        // Check for contradictions using pre-fetched embeddings, excluding self and any merged duplicate
+        // Check for contradictions using pre-fetched embeddings, excluding self and merged duplicate.
         // Handoffs encode evolving session state; suppress contradiction warnings.
         let mut potential_contradictions: Vec<PotentialContradiction> = Vec::new();
         const CONTRADICTION_THRESHOLD: f32 = 0.85;
@@ -357,7 +326,7 @@ impl ToolHandler {
 
         if memory_type != MemoryType::Handoff {
             for (existing_id, existing_vec) in &pre_store_embeddings {
-                if existing_id.as_str() == id.as_str() {
+                if existing_id.as_str() == final_id.as_str() {
                     continue; // Skip self
                 }
                 if merged_id == Some(existing_id.as_str()) {
@@ -383,7 +352,7 @@ impl ToolHandler {
         for related_id in input.related_to {
             let rel = Relationship {
                 id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
-                source_id: id.clone(),
+                source_id: final_id.clone(),
                 target_id: related_id,
                 relation_type: RelationType::RelatesTo,
                 strength: 1.0,
@@ -393,8 +362,12 @@ impl ToolHandler {
         }
 
         // Assign to cluster
-        let _cluster_id =
-            self.assign_to_cluster(&id, &embedding, &input.content, memory.importance)?;
+        let _cluster_id = self.assign_to_cluster(
+            &final_id,
+            &embedding,
+            &input.content,
+            input.importance.clamp(0.0, 1.0),
+        )?;
 
         // Invalidate search cache since we added new data
         self.invalidate_search_cache();
@@ -411,7 +384,7 @@ impl ToolHandler {
         };
 
         Ok(json!(MemoryStoreResult {
-            id,
+            id: final_id,
             message,
             branch,
             potential_contradictions,

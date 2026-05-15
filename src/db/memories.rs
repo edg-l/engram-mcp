@@ -805,4 +805,32 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    /// Count hook-captured memories stored today (UTC) for the given project.
+    ///
+    /// A memory is considered hook-captured if its `tags` JSON array contains the
+    /// string `"hook"`. Tags are stored as a JSON array, e.g. `["hook","prompt"]`,
+    /// so the LIKE pattern `%"hook"%` matches exactly.
+    #[allow(dead_code)] // Called by hooks::dispatch and CLI; not referenced from lib root
+    pub fn count_hook_memories_today(&self, project_id: &str) -> Result<usize, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        // Start-of-today UTC: truncate current timestamp to midnight.
+        // Note: `tags LIKE '%"hook"%'` is a full-table scan today. Acceptable at small
+        // project sizes; if hook traffic grows, promote `source` (hook vs manual) to a
+        // dedicated indexed column.
+        let now = chrono::Utc::now();
+        let start_of_today = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always a valid time")
+            .and_utc()
+            .timestamp();
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE project_id = ?1 AND created_at >= ?2 AND tags LIKE '%\"hook\"%'",
+            params![project_id, start_of_today],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
 }

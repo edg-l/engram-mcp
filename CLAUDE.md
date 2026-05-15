@@ -22,6 +22,7 @@ src/
   summarize.rs - extractive summarization for large content
   export.rs    - import/export JSON format
   error.rs     - MemoryError enum
+  hooks/       - Claude Code lifecycle hook handlers: dispatch, filter, redact, install, payload structs
 ```
 
 ## Key Types
@@ -87,6 +88,8 @@ engram-cli handoff create          # interactive handoff capture (prompts per se
 engram-cli handoff create --from-file session.md  # ingest pre-written markdown handoff
 engram-cli handoff resume [--branch X] [--query Q] [--max N]  # load context from recent handoffs
 engram-cli handoff search <query> [--branch X] [--section blockers,todos] [--limit N]  # search sections
+engram-cli hook-event <Event>              # process a Claude Code lifecycle hook event (reads stdin JSON)
+engram-cli hooks install/uninstall/status  # manage Claude Code settings.json integration
 ```
 
 ## Features
@@ -101,6 +104,7 @@ engram-cli handoff search <query> [--branch X] [--section blockers,todos] [--lim
 - Batch operations with transactions
 - Query pagination and empty-query optimization
 - Human-readable formatted output (markdown) + JSON in collapsible block
+- Claude Code lifecycle hooks: passive capture via `hook-event` subcommand + `hooks install` one-liner. Managed events: `UserPromptSubmit, PostToolUse, SubagentStop, SessionEnd` (Stop/PreCompact are explicit no-ops). `SessionEnd` reads `transcript_path` and stores the last assistant message as a `session_summary` Fact. All hook stores route through `store_with_dedup`, so near-duplicate captures are silently skipped. Per-project daily cap on hook captures prevents runaway logging. Hook importance is clamped to `0.5` regardless of `ENGRAM_HOOK_MIN_IMPORTANCE`.
 
 ## Handoffs
 Section-based session capture (`summary, decisions, todos, blockers, mental_model, next_steps, notes`). Handoffs are branch-aware `MemoryType::Handoff` memories, pinned by default, with a `handoff_sections` sidecar table holding per-section embeddings (256-dim f32 LE, prefix-free). Branch chaining via `continues_from` lives in the sidecar only (not a graph edge). Auto-links to `decision/pattern/debug` memories at cosine similarity >= 0.75 (cap 10 links). Bypasses dedup and contradiction detection entirely. Two MCP prompts: `handoff` (capture) and `resume` (restore). CLI: `engram-cli handoff create/resume/search`.
@@ -111,6 +115,10 @@ Section-based session capture (`summary, decisions, todos, blockers, mental_mode
 - `ENGRAM_DECAY_INTERVAL` - decay job interval in seconds (default: 3600)
 - `ENGRAM_RECLUSTER_INTERVAL` - re-clustering job interval in seconds (default: 21600)
 - `ENGRAM_MAX_CANDIDATES` - max candidate memories to score during search (default: 200)
+- `ENGRAM_HOOK_DEDUP_SKIP` - similarity threshold above which hook captures are silently dropped (default: 0.95, clamped to [0.5, 1.0])
+- `ENGRAM_HOOK_DAILY_CAP` - max hook-captured memories per project per UTC day; `0` = unlimited (default: 50)
+- `ENGRAM_HOOK_MIN_IMPORTANCE` - importance floor for hook captures (default: 0.5; values above 0.5 have no effect because dispatch caps importance at 0.5)
+- `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` - opt-in flag for the `UserPromptSubmit` hook (default off; even when on, captures require an explicit `#remember` cue)
 
 ## Commands
 ```bash

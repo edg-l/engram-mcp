@@ -3,6 +3,7 @@ pub mod filter;
 pub mod install;
 pub mod payload;
 pub mod redact;
+pub mod transcript;
 
 use std::str::FromStr;
 

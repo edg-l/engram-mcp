@@ -7,6 +7,7 @@
 use assert_cmd::Command;
 use engram_mcp::db::Database;
 use engram_mcp::memory::{Memory, MemoryType};
+use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -38,25 +39,33 @@ fn read_memories(db_path: &Path) -> Vec<Memory> {
 /// Blocker B1: hook-event reads the JSON payload from stdin when --payload is omitted.
 ///
 /// Pipe `UserPromptSubmit` JSON to stdin (no --payload flag).
-/// The dispatch handler must store a `Decision` row containing "Postgres".
+/// The dispatch handler must store a `Fact` row containing "Postgres".
 #[test]
 fn hook_event_reads_payload_from_stdin_without_flag() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("test.db");
 
-    // Prompt must match the cue regex and be >= 40 chars.
+    // Prompt must match the cue regex (decided/chose/prefer/switch) and be >= 40 chars.
     let stdin_json =
         r#"{"prompt":"we decided to switch to Postgres because of write throughput issues"}"#;
 
-    spawn_hook_event("UserPromptSubmit", stdin_json, &db_path).success();
+    let mut cmd = Command::cargo_bin("engram-cli").unwrap();
+    cmd.env("ENGRAM_DB", &db_path)
+        .env("ENGRAM_PROJECT", "test-bin-project")
+        .env("ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED", "true")
+        .arg("hook-event")
+        .arg("UserPromptSubmit")
+        .write_stdin(stdin_json.to_string())
+        .assert()
+        .success();
 
     let memories = read_memories(&db_path);
-    let decision = memories
+    let fact = memories
         .iter()
-        .find(|m| m.memory_type == MemoryType::Decision && m.content.contains("Postgres"));
+        .find(|m| m.memory_type == MemoryType::Fact && m.content.contains("Postgres"));
     assert!(
-        decision.is_some(),
-        "expected a Decision row containing 'Postgres', got:\n{:#?}",
+        fact.is_some(),
+        "expected a Fact row containing 'Postgres', got:\n{:#?}",
         memories
     );
 }
@@ -76,6 +85,7 @@ fn hook_event_payload_flag_overrides_stdin() {
     let mut cmd = Command::cargo_bin("engram-cli").unwrap();
     cmd.env("ENGRAM_DB", &db_path)
         .env("ENGRAM_PROJECT", "test-bin-project")
+        .env("ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED", "true")
         .arg("hook-event")
         .arg("UserPromptSubmit")
         .arg("--payload")
@@ -87,13 +97,13 @@ fn hook_event_payload_flag_overrides_stdin() {
 
     let memories = read_memories(&db_path);
 
-    // The --payload content should produce a Decision.
+    // The --payload content should produce a Fact.
     let from_payload = memories
         .iter()
-        .find(|m| m.memory_type == MemoryType::Decision && m.content.contains("auth module"));
+        .find(|m| m.memory_type == MemoryType::Fact && m.content.contains("auth module"));
     assert!(
         from_payload.is_some(),
-        "expected a Decision row for 'auth module', got:\n{:#?}",
+        "expected a Fact row for 'auth module', got:\n{:#?}",
         memories
     );
 
@@ -108,26 +118,22 @@ fn hook_event_payload_flag_overrides_stdin() {
     );
 }
 
-/// Blocker B2: `Stop` on a non-git workspace stores a Fact fallback, not an error.
-///
-/// Spawn from a temp dir that is NOT a git repo. The branch detection returns
-/// `None`, so `store_handoff_or_fact` falls back to a plain Fact row.
+/// Stop is now a no-op — nothing is stored regardless of payload content.
 #[test]
-fn stop_on_non_git_workspace_does_not_error() {
+fn stop_event_stores_nothing() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("test.db");
 
-    // Build a 300-char summary (Stop requires >= 200 chars).
+    // Build a 300-char summary (previously Stop required >= 200 chars, now irrelevant).
     let long_summary = format!(
         "Session ended after completing the authentication refactor. {}",
         "x".repeat(250)
     );
-    let stdin_json = format!(r#"{{"last_assistant_message":"{}"}}"#, long_summary);
+    let stdin_json = format!(r#"{{"response":"{}"}}"#, long_summary);
 
     let mut cmd = Command::cargo_bin("engram-cli").unwrap();
     cmd.env("ENGRAM_DB", &db_path)
         .env("ENGRAM_PROJECT", "test-bin-project")
-        // Run from the non-git temp dir so branch detection returns None.
         .current_dir(tmp.path())
         .arg("hook-event")
         .arg("Stop")
@@ -136,103 +142,121 @@ fn stop_on_non_git_workspace_does_not_error() {
         .success();
 
     let memories = read_memories(&db_path);
-
-    // Must have stored a Fact row (not a Handoff) since there's no git branch.
-    let fact_row = memories.iter().find(|m| m.memory_type == MemoryType::Fact);
     assert!(
-        fact_row.is_some(),
-        "expected a Fact row for the Stop fallback, got:\n{:#?}",
+        memories.is_empty(),
+        "Stop is a no-op: expected no stored memories, got:\n{:#?}",
         memories
     );
+}
 
-    // The Fact must NOT be a Handoff.
-    let handoff_row = memories
+/// PreCompact is now a no-op — nothing is stored regardless of payload content.
+#[test]
+fn pre_compact_event_stores_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+
+    // Test both the previously-ignored custom_instructions path and the empty path
+    // in a single test since both are now no-ops.
+    for stdin_json in &[
+        r#"{"compaction_reason":"manual","custom_instructions":"focus on auth code paths"}"#,
+        r#"{"compaction_reason":"auto"}"#,
+    ] {
+        let tmp2 = TempDir::new().unwrap();
+        let db_path2 = tmp2.path().join("test.db");
+
+        let mut cmd = Command::cargo_bin("engram-cli").unwrap();
+        cmd.env("ENGRAM_DB", &db_path2)
+            .env("ENGRAM_PROJECT", "test-bin-project")
+            .current_dir(tmp2.path())
+            .arg("hook-event")
+            .arg("PreCompact")
+            .write_stdin(stdin_json.to_string())
+            .assert()
+            .success();
+
+        let memories = read_memories(&db_path2);
+        assert!(
+            memories.is_empty(),
+            "PreCompact is a no-op: expected no stored memories for payload {:?}, got:\n{:#?}",
+            stdin_json,
+            memories
+        );
+    }
+
+    // Verify the original db_path wasn't written to either
+    let memories = read_memories(&db_path);
+    assert!(memories.is_empty());
+}
+
+/// SessionEnd reads the transcript file and stores an unpinned Fact tagged session_summary.
+#[test]
+fn session_end_reads_transcript_and_stores_fact() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+
+    // Write a JSONL transcript file whose last line is an assistant entry.
+    let transcript_path = tmp.path().join("transcript.jsonl");
+    let mut f = std::fs::File::create(&transcript_path).unwrap();
+    writeln!(f, r#"{{"type":"user","message":{{"content":"hello"}}}}"#).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"The refactor is complete and all tests pass successfully."}}]}}}}"#
+    )
+    .unwrap();
+
+    let stdin_json = format!(
+        r#"{{"reason":"logout","transcript_path":"{}"}}"#,
+        transcript_path.to_str().unwrap()
+    );
+
+    spawn_hook_event("SessionEnd", &stdin_json, &db_path).success();
+
+    let memories = read_memories(&db_path);
+    let fact = memories
         .iter()
-        .find(|m| m.memory_type == MemoryType::Handoff);
+        .find(|m| m.memory_type == MemoryType::Fact && m.content.contains("refactor is complete"));
     assert!(
-        handoff_row.is_none(),
-        "must not store a Handoff on non-git workspace, got:\n{:#?}",
+        fact.is_some(),
+        "expected a Fact row containing 'refactor is complete', got:\n{:#?}",
         memories
     );
 
-    // The row must carry both the "hook" and "stop_fallback" tags.
-    let fact = fact_row.unwrap();
+    let fact = fact.unwrap();
+    assert!(
+        !fact.pinned,
+        "session_summary Fact must not be pinned, got pinned=true"
+    );
+    assert!(
+        fact.tags.contains(&"session_summary".to_string()),
+        "expected 'session_summary' tag, got tags: {:?}",
+        fact.tags
+    );
     assert!(
         fact.tags.contains(&"hook".to_string()),
         "expected 'hook' tag, got tags: {:?}",
         fact.tags
     );
     assert!(
-        fact.tags.contains(&"stop_fallback".to_string()),
-        "expected 'stop_fallback' tag, got tags: {:?}",
-        fact.tags
+        fact.importance <= 0.5,
+        "hook_importance_cap must clamp stored importance to <= 0.5, got {}",
+        fact.importance
     );
 }
 
-/// PreCompact: custom_instructions content is captured in the stored Fact.
-///
-/// When `custom_instructions` is non-empty the dispatch handler stores its
-/// value directly rather than generating a timestamp summary.
+/// SessionEnd with no transcript_path stores nothing and exits successfully.
 #[test]
-fn pre_compact_uses_custom_instructions_when_present() {
+fn session_end_missing_transcript_path_stores_nothing() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("test.db");
 
-    let stdin_json = r#"{"trigger":"manual","custom_instructions":"focus on auth code paths"}"#;
+    let stdin_json = r#"{"reason":"logout"}"#;
 
-    let mut cmd = Command::cargo_bin("engram-cli").unwrap();
-    cmd.env("ENGRAM_DB", &db_path)
-        .env("ENGRAM_PROJECT", "test-bin-project")
-        // Non-git cwd forces Fact fallback.
-        .current_dir(tmp.path())
-        .arg("hook-event")
-        .arg("PreCompact")
-        .write_stdin(stdin_json)
-        .assert()
-        .success();
+    spawn_hook_event("SessionEnd", stdin_json, &db_path).success();
 
     let memories = read_memories(&db_path);
-
-    let row = memories.iter().find(|m| {
-        m.memory_type == MemoryType::Fact && m.content.contains("focus on auth code paths")
-    });
     assert!(
-        row.is_some(),
-        "expected a Fact row containing the custom_instructions text, got:\n{:#?}",
-        memories
-    );
-}
-
-/// PreCompact: a timestamp summary is generated when custom_instructions is empty.
-///
-/// When `custom_instructions` is empty the handler stores a
-/// "pre-compaction checkpoint at <rfc3339>" string.
-#[test]
-fn pre_compact_falls_back_to_timestamp_summary_when_empty() {
-    let tmp = TempDir::new().unwrap();
-    let db_path = tmp.path().join("test.db");
-
-    let stdin_json = r#"{"trigger":"auto","custom_instructions":""}"#;
-
-    let mut cmd = Command::cargo_bin("engram-cli").unwrap();
-    cmd.env("ENGRAM_DB", &db_path)
-        .env("ENGRAM_PROJECT", "test-bin-project")
-        // Non-git cwd forces Fact fallback.
-        .current_dir(tmp.path())
-        .arg("hook-event")
-        .arg("PreCompact")
-        .write_stdin(stdin_json)
-        .assert()
-        .success();
-
-    let memories = read_memories(&db_path);
-
-    let row = memories.iter().find(|m| {
-        m.memory_type == MemoryType::Fact && m.content.contains("pre-compaction checkpoint at")
-    });
-    assert!(
-        row.is_some(),
-        "expected a Fact row with 'pre-compaction checkpoint at' timestamp, got:\n{:#?}",
+        memories.is_empty(),
+        "expected nothing stored when transcript_path is absent, got:\n{:#?}",
         memories
     );
 }

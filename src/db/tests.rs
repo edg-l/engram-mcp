@@ -882,3 +882,58 @@ fn test_query_handoffs_unknown_type_propagates_error() {
         );
     }
 }
+
+#[test]
+fn test_count_hook_memories_today() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("proj", "proj").unwrap();
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Two hook-tagged memories.
+    for i in 0..2 {
+        let m = Memory {
+            id: format!("mem-hook-{}", i),
+            project_id: "proj".to_string(),
+            memory_type: MemoryType::Fact,
+            content: format!("hook memory {}", i),
+            summary: None,
+            tags: vec!["hook".to_string(), "prompt".to_string()],
+            importance: 0.4,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: None,
+            merged_from: None,
+            pinned: false,
+            global: false,
+        };
+        db.store_memory(&m).unwrap();
+    }
+
+    // One memory without the "hook" tag.
+    let untagged = Memory {
+        id: "mem-plain".to_string(),
+        project_id: "proj".to_string(),
+        memory_type: MemoryType::Fact,
+        content: "not a hook memory".to_string(),
+        summary: None,
+        tags: vec!["manual".to_string()],
+        importance: 0.5,
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: now,
+        updated_at: now,
+        last_accessed_at: now,
+        branch: None,
+        merged_from: None,
+        pinned: false,
+        global: false,
+    };
+    db.store_memory(&untagged).unwrap();
+
+    let count = db.count_hook_memories_today("proj").unwrap();
+    assert_eq!(count, 2, "expected 2 hook memories, got {}", count);
+}

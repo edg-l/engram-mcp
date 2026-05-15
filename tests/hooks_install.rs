@@ -76,10 +76,10 @@ fn engram_hook_events(settings: &Value) -> Vec<String> {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-/// `hooks install` creates exactly 6 managed entries, none for SessionStart.
+/// `hooks install` creates exactly 4 managed entries, none for SessionStart, Stop, or PreCompact.
 /// A backup file is created if a pre-existing settings.json was present.
 #[test]
-fn install_creates_six_managed_entries_and_backup() {
+fn install_creates_four_managed_entries_and_backup() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     let claude_dir = home.join(".claude");
@@ -100,22 +100,20 @@ fn install_creates_six_managed_entries_and_backup() {
 
     let settings = read_settings(home);
 
-    // Exactly 6 engram-cli hook entries.
+    // Exactly 4 engram-cli hook entries.
     assert_eq!(
         count_engram_hooks(&settings),
-        6,
-        "expected 6 engram-cli hook entries, got:\n{}",
+        4,
+        "expected 4 engram-cli hook entries, got:\n{}",
         serde_json::to_string_pretty(&settings).unwrap()
     );
 
-    // The 6 expected events are present.
+    // The 4 expected events are present.
     let mut events = engram_hook_events(&settings);
     events.sort();
     let mut expected = vec![
         "UserPromptSubmit",
         "PostToolUse",
-        "Stop",
-        "PreCompact",
         "SessionEnd",
         "SubagentStop",
     ];
@@ -126,6 +124,18 @@ fn install_creates_six_managed_entries_and_backup() {
     assert!(
         !events.contains(&"SessionStart".to_string()),
         "SessionStart should not be managed"
+    );
+
+    // Stop must NOT be present.
+    assert!(
+        !events.contains(&"Stop".to_string()),
+        "Stop should not be managed"
+    );
+
+    // PreCompact must NOT be present.
+    assert!(
+        !events.contains(&"PreCompact".to_string()),
+        "PreCompact should not be managed"
     );
 
     // A backup file must exist (we pre-seeded a settings.json).
@@ -141,7 +151,7 @@ fn install_creates_six_managed_entries_and_backup() {
     assert_eq!(bak_count, 1, "expected exactly one backup file");
 }
 
-/// After `install`, user-authored Stop hook survives `uninstall`.
+/// After `install`, user-authored PostToolUse hook survives `uninstall`.
 #[test]
 fn uninstall_removes_only_engram_entries() {
     let tmp = tempfile::tempdir().unwrap();
@@ -149,16 +159,16 @@ fn uninstall_removes_only_engram_entries() {
     let claude_dir = home.join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
 
-    // Pre-seed a settings.json with a user-authored Stop hook (no _source key).
+    // Pre-seed a settings.json with a user-authored PostToolUse hook (no _source key).
     let user_hook = serde_json::json!({
         "hooks": {
-            "Stop": [
+            "PostToolUse": [
                 {
                     "matcher": "my-tool",
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "echo user-stop-hook"
+                            "command": "echo user-posttooluse-hook"
                         }
                     ]
                 }
@@ -177,15 +187,15 @@ fn uninstall_removes_only_engram_entries() {
         .assert()
         .success();
 
-    // Verify both user and engram entries coexist under Stop.
+    // Verify both user and engram entries coexist under PostToolUse.
     let after_install = read_settings(home);
-    let stop_arr = after_install["hooks"]["Stop"]
+    let post_tool_arr = after_install["hooks"]["PostToolUse"]
         .as_array()
-        .expect("Stop should be an array");
+        .expect("PostToolUse should be an array");
     assert_eq!(
-        stop_arr.len(),
+        post_tool_arr.len(),
         2,
-        "Stop should have 2 entries after install"
+        "PostToolUse should have 2 entries after install (user + engram)"
     );
 
     // Uninstall engram entries.
@@ -203,19 +213,19 @@ fn uninstall_removes_only_engram_entries() {
         "all engram-cli hooks should be removed"
     );
 
-    // User-authored Stop hook must survive.
-    let stop_arr_after = after_uninstall["hooks"]["Stop"]
+    // User-authored PostToolUse hook must survive.
+    let post_tool_arr_after = after_uninstall["hooks"]["PostToolUse"]
         .as_array()
-        .expect("Stop key should still exist with user entry");
+        .expect("PostToolUse key should still exist with user entry");
     assert_eq!(
-        stop_arr_after.len(),
+        post_tool_arr_after.len(),
         1,
-        "user-authored Stop hook should survive"
+        "user-authored PostToolUse hook should survive"
     );
-    let user_cmd = stop_arr_after[0]["hooks"][0]["command"]
+    let user_cmd = post_tool_arr_after[0]["hooks"][0]["command"]
         .as_str()
         .unwrap_or("");
-    assert_eq!(user_cmd, "echo user-stop-hook");
+    assert_eq!(user_cmd, "echo user-posttooluse-hook");
 }
 
 /// Running `hooks install` twice does not duplicate entries.
@@ -231,7 +241,7 @@ fn install_is_idempotent() {
         .success();
 
     let settings_after_first = read_settings(home);
-    assert_eq!(count_engram_hooks(&settings_after_first), 6);
+    assert_eq!(count_engram_hooks(&settings_after_first), 4);
 
     // Second install.
     let output = engram_cli(home)
@@ -244,7 +254,7 @@ fn install_is_idempotent() {
     let settings_after_second = read_settings(home);
     assert_eq!(
         count_engram_hooks(&settings_after_second),
-        6,
+        4,
         "second install should not duplicate entries"
     );
 
@@ -253,6 +263,32 @@ fn install_is_idempotent() {
     assert!(
         stdout.contains("skipped") || stdout.contains("Already present"),
         "second install should report skipped entries; got: {}",
+        stdout
+    );
+}
+
+/// `hooks status` output includes the capture count line.
+#[test]
+fn hooks_status_shows_capture_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+
+    // Install first so there's something to show.
+    engram_cli(home)
+        .args(["hooks", "install"])
+        .assert()
+        .success();
+
+    let output = engram_cli(home)
+        .args(["hooks", "status"])
+        .output()
+        .expect("failed to run hooks status");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hook captures today:"),
+        "hooks status should include capture count line; got: {}",
         stdout
     );
 }

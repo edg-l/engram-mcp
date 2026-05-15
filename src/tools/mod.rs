@@ -9,11 +9,13 @@ mod handler;
 mod handoff;
 mod schemas;
 pub mod scoring;
+pub mod store;
 
 #[cfg(test)]
 mod test_utils;
 
 pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
-pub use schemas::{MemoryUpdateInput, get_tool_definitions};
+pub use schemas::{MemoryUpdateInput, dedup_threshold, get_tool_definitions};
 pub use scoring::{SearchMode, compute_hybrid_score, compute_tag_boost};
+pub use store::{StoreOutcome, store_with_dedup};

@@ -8,9 +8,10 @@ use crate::hooks::payload::{
     SubagentStopPayload, UserPromptSubmitPayload,
 };
 use crate::hooks::redact;
-use crate::memory::{HandoffSections, Memory, MemoryType};
+use crate::hooks::transcript::extract_last_assistant_text;
+use crate::memory::{Memory, MemoryType};
 use crate::summarize::{generate_summary, should_auto_summarize};
-use crate::tools::create_handoff;
+use crate::tools::{StoreOutcome, dedup_threshold, store_with_dedup};
 
 #[derive(Debug)]
 #[allow(dead_code)] // Fields read by callers via Debug formatting and pattern matching
@@ -36,6 +37,15 @@ pub fn dispatch(
         return Ok(DispatchOutcome::Skipped("event_disabled"));
     }
 
+    // Daily capture cap: skip (without storing) if the project has already hit its quota today.
+    // Only enforced when not in dry_run mode, and only when the cap is > 0 (0 = unlimited).
+    if !dry_run {
+        let cap = filter::hook_daily_cap();
+        if cap > 0 && db.count_hook_memories_today(project_id)? >= cap {
+            return Ok(DispatchOutcome::Skipped("daily_cap_reached"));
+        }
+    }
+
     match event {
         HookEvent::SessionStart => {
             if serde_json::from_str::<SessionStartPayload>(raw_json).is_err() {
@@ -59,12 +69,15 @@ pub fn dispatch(
                 return Ok(DispatchOutcome::Skipped("prompt_too_short"));
             }
 
-            let cue_re = match filter::compiled_prompt_cue_regex() {
-                Some(r) => r,
-                None => return Ok(DispatchOutcome::Skipped("invalid_cue_regex")),
-            };
-            if !cue_re.is_match(prompt) {
-                return Ok(DispatchOutcome::Skipped("prompt_no_cue_match"));
+            // Explicit opt-in via #remember bypasses the cue-regex gate.
+            if !prompt.contains("#remember") {
+                let cue_re = match filter::compiled_prompt_cue_regex() {
+                    Some(r) => r,
+                    None => return Ok(DispatchOutcome::Skipped("invalid_cue_regex")),
+                };
+                if !cue_re.is_match(prompt) {
+                    return Ok(DispatchOutcome::Skipped("prompt_no_cue_match"));
+                }
             }
 
             let content = redact::redact(prompt);
@@ -72,25 +85,25 @@ pub fn dispatch(
 
             if dry_run {
                 return Ok(DispatchOutcome::DryRun(format!(
-                    "UserPromptSubmit: would store Decision (branch={:?}): {}",
+                    "UserPromptSubmit: would store Fact (branch={:?}): {}",
                     branch,
-                    &content[..content.len().min(80)]
+                    &content[..content.floor_char_boundary(80)]
                 )));
             }
 
-            let id = store_memory(
+            let outcome = store_memory(
                 db,
                 embedding_service,
                 project_id,
                 &content,
-                MemoryType::Decision,
+                MemoryType::Fact,
                 &["hook", "prompt"],
-                filter::min_importance(),
+                hook_importance_cap(filter::min_importance()),
                 branch.as_deref(),
                 false,
                 false,
             )?;
-            Ok(DispatchOutcome::Stored(id))
+            Ok(outcome_to_dispatch(outcome))
         }
 
         HookEvent::PostToolUse => {
@@ -101,18 +114,7 @@ pub fn dispatch(
 
             let tool_name = payload.tool_name.as_deref().unwrap_or("unknown");
 
-            // Check for failure signal
-            let is_failure = payload.exit_code.is_some_and(|c| c != 0)
-                || payload
-                    .tool_response
-                    .as_ref()
-                    .map(|r| {
-                        let s = format!("{:?}", r).to_lowercase();
-                        s.contains("error") || s.contains("failed") || s.contains("panic")
-                    })
-                    .unwrap_or(false);
-
-            if !is_failure {
+            if !tool_response_indicates_failure(payload.tool_response.as_ref(), payload.exit_code) {
                 return Ok(DispatchOutcome::Skipped("tool_succeeded"));
             }
 
@@ -120,29 +122,22 @@ pub fn dispatch(
                 return Ok(DispatchOutcome::Skipped("tool_denied"));
             }
 
-            let error_or_response = payload
-                .tool_response
-                .as_ref()
-                .map(|r| format!("{:?}", r))
-                .unwrap_or_else(|| format!("exit_code={:?}", payload.exit_code));
+            let error_text = extract_error_text(payload.tool_response.as_ref(), payload.exit_code);
 
             let input_str = payload
                 .tool_input
                 .as_ref()
                 .map(|i| {
-                    let s = format!("{}", i);
+                    let s = i.to_string();
                     if s.len() > 500 {
-                        format!("{}…", &s[..500])
+                        format!("{}…", &s[..s.floor_char_boundary(500)])
                     } else {
                         s
                     }
                 })
                 .unwrap_or_default();
 
-            let content_raw = format!(
-                "{} failed: {}\nInput: {}",
-                tool_name, error_or_response, input_str
-            );
+            let content_raw = format!("{} failed: {}\nInput: {}", tool_name, error_text, input_str);
             let content = redact::redact(&content_raw);
             let branch = current_branch();
             let tags = vec!["hook", "failure", tool_name];
@@ -154,99 +149,37 @@ pub fn dispatch(
                 )));
             }
 
-            let id = store_memory(
+            let outcome = store_memory(
                 db,
                 embedding_service,
                 project_id,
                 &content,
                 MemoryType::Debug,
                 &tags,
-                0.6,
+                hook_importance_cap(0.6),
                 branch.as_deref(),
                 false,
                 false,
             )?;
-            Ok(DispatchOutcome::Stored(id))
+            Ok(outcome_to_dispatch(outcome))
         }
 
         HookEvent::Stop => {
-            let payload = match serde_json::from_str::<StopPayload>(raw_json) {
-                Ok(p) => p,
+            // Stop fires on every agent turn — capturing per-turn is pure volume noise.
+            match serde_json::from_str::<StopPayload>(raw_json) {
+                Ok(_) => {}
                 Err(_) => return Ok(DispatchOutcome::Skipped("parse_error")),
-            };
-
-            if payload.stop_hook_active == Some(true) {
-                return Ok(DispatchOutcome::Skipped("stop_reentrant"));
             }
-
-            let message = match payload.last_assistant_message.as_deref() {
-                Some(m) if m.len() >= 200 => m,
-                Some(_) => return Ok(DispatchOutcome::Skipped("too_short")),
-                None => return Ok(DispatchOutcome::Skipped("too_short")),
-            };
-
-            let summary = redact::redact(message);
-            let branch = current_branch();
-
-            if dry_run {
-                return Ok(DispatchOutcome::DryRun(format!(
-                    "Stop: would store handoff (branch={:?}): {}",
-                    branch,
-                    &summary[..summary.len().min(80)]
-                )));
-            }
-
-            let id = store_handoff_or_fact(
-                db,
-                embedding_service,
-                project_id,
-                &summary,
-                branch.as_deref(),
-                0.7,
-                true,
-                &["hook", "stop_fallback"],
-            )?;
-            Ok(DispatchOutcome::Stored(id))
+            Ok(DispatchOutcome::Skipped("stop_noop"))
         }
 
         HookEvent::PreCompact => {
-            let payload = match serde_json::from_str::<PreCompactPayload>(raw_json) {
-                Ok(p) => p,
+            // SessionEnd already captures transcript-based summaries; a mid-session checkpoint would just duplicate it.
+            match serde_json::from_str::<PreCompactPayload>(raw_json) {
+                Ok(_) => {}
                 Err(_) => return Ok(DispatchOutcome::Skipped("parse_error")),
-            };
-
-            let summary_text = if let Some(s) = payload.custom_instructions.as_deref()
-                && !s.trim().is_empty()
-            {
-                s.to_string()
-            } else {
-                format!(
-                    "pre-compaction checkpoint at {}",
-                    chrono::Utc::now().to_rfc3339()
-                )
-            };
-            let summary = redact::redact(&summary_text);
-            let branch = current_branch();
-
-            if dry_run {
-                return Ok(DispatchOutcome::DryRun(format!(
-                    "PreCompact: would store handoff (branch={:?}): {}",
-                    branch,
-                    &summary[..summary.len().min(80)]
-                )));
             }
-
-            let id = store_handoff_or_fact(
-                db,
-                embedding_service,
-                project_id,
-                &summary,
-                branch.as_deref(),
-                0.8,
-                true,
-                &["hook", "precompact_fallback"],
-            )?;
-            Ok(DispatchOutcome::Stored(id))
+            Ok(DispatchOutcome::Skipped("precompact_noop"))
         }
 
         HookEvent::SessionEnd => {
@@ -262,34 +195,49 @@ pub fn dispatch(
                 _ => {}
             }
 
-            let reason_str = payload.reason.as_deref().unwrap_or("unknown").to_string();
-            let content = redact::redact(&format!(
-                "Session ended ({}). Project: {}",
-                reason_str, project_id
-            ));
+            let transcript_path = match payload.transcript_path.as_deref() {
+                Some(p) => p,
+                None => return Ok(DispatchOutcome::Skipped("no_transcript_path")),
+            };
+
+            let raw_text = match extract_last_assistant_text(transcript_path, 1) {
+                Some(t) => t,
+                None => return Ok(DispatchOutcome::Skipped("no_assistant_message")),
+            };
+
+            let redacted = redact::redact(&raw_text);
+
+            // Truncate to SESSION_SUMMARY_MAX bytes on a safe char boundary.
+            let truncated = if redacted.len() > SESSION_SUMMARY_MAX {
+                let cut = redacted.floor_char_boundary(SESSION_SUMMARY_MAX);
+                format!("{}…", &redacted[..cut])
+            } else {
+                redacted
+            };
+
             let branch = current_branch();
-            let tags = vec!["hook", "session_end", reason_str.as_str()];
 
             if dry_run {
                 return Ok(DispatchOutcome::DryRun(format!(
-                    "SessionEnd: would store Fact (reason={})",
-                    reason_str
+                    "SessionEnd: would store session-summary Fact from transcript (branch={:?}): {}",
+                    branch,
+                    &truncated[..truncated.floor_char_boundary(80)]
                 )));
             }
 
-            let id = store_memory(
+            let outcome = store_memory(
                 db,
                 embedding_service,
                 project_id,
-                &content,
+                &truncated,
                 MemoryType::Fact,
-                &tags,
-                0.3,
+                &["hook", "session_summary"],
+                hook_importance_cap(0.4),
                 branch.as_deref(),
                 false,
                 false,
             )?;
-            Ok(DispatchOutcome::Stored(id))
+            Ok(outcome_to_dispatch(outcome))
         }
 
         HookEvent::SubagentStop => {
@@ -315,91 +263,64 @@ pub fn dispatch(
                 )));
             }
 
-            let id = store_memory(
+            let outcome = store_memory(
                 db,
                 embedding_service,
                 project_id,
                 &content,
                 MemoryType::Fact,
                 &tags,
-                0.55,
+                hook_importance_cap(0.55),
                 branch.as_deref(),
                 false,
                 false,
             )?;
-            Ok(DispatchOutcome::Stored(id))
+            Ok(outcome_to_dispatch(outcome))
         }
     }
 }
 
 // ---- private helpers ----
 
-/// Store a handoff if branch is `Some`, falling back to a plain Fact on `InvalidType` or `None` branch.
-#[allow(clippy::too_many_arguments)]
-fn store_handoff_or_fact(
-    db: &Database,
-    embedding_service: Option<&EmbeddingService>,
-    project_id: &str,
-    summary: &str,
-    branch: Option<&str>,
-    importance: f64,
-    pinned: bool,
-    fallback_tags: &[&str],
-) -> Result<uuid::Uuid, MemoryError> {
-    if let Some(b) = branch
-        && let Some(es) = embedding_service
-    {
-        let sections = HandoffSections {
-            summary: summary.to_string(),
-            decisions: vec![],
-            todos: vec![],
-            blockers: vec![],
-            mental_model: String::new(),
-            next_steps: vec![],
-            notes: None,
-            continues_from: None,
-        };
-        match create_handoff(
-            db,
-            es,
-            project_id,
-            Some(b),
-            sections,
-            importance,
-            pinned,
-            true,
-        ) {
-            Ok(result) => {
-                let id: uuid::Uuid = result
-                    .id
-                    .trim_start_matches("mem_")
-                    .parse()
-                    .unwrap_or_else(|_| uuid::Uuid::new_v4());
-                return Ok(id);
-            }
-            Err(MemoryError::InvalidType(_)) => {
-                // Fall through to plain Fact store
-            }
-            Err(e) => return Err(e),
-        }
-    }
+/// Maximum bytes of transcript text to store in a session-summary memory.
+const SESSION_SUMMARY_MAX: usize = 4000;
 
-    // Plain Fact fallback (no branch, or InvalidType from create_handoff)
-    store_memory(
-        db,
-        embedding_service,
-        project_id,
-        summary,
-        MemoryType::Fact,
-        fallback_tags,
-        importance,
-        branch,
-        pinned,
-        false,
-    )
+/// Hard-clamp importance to a maximum of 0.5 for all hook-stored memories.
+/// Manual `memory_store` calls must always be able to outrank passive hook captures.
+fn hook_importance_cap(raw: f64) -> f64 {
+    raw.clamp(0.0, 0.5)
 }
 
-/// Build and store a `Memory`, then store its embedding if `embedding_service` is available.
+/// Convert a `StoreOutcome` to a `DispatchOutcome`.
+///
+/// For `Stored` and `Merged`, the uuid is extracted from the `"mem_<uuid>"` id by
+/// stripping the `"mem_"` prefix and parsing. Failures fall back to a new random UUID.
+fn outcome_to_dispatch(outcome: StoreOutcome) -> DispatchOutcome {
+    match outcome {
+        StoreOutcome::Stored(full_id) | StoreOutcome::Merged { id: full_id, .. } => {
+            let uuid = full_id
+                .strip_prefix("mem_")
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "hook store returned non-standard memory id {:?}; emitting random uuid",
+                        full_id
+                    );
+                    uuid::Uuid::new_v4()
+                });
+            DispatchOutcome::Stored(uuid)
+        }
+        StoreOutcome::SkippedSimilar { .. } => DispatchOutcome::Skipped("dedup_similar"),
+    }
+}
+
+/// Build and store a `Memory`, routing through `store_with_dedup`.
+///
+/// When `embedding_service` is `Some`, the embedding is computed and dedup is applied:
+/// - the hook-specific skip threshold suppresses storage of near-identical memories.
+/// - the MCP dedup threshold controls when two memories are merged.
+///
+/// When `embedding_service` is `None`, the memory is stored without dedup or embedding.
 #[allow(clippy::too_many_arguments)]
 fn store_memory(
     db: &Database,
@@ -412,9 +333,8 @@ fn store_memory(
     branch: Option<&str>,
     pinned: bool,
     global: bool,
-) -> Result<uuid::Uuid, MemoryError> {
-    let mem_uuid = uuid::Uuid::new_v4();
-    let id = format!("mem_{}", mem_uuid.simple());
+) -> Result<StoreOutcome, MemoryError> {
+    let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let now = chrono::Utc::now().timestamp();
 
     let summary = if should_auto_summarize(content, None) {
@@ -442,14 +362,20 @@ fn store_memory(
         global,
     };
 
-    db.store_memory(&memory)?;
-
     if let Some(es) = embedding_service {
         let embedding = es.embed_memory(memory_type, content)?;
-        db.store_embedding(&id, &embedding, es.model_version())?;
+        store_with_dedup(
+            db,
+            Some(es),
+            project_id,
+            memory,
+            Some(&embedding),
+            dedup_threshold(),
+            Some(filter::hook_dedup_skip_threshold()),
+        )
+    } else {
+        store_with_dedup(db, None, project_id, memory, None, 0.0, None)
     }
-
-    Ok(mem_uuid)
 }
 
 /// Detect the current git branch, identical logic to `cli.rs::get_current_branch`.
@@ -509,5 +435,72 @@ fn find_git_root() -> Option<std::path::PathBuf> {
         if !current.pop() {
             return None;
         }
+    }
+}
+
+/// Returns `true` if the tool response or exit code signals a failure.
+///
+/// Checks (in order of reliability):
+/// 1. `resp` is a JSON object with a non-empty `error` or `stderr` string field.
+/// 2. `resp` is a JSON object with a nested numeric `exit_code`, `returncode`, or `code` field != 0.
+/// 3. Top-level `exit_code` is `Some(c)` with `c != 0` (UNVERIFIED: not a guaranteed field).
+/// 4. Last resort: compact JSON serialization lowercased contains "error", "failed", or "panic".
+fn tool_response_indicates_failure(
+    resp: Option<&serde_json::Value>,
+    exit_code: Option<i32>,
+) -> bool {
+    if let Some(serde_json::Value::Object(map)) = resp {
+        // Check for non-empty error/stderr string fields
+        for key in &["error", "stderr"] {
+            if let Some(serde_json::Value::String(s)) = map.get(*key)
+                && !s.is_empty()
+            {
+                return true;
+            }
+        }
+
+        // Check for nested numeric exit code fields
+        for key in &["exit_code", "returncode", "code"] {
+            if let Some(serde_json::Value::Number(n)) = map.get(*key)
+                && n.as_i64().is_some_and(|v| v != 0)
+            {
+                return true;
+            }
+        }
+    }
+
+    // Top-level exit_code fallback (UNVERIFIED weak signal)
+    if exit_code.is_some_and(|c| c != 0) {
+        return true;
+    }
+
+    // Last resort: compact JSON string scan
+    if let Some(v) = resp
+        && let Ok(compact) = serde_json::to_string(v)
+    {
+        let lower = compact.to_lowercase();
+        if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Extract a human-readable error description from the tool response.
+fn extract_error_text(resp: Option<&serde_json::Value>, exit_code: Option<i32>) -> String {
+    if let Some(serde_json::Value::Object(map)) = resp {
+        for key in &["error", "stderr", "message"] {
+            if let Some(serde_json::Value::String(s)) = map.get(*key)
+                && !s.is_empty()
+            {
+                return s.clone();
+            }
+        }
+    }
+
+    match resp {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string()),
+        None => format!("exit_code={:?}", exit_code),
     }
 }

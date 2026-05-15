@@ -672,7 +672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Commands::Hooks { cmd } => {
-            cmd_hooks(cmd);
+            cmd_hooks(cmd, &db, &project_id);
         }
     }
 
@@ -2009,7 +2009,7 @@ fn cmd_handoff(
     Ok(())
 }
 
-fn cmd_hooks(cmd: HooksCmd) {
+fn cmd_hooks(cmd: HooksCmd, db: &Database, project_id: &str) {
     match cmd {
         HooksCmd::Install => match hooks::install::install() {
             Ok(report) => {
@@ -2083,6 +2083,20 @@ fn cmd_hooks(cmd: HooksCmd) {
                     println!("Shadowed (other hooks also registered for these events):");
                     for ev in &report.shadowed {
                         println!("  {}", ev);
+                    }
+                }
+                // Show today's hook capture count vs daily cap.
+                match db.count_hook_memories_today(project_id) {
+                    Ok(n) => {
+                        let cap = hooks::filter::hook_daily_cap();
+                        if cap == 0 {
+                            println!("Hook captures today: {} / unlimited", n);
+                        } else {
+                            println!("Hook captures today: {} / {}", n, cap);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("hooks status: could not query capture count: {}", e);
                     }
                 }
             }
