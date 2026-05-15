@@ -44,6 +44,8 @@ Or: `/mcp__engram__resume` from Claude Code.
 
 Each new handoff sets `continues_from` to the previous one on the same branch, forming a chain. `handoff_resume` walks the chain (depth 5, cycle-detected) and returns the top-scoring sections via hybrid similarity + recency. Sections automatically link to existing `decision` / `pattern` / `debug` memories at cosine ≥ 0.75.
 
+When a branch has only one handoff, `handoff_resume` supplements `linked_memories` with related `decision` / `pattern` / `debug` memories surfaced via vector search against the query — so even a fresh branch with a single capture comes back with cross-cutting context, not five slices of the same document.
+
 ## Installation
 
 ```bash
@@ -103,10 +105,14 @@ without any explicit tool calls. One-liner install:
 engram-cli hooks install
 ```
 
-This registers handlers for `UserPromptSubmit`, `PostToolUse`, `Stop`,
-`PreCompact`, `SessionEnd`, and `SubagentStop`. See
-[hooks/README.md](hooks/README.md) for the full per-event reference, env vars,
-and secret redaction details.
+This registers handlers for four lifecycle events: `UserPromptSubmit`,
+`PostToolUse`, `SubagentStop`, and `SessionEnd`. `Stop` and `PreCompact` are
+explicit no-ops (per-turn noise and mid-session duplicates of `SessionEnd`).
+All hook stores route through the same dedup path as `memory_store`, so
+near-identical captures are silently skipped (`ENGRAM_HOOK_DEDUP_SKIP`,
+default 0.95). A per-project daily cap (`ENGRAM_HOOK_DAILY_CAP`, default 50)
+prevents runaway logging. See [hooks/README.md](hooks/README.md) for the full
+per-event reference, env vars, and secret redaction details.
 
 ### Auto-load context on session start (Claude Code)
 
@@ -168,8 +174,9 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 - **Semantic deduplication** at store time (≥ 0.90 auto-merge) plus periodic background dedup
 - **Hierarchical clustering** with centroid-based retrieval at scale
 - **Relationship graphs** (`relates_to`, `supersedes`, `derived_from`, `contradicts`)
-- **Contradiction detection** flags conflicts at similarity > 0.85
+- **Contradiction detection** flags conflicts at cosine > 0.85, scoped to the same non-handoff `MemoryType` (cross-type and handoff-touching matches are suppressed to avoid topical-overlap false positives)
 - **Branch-aware queries** filter by git branch scope
+- **External artifacts**: memories can declare referenced files / URLs / identifiers via `external_artifacts`. Retrieval lists them inline and tags local paths with `[missing]` if absent on the server's filesystem
 - **Pre-filtered retrieval** caps embedding scans for performance at scale
 - **Import/export** for backup and migration
 
@@ -217,13 +224,15 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
   "tags": ["database", "api", "architecture"],
   "importance": 0.7,
   "pinned": true,
-  "global": false
+  "global": false,
+  "external_artifacts": ["docs/adr/0007-postgres.md", "https://github.com/foo/bar/pull/42"]
 }
 ```
 
 - `pinned: true` — never decays or gets pruned
 - `global: true` — visible in all projects (forces `branch` to null)
 - `importance` — 0.3 minor, 0.5 normal, 0.7 important, 0.9 critical
+- `external_artifacts` — optional list of file paths, URLs, or opaque IDs the memory references. Local-looking paths are existence-checked at retrieval and marked `[missing]` if absent. URLs and opaque IDs print unmarked (no network calls). Use `memory_update` with `[]` to clear; omit the field to preserve existing
 
 ### Querying
 
@@ -256,9 +265,14 @@ engram-cli context "auth refactor" --global
 # CRUD
 engram-cli store "The API uses rate limiting" -t fact --tags api,security
 engram-cli store "Always use snake_case" -t preference --pinned --global
+engram-cli store "Bench results show BM25 wins" -t fact \
+  --artifact benchmarks/longmemeval/RESULTS.md \
+  --artifact https://github.com/edg-l/engram-mcp/pull/42
 engram-cli show mem_abc123
 engram-cli list
 engram-cli update mem_abc123 -c "Updated content" --importance 0.9
+engram-cli update mem_abc123 --artifact /new/path.md          # replace artifact list
+engram-cli update mem_abc123 --clear-artifacts                # clear artifact list
 engram-cli delete mem_abc123
 
 # Pinning
@@ -294,6 +308,21 @@ engram-cli health
 | `ENGRAM_DECAY_INTERVAL` | Decay job interval (seconds) | `3600` (1 hour) |
 | `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
 | `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
+| `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (18 tools), `core` (11), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
+| `ENGRAM_HOOK_DEDUP_SKIP` | Similarity threshold above which hook captures are silently dropped (clamped to `[0.5, 1.0]`) | `0.95` |
+| `ENGRAM_HOOK_DAILY_CAP` | Max hook-captured memories per project per UTC day; `0` = unlimited | `50` |
+
+## Retrieval benchmark
+
+Retrieval quality on a 30-question seeded slice of [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval) (cleaned), full haystack ingested (~225–275 turn-pairs per question). See [benchmarks/longmemeval/RESULTS.md](benchmarks/longmemeval/RESULTS.md) for the full table, methodology, and caveats.
+
+| Mode | partial-R@5 | full-R@5 | MRR |
+|---|---:|---:|---:|
+| Vector | 50.0% | 23.3% | 0.326 |
+| BM25 | **93.3%** | **73.3%** | **0.883** |
+| Hybrid (RRF k=60, default) | 93.3% | 70.0% | 0.828 |
+
+LongMemEval queries reference specific entities, dates, and numbers in the haystack; FTS5 catches them exactly, which is why BM25 leads on this slice. Hybrid (Reciprocal Rank Fusion) is the published-best baseline and remains the default; flipping defaults on a 30-question slice would over-fit. The headline finding: **embedder tuning is the highest-leverage retrieval improvement on this workload, not the fusion algorithm.** Full 500-question run is future work.
 
 ## How it compares
 
