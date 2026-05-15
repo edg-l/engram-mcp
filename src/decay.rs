@@ -136,8 +136,10 @@ mod tests {
     ///
     /// The DB-level decay query (`update_relevance_scores`) filters `WHERE pinned = 0`,
     /// so pinned memories are exempt.  This test calls the real production function to
-    /// verify that invariant end-to-end.  rusqlite's bundled SQLite supports `EXP()` and
-    /// `LN()`, so no stub is needed.
+    /// verify that invariant end-to-end.  `Database::open` and `Database::open_in_memory`
+    /// both register `EXP()` and `LN()` as custom scalar functions via
+    /// `register_math_scalar_functions` (see `src/db/mod.rs`), so the SQL in
+    /// `update_relevance_scores` works on both in-memory and on-disk databases.
     #[test]
     fn decay_skips_pinned_handoff() {
         let db = crate::db::Database::open_in_memory().unwrap();

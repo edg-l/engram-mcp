@@ -118,6 +118,35 @@ pub struct Database {
     pub(super) conn: Arc<Mutex<Connection>>,
 }
 
+/// Register `EXP()` and `LN()` as scalar functions on the given connection.
+///
+/// The bundled SQLite is not compiled with `SQLITE_ENABLE_MATH_FUNCTIONS`, so the
+/// `update_relevance_scores` decay query (which calls `EXP()` and `LN()` directly in
+/// SQL) would otherwise fail with `no such function`. Must be called on every
+/// connection used by `Database`, in both production (`open`) and test
+/// (`open_in_memory`) constructors.
+fn register_math_scalar_functions(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.create_scalar_function(
+        "EXP",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let x: f64 = ctx.get(0)?;
+            Ok(x.exp())
+        },
+    )?;
+    conn.create_scalar_function(
+        "LN",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let x: f64 = ctx.get(0)?;
+            Ok(x.ln())
+        },
+    )?;
+    Ok(())
+}
+
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MemoryError> {
         let conn = Connection::open(path)?;
@@ -126,6 +155,7 @@ impl Database {
              PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 3000;",
         )?;
+        register_math_scalar_functions(&conn)?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -140,27 +170,7 @@ impl Database {
             "PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 3000;",
         )?;
-        // The bundled SQLite is not compiled with SQLITE_ENABLE_MATH_FUNCTIONS, so EXP()
-        // and LN() are unavailable.  Register them as custom scalar functions so that
-        // update_relevance_scores works correctly in test builds.
-        conn.create_scalar_function(
-            "EXP",
-            1,
-            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let x: f64 = ctx.get(0)?;
-                Ok(x.exp())
-            },
-        )?;
-        conn.create_scalar_function(
-            "LN",
-            1,
-            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let x: f64 = ctx.get(0)?;
-                Ok(x.ln())
-            },
-        )?;
+        register_math_scalar_functions(&conn)?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
