@@ -8,6 +8,64 @@ use std::sync::Arc;
 use crate::memory::HandoffSections;
 
 // ============================================
+// ToolProfile
+// ============================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolProfile {
+    #[default]
+    Full,
+    Core,
+    Minimal,
+}
+
+impl std::str::FromStr for ToolProfile {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "core" => Ok(Self::Core),
+            "minimal" => Ok(Self::Minimal),
+            other => Err(format!(
+                "unknown ToolProfile {other:?}; expected full|core|minimal"
+            )),
+        }
+    }
+}
+
+const MINIMAL_TOOLS: &[&str] = &["memory_context", "memory_store", "handoff_resume"];
+
+const CORE_TOOLS: &[&str] = &[
+    "memory_context",
+    "memory_store",
+    "handoff_resume",
+    "memory_query",
+    "memory_update",
+    "memory_delete",
+    "memory_link",
+    "memory_graph",
+    "handoff_create",
+    "memory_store_batch",
+    "memory_delete_batch",
+];
+
+fn filter_by_name(all: &[Tool], names: &[&str]) -> Vec<Tool> {
+    all.iter()
+        .filter(|t| names.contains(&&*t.name))
+        .cloned()
+        .collect()
+}
+
+pub fn get_tool_definitions_for(profile: ToolProfile) -> Vec<Tool> {
+    let all = get_tool_definitions();
+    match profile {
+        ToolProfile::Full => all,
+        ToolProfile::Core => filter_by_name(&all, CORE_TOOLS),
+        ToolProfile::Minimal => filter_by_name(&all, MINIMAL_TOOLS),
+    }
+}
+
+// ============================================
 // Default helpers for serde
 // ============================================
 
@@ -107,6 +165,9 @@ pub struct MemoryStoreInput {
     /// Make this memory visible across all projects. Global memories always have branch=null.
     #[serde(default)]
     pub global: bool,
+    /// Optional list of external artifact references (file paths, URLs, ticket IDs).
+    #[serde(default)]
+    pub external_artifacts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +202,8 @@ pub struct MemoryUpdateInput {
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
     pub pinned: Option<bool>,
+    /// Replace external_artifacts list. Pass empty array to clear; omit to preserve existing.
+    pub external_artifacts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,7 +384,12 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "related_to": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs this relates to. Creates 'relates_to' links."},
                     "branch": {"type": "string", "description": "Git branch scope. Omit for global (visible everywhere), 'auto' for current branch only, or an explicit branch name."},
                     "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."},
-                    "global": {"type": "boolean", "description": "Make this memory visible across all projects. Global memories always have branch=null."}
+                    "global": {"type": "boolean", "description": "Make this memory visible across all projects. Global memories always have branch=null."},
+                    "external_artifacts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of external artifact references (file paths, URLs, ticket IDs). Strings are surfaced at retrieval. Local-looking paths (absolute, ./ or ../, or drive-letter) are checked for existence and marked `[missing]` if absent on the server's filesystem."
+                    }
                 },
                 "required": ["content", "type"]
             })),
@@ -372,7 +440,12 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "New importance level."},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces old)."},
                     "summary": {"type": "string", "description": "New summary (replaces old)."},
-                    "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."}
+                    "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."},
+                    "external_artifacts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replace external_artifacts list. Pass empty array to clear; omit to preserve existing."
+                    }
                 },
                 "required": ["id"]
             })),
@@ -437,7 +510,12 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                                 "type": {"type": "string", "enum": ["fact", "decision", "preference", "pattern", "debug", "entity"]},
                                 "tags": {"type": "array", "items": {"type": "string"}},
                                 "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                                "summary": {"type": "string"}
+                                "summary": {"type": "string"},
+                                "external_artifacts": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Optional list of external artifact references (file paths, URLs, ticket IDs). Strings are surfaced at retrieval. Local-looking paths (absolute, ./ or ../, or drive-letter) are checked for existence and marked `[missing]` if absent on the server's filesystem."
+                                }
                             },
                             "required": ["content", "type"]
                         },
@@ -528,10 +606,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "properties": {
                             "summary": {"type": "string", "description": "High-level summary of the session."},
                             "decisions": {"type": "array", "items": {"type": "string"}, "description": "Key decisions made."},
-                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Outstanding action items."},
-                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Known blockers."},
+                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items."},
+                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Things preventing forward motion right now (missing access, failing dependency, unanswered question)."},
                             "mental_model": {"type": "string", "description": "Architecture or context the next session needs."},
-                            "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Concrete next steps."},
+                            "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup."},
                             "notes": {"type": "string", "description": "Freeform notes (optional)."},
                             "continues_from": {"type": "string", "description": "ID of the handoff this continues from (optional)."}
                         },

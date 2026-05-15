@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -20,12 +22,56 @@ use super::schemas::{
     HandoffCreateInput, HandoffResumeInput, HandoffSearchInput, MemoryContextInput,
     MemoryDedupInput, MemoryDeleteBatchInput, MemoryDeleteInput, MemoryExportInput,
     MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryPromoteInput, MemoryPruneInput,
-    MemoryQueryInput, MemoryStoreBatchInput, MemoryStoreInput, MemoryUpdateInput, dedup_threshold,
+    MemoryQueryInput, MemoryStoreBatchInput, MemoryStoreInput, MemoryUpdateInput, ToolProfile,
+    dedup_threshold, get_tool_definitions_for,
 };
 use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
     compute_tag_boost, rrf_fuse,
 };
+
+// ============================================
+// Per-process profile + once-warning
+// ============================================
+
+/// Active tool profile for this process. Initialized on first dispatch from
+/// the ENGRAM_MCP_TOOL_PROFILE env var (mirrors the read in MemoryServer::new).
+static ACTIVE_PROFILE: OnceLock<ToolProfile> = OnceLock::new();
+
+fn active_profile() -> ToolProfile {
+    *ACTIVE_PROFILE.get_or_init(|| {
+        std::env::var("ENGRAM_MCP_TOOL_PROFILE")
+            .ok()
+            .and_then(|raw| raw.parse::<ToolProfile>().ok())
+            .unwrap_or_default()
+    })
+}
+
+static WARNED_TOOLS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Tool names advertised under the active profile, cached on first dispatch to
+/// avoid rebuilding the full `Vec<Tool>` (with all JSON schema payloads) on
+/// every call.
+static ADVERTISED_NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+
+fn advertised_names() -> &'static HashSet<String> {
+    ADVERTISED_NAMES.get_or_init(|| {
+        get_tool_definitions_for(active_profile())
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    })
+}
+
+fn warn_unavailable_once(tool: &str, profile: ToolProfile) {
+    let set = WARNED_TOOLS.get_or_init(|| Mutex::new(HashSet::new()));
+    let is_new = set.lock().unwrap().insert(tool.to_string());
+    if is_new {
+        eprintln!(
+            "[engram] tool '{tool}' is not advertised under profile {profile:?} but was dispatched; this name may be hidden from future MCP `tools/list` responses."
+        );
+    }
+}
 
 // ============================================
 // Result structs
@@ -183,6 +229,11 @@ impl ToolHandler {
     }
 
     pub fn handle_tool(&self, name: &str, arguments: Value) -> Result<Value, MemoryError> {
+        // Warn once per process if a tool is called that isn't advertised under the active profile.
+        if !advertised_names().contains(name) {
+            warn_unavailable_once(name, active_profile());
+        }
+
         match name {
             "memory_store" => self.memory_store(arguments),
             "memory_query" => self.memory_query(arguments),
@@ -253,6 +304,7 @@ impl ToolHandler {
             last_accessed_at: now,
             branch: branch.clone(),
             merged_from: None,
+            external_artifacts: input.external_artifacts,
             pinned: input.pinned,
             global: input.global,
         };
@@ -318,8 +370,7 @@ impl ToolHandler {
             }
         };
 
-        // Check for contradictions using pre-fetched embeddings, excluding self and merged duplicate.
-        // Handoffs encode evolving session state; suppress contradiction warnings.
+        // Contradictions are only meaningful within the same non-handoff type; handoffs are session snapshots and warrant no warning either way.
         let mut potential_contradictions: Vec<PotentialContradiction> = Vec::new();
         const CONTRADICTION_THRESHOLD: f32 = 0.85;
         let merged_id: Option<&str> = merge_info.as_ref().map(|mi| mi.merged_with.as_str());
@@ -332,10 +383,17 @@ impl ToolHandler {
                 if merged_id == Some(existing_id.as_str()) {
                     continue; // Skip the merged-away duplicate
                 }
+                let Some(existing_memory) = pre_store_memories.get(existing_id) else {
+                    continue; // Defensive: embedding exists but memory row missing
+                };
+                if existing_memory.memory_type == MemoryType::Handoff {
+                    continue; // Handoff on the existing side: skip
+                }
+                if existing_memory.memory_type != memory_type {
+                    continue; // Cross-type: not a meaningful contradiction
+                }
                 let similarity = cosine_similarity(&embedding, existing_vec);
-                if similarity >= CONTRADICTION_THRESHOLD
-                    && let Some(existing_memory) = pre_store_memories.get(existing_id)
-                {
+                if similarity >= CONTRADICTION_THRESHOLD {
                     potential_contradictions.push(PotentialContradiction {
                         memory_id: existing_id.clone(),
                         summary: existing_memory
@@ -807,6 +865,19 @@ impl ToolHandler {
             memory.pinned = pinned;
         }
 
+        // external_artifacts update semantics:
+        //   - input.external_artifacts is None  -> preserve existing (omit = keep)
+        //   - input.external_artifacts is Some([]) -> clear (empty array = delete)
+        //   - input.external_artifacts is Some([a, b, ...]) -> replace with new list
+        if let Some(artifacts) = input.external_artifacts {
+            if artifacts.is_empty() {
+                memory.external_artifacts = None;
+            } else {
+                memory.external_artifacts = Some(artifacts);
+            }
+        }
+        // If None: leave memory.external_artifacts unchanged (preserves whatever was loaded from DB).
+
         // (d) For Handoff memories with new content: write memory row + full-content embedding +
         // sidecar in one transaction so a partial failure cannot leave them out of sync.
         // For all other cases fall back to the regular single-table update.
@@ -1083,6 +1154,7 @@ impl ToolHandler {
                 last_accessed_at: now,
                 branch,
                 merged_from: None,
+                external_artifacts: mem_input.external_artifacts,
                 pinned: mem_input.pinned,
                 global: mem_input.global,
             };

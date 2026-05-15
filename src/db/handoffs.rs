@@ -319,7 +319,7 @@ impl Database {
                 let mut stmt = conn.prepare(
                     "SELECT id, project_id, memory_type, content, summary, tags, importance,
                             relevance_score, access_count, created_at, updated_at,
-                            last_accessed_at, branch, merged_from, pinned, global
+                            last_accessed_at, branch, merged_from, pinned, global, external_artifacts
                      FROM memories
                      WHERE project_id = ?1 AND memory_type = 'handoff'
                      ORDER BY created_at DESC
@@ -347,6 +347,9 @@ impl Database {
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         pinned: row.get::<_, i64>(14)? != 0,
                         global: row.get::<_, i64>(15)? != 0,
+                        external_artifacts: row
+                            .get::<_, Option<String>>(16)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -356,7 +359,7 @@ impl Database {
                 let mut stmt = conn.prepare(
                     "SELECT id, project_id, memory_type, content, summary, tags, importance,
                             relevance_score, access_count, created_at, updated_at,
-                            last_accessed_at, branch, merged_from, pinned, global
+                            last_accessed_at, branch, merged_from, pinned, global, external_artifacts
                      FROM memories
                      WHERE project_id = ?1 AND memory_type = 'handoff'
                        AND (branch IS NULL OR branch = ?3)
@@ -385,6 +388,9 @@ impl Database {
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         pinned: row.get::<_, i64>(14)? != 0,
                         global: row.get::<_, i64>(15)? != 0,
+                        external_artifacts: row
+                            .get::<_, Option<String>>(16)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()

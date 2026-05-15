@@ -65,9 +65,15 @@ impl Database {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let artifacts_json: Option<String> = memory
+            .external_artifacts
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(serde_json::to_string)
+            .transpose()?;
         conn.execute(
-            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 memory.id,
                 memory.project_id,
@@ -85,6 +91,7 @@ impl Database {
                 merged_from_json,
                 memory.pinned as i64,
                 memory.global as i64,
+                artifacts_json,
             ],
         )?;
         Ok(())
@@ -93,7 +100,7 @@ impl Database {
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
              FROM memories WHERE id = ?1"
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -121,6 +128,9 @@ impl Database {
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 pinned: row.get::<_, i64>(14)? != 0,
                 global: row.get::<_, i64>(15)? != 0,
+                external_artifacts: row
+                    .get::<_, Option<String>>(16)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             }))
         } else {
             Ok(None)
@@ -130,9 +140,16 @@ impl Database {
     pub fn update_memory(&self, memory: &Memory) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
         let tags_json = serde_json::to_string(&memory.tags)?;
+        // Store NULL for None or empty vec (treat empty as clear); non-empty vec as JSON.
+        let artifacts_json: Option<String> = memory
+            .external_artifacts
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(serde_json::to_string)
+            .transpose()?;
         conn.execute(
-            "UPDATE memories SET content = ?1, summary = ?2, tags = ?3, importance = ?4, relevance_score = ?5, access_count = ?6, updated_at = ?7, last_accessed_at = ?8, pinned = ?9, global = ?10
-             WHERE id = ?11",
+            "UPDATE memories SET content = ?1, summary = ?2, tags = ?3, importance = ?4, relevance_score = ?5, access_count = ?6, updated_at = ?7, last_accessed_at = ?8, pinned = ?9, global = ?10, external_artifacts = ?11
+             WHERE id = ?12",
             params![
                 memory.content,
                 memory.summary,
@@ -144,6 +161,7 @@ impl Database {
                 memory.last_accessed_at,
                 memory.pinned as i64,
                 memory.global as i64,
+                artifacts_json,
                 memory.id,
             ],
         )?;
@@ -190,7 +208,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         let mut sql = String::from(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
              FROM memories WHERE project_id = ?1"
         );
 
@@ -254,6 +272,9 @@ impl Database {
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 pinned: row.get::<_, i64>(14)? != 0,
                 global: row.get::<_, i64>(15)? != 0,
+                external_artifacts: row
+                    .get::<_, Option<String>>(16)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             })
         }
 
@@ -396,7 +417,7 @@ impl Database {
         // Build query with placeholders
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
              FROM memories WHERE id IN ({})",
             placeholders.join(",")
         );
@@ -429,6 +450,9 @@ impl Database {
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 pinned: row.get::<_, i64>(14)? != 0,
                 global: row.get::<_, i64>(15)? != 0,
+                external_artifacts: row
+                    .get::<_, Option<String>>(16)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             })
         })?;
 
@@ -498,7 +522,7 @@ impl Database {
     ) -> Result<Vec<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global
+            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
              FROM memories WHERE project_id = ?1
              ORDER BY access_count DESC
              LIMIT ?2",
@@ -525,6 +549,9 @@ impl Database {
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 pinned: row.get::<_, i64>(14)? != 0,
                 global: row.get::<_, i64>(15)? != 0,
+                external_artifacts: row
+                    .get::<_, Option<String>>(16)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())

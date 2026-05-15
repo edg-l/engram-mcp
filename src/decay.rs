@@ -61,6 +61,7 @@ mod tests {
             last_accessed_at: now - (days_ago * 86400),
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         }
@@ -168,6 +169,7 @@ mod tests {
             last_accessed_at: far_past,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: true,
             global: false,
         };
@@ -188,6 +190,7 @@ mod tests {
             last_accessed_at: far_past,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         };

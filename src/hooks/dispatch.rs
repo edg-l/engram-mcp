@@ -358,6 +358,7 @@ fn store_memory(
         last_accessed_at: now,
         branch: branch.map(String::from),
         merged_from: None,
+        external_artifacts: None,
         pinned,
         global,
     };

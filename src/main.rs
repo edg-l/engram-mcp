@@ -32,7 +32,8 @@ use tracing_subscriber::{self, EnvFilter};
 use crate::db::Database;
 use crate::embedding::EmbeddingService;
 use crate::error::MemoryError;
-use crate::tools::{ToolHandler, get_tool_definitions, parse_search_mode};
+use crate::tools::schemas::{ToolProfile, get_tool_definitions_for};
+use crate::tools::{ToolHandler, parse_search_mode};
 
 /// Find the git repository root by walking up from current directory.
 /// Returns None if not in a git repository.
@@ -450,15 +451,27 @@ struct MemoryServer {
     db_path: PathBuf,
     project_id: String,
     current_branch: Option<String>,
+    tool_profile: ToolProfile,
 }
 
 impl MemoryServer {
     fn new(db_path: PathBuf, project_id: String, current_branch: Option<String>) -> Self {
+        let tool_profile = std::env::var("ENGRAM_MCP_TOOL_PROFILE")
+            .ok()
+            .and_then(|raw| match raw.parse::<ToolProfile>() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[engram] {e}; falling back to Full");
+                    None
+                }
+            })
+            .unwrap_or_default();
         Self {
             tool_handler: Arc::new(RwLock::new(None)),
             db_path,
             project_id,
             current_branch,
+            tool_profile,
         }
     }
 
@@ -509,7 +522,11 @@ impl ServerHandler for MemoryServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async move { Ok(ListToolsResult::with_all_items(get_tool_definitions())) }
+        async move {
+            Ok(ListToolsResult::with_all_items(get_tool_definitions_for(
+                self.tool_profile,
+            )))
+        }
     }
 
     fn call_tool(

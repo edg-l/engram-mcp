@@ -97,6 +97,9 @@ enum Commands {
         /// Make this memory visible across all projects (forces branch=null)
         #[arg(long)]
         global: bool,
+        /// External artifact references (file paths, URLs, ticket IDs). Repeatable.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<String>,
     },
     /// Delete a memory
     Delete {
@@ -119,6 +122,12 @@ enum Commands {
         /// New summary
         #[arg(short, long)]
         summary: Option<String>,
+        /// Replace external artifact list. Repeatable. Pass once with empty string to clear.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<String>,
+        /// Clear all external artifacts (sets list to empty).
+        #[arg(long)]
+        clear_artifacts: bool,
     },
     /// Link two memories
     Link {
@@ -245,16 +254,16 @@ enum HandoffCmd {
         /// Key decisions made (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         decisions: Vec<String>,
-        /// Outstanding todo items (can be repeated or comma-separated)
+        /// Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         todos: Vec<String>,
-        /// Known blockers (can be repeated or comma-separated)
+        /// Things preventing forward motion right now (missing access, failing dependency, unanswered question). (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         blockers: Vec<String>,
         /// Architecture/context needed by the next session
         #[arg(long)]
         mental_model: Option<String>,
-        /// Concrete next steps (can be repeated or comma-separated)
+        /// Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup. (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         next_steps: Vec<String>,
         /// Freeform notes (optional)
@@ -519,6 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             branch,
             pinned,
             global,
+            artifacts,
         } => {
             cmd_store(
                 &db,
@@ -533,6 +543,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_branch.as_deref(),
                 pinned,
                 global,
+                if artifacts.is_empty() {
+                    None
+                } else {
+                    Some(artifacts)
+                },
             )?;
         }
         Commands::Delete { id } => {
@@ -544,7 +559,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             importance,
             tags,
             summary,
+            artifacts,
+            clear_artifacts,
         } => {
+            // external_artifacts semantics for CLI:
+            //   --clear-artifacts       -> Some([]) (clear)
+            //   --artifact PATH ...     -> Some([PATH, ...]) (replace)
+            //   neither flag            -> None (preserve)
+            let external_artifacts = if clear_artifacts {
+                Some(Vec::new())
+            } else if !artifacts.is_empty() {
+                Some(artifacts)
+            } else {
+                None
+            };
             cmd_update(
                 &db,
                 embedding_service.as_ref().unwrap(),
@@ -553,6 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 importance,
                 tags,
                 summary,
+                external_artifacts,
             )?;
         }
         Commands::Link {
@@ -935,6 +964,7 @@ fn cmd_store(
     current_branch: Option<&str>,
     pinned: bool,
     global: bool,
+    external_artifacts: Option<Vec<String>>,
 ) -> Result<(), MemoryError> {
     let memory_type: MemoryType = type_str
         .parse()
@@ -980,6 +1010,7 @@ fn cmd_store(
         last_accessed_at: now,
         branch: branch.clone(),
         merged_from: None,
+        external_artifacts,
         pinned,
         global,
     };
@@ -1008,6 +1039,7 @@ fn cmd_delete(db: &Database, id: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_update(
     db: &Database,
     embedding_service: &EmbeddingService,
@@ -1016,6 +1048,7 @@ fn cmd_update(
     importance: Option<f64>,
     tags: Option<String>,
     summary: Option<String>,
+    external_artifacts: Option<Vec<String>>,
 ) -> Result<(), MemoryError> {
     let mut memory = db
         .get_memory(id)?
@@ -1045,6 +1078,15 @@ fn cmd_update(
 
     if let Some(sum) = summary {
         memory.summary = Some(sum);
+    }
+
+    // external_artifacts: None = preserve, Some([]) = clear, Some([...]) = replace
+    if let Some(artifacts) = external_artifacts {
+        if artifacts.is_empty() {
+            memory.external_artifacts = None;
+        } else {
+            memory.external_artifacts = Some(artifacts);
+        }
     }
 
     db.update_memory(&memory)?;

@@ -9,16 +9,16 @@ One to three sentences. What was this session about? What is the single most imp
 List each architectural or design choice made this session. Format: what was decided AND why. Include trade-offs that were weighed. Omit trivial choices.
 
 **todos**
-Unfinished action items that must happen next. Each item should be specific enough that the next session can act on it without additional context. Include file paths or function names where relevant.
+Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items.
 
 **blockers**
-Anything that stopped or would stop forward progress. Include: missing information, external dependencies, unresolved errors, or decisions that need user input. If none, omit this section.
+Things preventing forward motion right now (missing access, failing dependency, unanswered question).
 
 **mental_model**
 The architectural understanding needed to continue this work: how the relevant subsystems fit together, invariants the code relies on, non-obvious constraints. Write for an agent with no memory of this session. One to five sentences or a short bulleted list.
 
 **next_steps**
-The ordered sequence of concrete actions for the next session to take. Item 1 should be the exact first thing to do. Be specific about which file, function, or command.
+Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 
 **notes**
 Freeform notes that don't fit elsewhere: environment quirks, partial workarounds, references, or anything a fresh agent would find useful. Optional — omit if empty.

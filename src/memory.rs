@@ -76,13 +76,13 @@ pub struct HandoffSections {
     pub summary: String,
     /// Key decisions made during the session (each item is one decision).
     pub decisions: Vec<String>,
-    /// Outstanding action items (each item is one todo).
+    /// Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items.
     pub todos: Vec<String>,
-    /// Known blockers preventing progress (each item is one blocker).
+    /// Things preventing forward motion right now (missing access, failing dependency, unanswered question).
     pub blockers: Vec<String>,
     /// Mental model: architecture, invariants, or context the next session needs.
     pub mental_model: String,
-    /// Concrete next steps to take in the following session.
+    /// Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
     pub next_steps: Vec<String>,
     /// Freeform notes that don't fit the other sections (optional).
     pub notes: Option<String>,
@@ -384,6 +384,11 @@ pub struct Memory {
     /// Provenance tracking: IDs and previews of memories that were merged into this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_from: Option<Vec<MergeSource>>,
+    /// Optional list of external artifact references (file paths, URLs, ticket IDs).
+    /// Surfaced at retrieval; local-looking paths are checked for existence and marked
+    /// `[missing]` if absent on the server's filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_artifacts: Option<Vec<String>>,
     /// Whether this memory is pinned (exempt from decay and auto-prune).
     #[serde(default)]
     pub pinned: bool,

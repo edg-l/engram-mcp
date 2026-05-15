@@ -46,6 +46,7 @@ fn make_handoff_memory(
         last_accessed_at: now,
         branch: Some(branch.to_string()),
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: false,
     }

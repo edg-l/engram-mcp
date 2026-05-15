@@ -196,6 +196,27 @@ impl Database {
             )?;
         }
 
+        // Migration 5: add external_artifacts column (nullable JSON array of strings).
+        if current_version < 5 {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let has_col = stmt
+                .query_map([], |row| {
+                    let name: String = row.get(1)?;
+                    Ok(name)
+                })?
+                .filter_map(|r| r.ok())
+                .any(|name| name == "external_artifacts");
+
+            if !has_col {
+                conn.execute_batch("ALTER TABLE memories ADD COLUMN external_artifacts TEXT;")?;
+            }
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![5],
+            )?;
+        }
+
         Ok(())
     }
 }

@@ -71,6 +71,7 @@ pub fn build_fixture_with_dummy_embeddings(corpus_size: usize) -> BenchFixture {
                 last_accessed_at: now - i as i64,
                 branch: Some("main".to_string()),
                 merged_from: None,
+                external_artifacts: None,
                 pinned: false,
                 global: false,
             }
@@ -145,6 +146,7 @@ pub fn build_fixture_with_clusters(corpus_size: usize, num_clusters: usize) -> B
                 last_accessed_at: now - i as i64,
                 branch: Some("main".to_string()),
                 merged_from: None,
+                external_artifacts: None,
                 pinned: false,
                 global: false,
             }
@@ -252,6 +254,7 @@ pub fn build_fixture_real_embeddings(corpus_size: usize) -> BenchFixture {
                 last_accessed_at: now - i as i64,
                 branch: Some("main".to_string()),
                 merged_from: None,
+                external_artifacts: None,
                 pinned: false,
                 global: false,
             }

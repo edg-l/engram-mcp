@@ -2,9 +2,61 @@
 //!
 //! Converts JSON tool results into compact text for token-efficient LLM consumption.
 
+use std::path::Path;
+
 use crate::db::Database;
 use crate::memory::{HandoffSections, Memory};
 use serde_json::Value;
+
+/// Return true if `path` looks like a local filesystem path that should be
+/// existence-checked.  Heuristics:
+/// - Starts with `/` (Unix absolute)
+/// - Starts with `./` or `../` (relative)
+/// - Starts with a Windows drive letter followed by `:\` or `:/`
+fn is_local_looking(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with("./") || path.starts_with("../") {
+        return true;
+    }
+    // Windows drive letter: C:\ or C:/
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    false
+}
+
+/// Render the external_artifacts list for a `Memory` struct.
+///
+/// Each artifact is printed on its own line under `**Artifacts:**`.
+/// Local-looking paths are checked for existence; missing ones are suffixed with ` [missing]`.
+/// Non-local paths (URLs, ticket IDs, etc.) are printed as-is.
+///
+/// Returns an empty string if `artifacts` is `None` or empty.
+pub fn render_artifacts(artifacts: &Option<Vec<String>>) -> String {
+    let Some(list) = artifacts else {
+        return String::new();
+    };
+    if list.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n**Artifacts:**\n");
+    for path in list {
+        if is_local_looking(path) {
+            if Path::new(path).exists() {
+                out.push_str(&format!("- {}\n", path));
+            } else {
+                out.push_str(&format!("- {}  [missing]\n", path));
+            }
+        } else {
+            out.push_str(&format!("- {}\n", path));
+        }
+    }
+    out
+}
 
 /// Render a `Handoff` memory as a human-readable section-aware view.
 ///
@@ -138,6 +190,7 @@ fn format_memory_content_from_json_with_db(
         last_accessed_at: 0,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -296,6 +349,11 @@ fn compact_query(result: &Value, content_length: usize, db: Option<&Database>) -
         };
         out.push_str(&formatted_content);
         out.push('\n');
+        // Render external artifacts with existence check for local-looking paths.
+        let artifacts: Option<Vec<String>> = memory
+            .get("external_artifacts")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        out.push_str(&render_artifacts(&artifacts));
     }
 
     // Contradiction warnings
@@ -373,6 +431,11 @@ fn compact_context(result: &Value, content_length: usize, db: Option<&Database>)
         };
         out.push_str(&formatted_content);
         out.push('\n');
+        // Render external artifacts with existence check for local-looking paths.
+        let artifacts: Option<Vec<String>> = mem
+            .get("external_artifacts")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        out.push_str(&render_artifacts(&artifacts));
     }
 
     out

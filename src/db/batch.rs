@@ -20,9 +20,15 @@ impl Database {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let artifacts_json: Option<String> = memory
+                .external_artifacts
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(serde_json::to_string)
+                .transpose()?;
             tx.execute(
-                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO memories (id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     memory.id,
                     memory.project_id,
@@ -40,6 +46,7 @@ impl Database {
                     merged_from_json,
                     memory.pinned as i64,
                     memory.global as i64,
+                    artifacts_json,
                 ],
             )?;
             count += 1;

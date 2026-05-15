@@ -109,6 +109,7 @@ pub async fn ingest_question(
                 last_accessed_at: created_at,
                 branch: None,
                 merged_from: None,
+                external_artifacts: None,
                 pinned: false,
                 global: false,
             };

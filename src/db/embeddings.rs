@@ -412,6 +412,7 @@ mod tests {
             last_accessed_at: now,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         }

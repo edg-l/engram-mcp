@@ -45,6 +45,7 @@ async fn ingest_does_not_auto_dedup_near_identical_turn_pairs() {
             last_accessed_at: now,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         };

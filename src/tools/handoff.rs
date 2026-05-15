@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +117,7 @@ pub fn create_handoff(
         last_accessed_at: now,
         branch: Some(resolved_branch),
         merged_from: None,
+        external_artifacts: None,
         pinned,
         global: false,
     };
@@ -395,13 +396,82 @@ pub fn resume_handoff_with_vec(
         .collect();
 
     let linked_memories_map = db.get_memories_batch(&derived_target_ids)?;
-    let linked_memories: Vec<Memory> = derived_target_ids
+    let mut linked_memories: Vec<Memory> = derived_target_ids
         .iter()
         .filter_map(|id| linked_memories_map.get(id).cloned())
         .collect();
 
+    // Step 5b: single-handoff diversity backfill.
+    // When the chain contains only one handoff, there is no cross-handoff diversity in
+    // top_sections. If a query vector is available and the section budget has remaining
+    // slots, fill them with the highest-similarity Decision/Pattern/Debug memories.
+    let single_handoff = chain_ids.len() == 1;
+    let mut backfill_message: Option<String> = None;
+    if single_handoff
+        && let Some(qvec) = query_vec.as_ref()
+        && top_sections.len() < max_sections
+    {
+        let remaining_slots = max_sections - top_sections.len();
+
+        // IDs already represented — deduplicate against the chain and existing linked_memories.
+        let mut seen_ids: HashSet<String> = chain_ids.iter().cloned().collect();
+        for lm in &linked_memories {
+            seen_ids.insert(lm.id.clone());
+        }
+
+        let embeddings = db.get_all_embeddings_for_project_and_global(project_id)?;
+        let mems = db.get_all_memories_for_project(project_id)?;
+        let mem_map: HashMap<String, Memory> =
+            mems.into_iter().map(|m| (m.id.clone(), m)).collect();
+
+        const BACKFILL_TYPES: [MemoryType; 3] =
+            [MemoryType::Decision, MemoryType::Pattern, MemoryType::Debug];
+
+        let mut scored: Vec<(f32, String)> = embeddings
+            .into_iter()
+            .filter_map(|(id, vec)| {
+                if seen_ids.contains(&id) {
+                    return None;
+                }
+                let mem = mem_map.get(&id)?;
+                if !BACKFILL_TYPES.contains(&mem.memory_type) {
+                    return None;
+                }
+                // Branch filter: candidate must match the handoff branch or be global.
+                if let Some(ref hbranch) = resolved_branch {
+                    match &mem.branch {
+                        Some(mbranch) if mbranch == hbranch => {}
+                        None => {}        // global memory — always included
+                        _ => return None, // different branch
+                    }
+                }
+                let sim = cosine_similarity(qvec, &vec);
+                Some((sim, id))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut added = 0usize;
+        for (_, id) in scored.into_iter().take(remaining_slots) {
+            if let Some(mem) = mem_map.get(&id) {
+                linked_memories.push(mem.clone());
+                added += 1;
+            }
+        }
+
+        if added >= 1 {
+            backfill_message = Some(
+                "Single handoff on branch; supplemented with related decisions/patterns/debug memories."
+                    .to_string(),
+            );
+        }
+    }
+
     // Step 6: record access on latest handoff.
     let _ = db.record_access(&latest_id);
+
+    let final_message = backfill_message.or(message);
 
     Ok(HandoffResumeResult {
         branch: resolved_branch,
@@ -409,7 +479,7 @@ pub fn resume_handoff_with_vec(
         chain: chain_ids,
         top_sections,
         linked_memories,
-        message,
+        message: final_message,
     })
 }
 

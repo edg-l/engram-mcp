@@ -47,6 +47,7 @@ pub(super) fn insert_test_handoff(
         last_accessed_at: now,
         branch: Some(branch.to_string()),
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: false,
     };

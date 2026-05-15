@@ -19,7 +19,7 @@ You are resuming a work session. Call `handoff_resume` to load context from the 
 
 3. Summarize what you learned in two to four sentences covering:
    - What the previous session accomplished.
-   - What blockers or open questions exist.
+   - What blockers exist: things preventing forward motion right now (missing access, failing dependency, unanswered question).
    - The mental model needed to continue.
 
 4. Propose the next concrete action: the exact first step the user should take, referencing specific files, functions, or commands where possible.

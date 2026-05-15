@@ -109,6 +109,8 @@ engram-cli hooks install/uninstall/status  # manage Claude Code settings.json in
 ## Handoffs
 Section-based session capture (`summary, decisions, todos, blockers, mental_model, next_steps, notes`). Handoffs are branch-aware `MemoryType::Handoff` memories, pinned by default, with a `handoff_sections` sidecar table holding per-section embeddings (256-dim f32 LE, prefix-free). Branch chaining via `continues_from` lives in the sidecar only (not a graph edge). Auto-links to `decision/pattern/debug` memories at cosine similarity >= 0.75 (cap 10 links). Bypasses dedup and contradiction detection entirely. Two MCP prompts: `handoff` (capture) and `resume` (restore). CLI: `engram-cli handoff create/resume/search`.
 
+Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
+
 ## Config (env vars)
 - `ENGRAM_DB` - SQLite path (default: ~/.local/share/engram/memories.db)
 - `ENGRAM_PROJECT` - project scope (default: cwd name)
@@ -119,6 +121,7 @@ Section-based session capture (`summary, decisions, todos, blockers, mental_mode
 - `ENGRAM_HOOK_DAILY_CAP` - max hook-captured memories per project per UTC day; `0` = unlimited (default: 50)
 - `ENGRAM_HOOK_MIN_IMPORTANCE` - importance floor for hook captures (default: 0.5; values above 0.5 have no effect because dispatch caps importance at 0.5)
 - `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` - opt-in flag for the `UserPromptSubmit` hook (default off; even when on, captures require an explicit `#remember` cue)
+- `ENGRAM_MCP_TOOL_PROFILE` - advertised MCP tool surface: `full` (18 tools, default), `core` (11), or `minimal` (3: memory_context, memory_store, handoff_resume). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process.
 
 ## Commands
 ```bash

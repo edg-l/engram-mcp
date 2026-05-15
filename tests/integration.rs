@@ -55,6 +55,7 @@ fn test_full_memory_lifecycle() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -99,6 +100,7 @@ fn test_full_memory_lifecycle() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -166,6 +168,7 @@ fn test_relationship_graph() {
             last_accessed_at: now,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         },
@@ -184,6 +187,7 @@ fn test_relationship_graph() {
             last_accessed_at: now,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         },
@@ -202,6 +206,7 @@ fn test_relationship_graph() {
             last_accessed_at: now,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         },
@@ -277,6 +282,7 @@ fn test_memory_access_tracking() {
         last_accessed_at: now - 1000,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -383,6 +389,7 @@ fn test_prefilter_respects_cap_and_pinned_bypass() {
             last_accessed_at: now - (i as i64) * 100,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: is_pinned,
             global: false,
         };
@@ -463,6 +470,7 @@ fn test_global_memory_visible_cross_project() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: true,
     };
@@ -525,6 +533,7 @@ fn test_project_memory_invisible_cross_project() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -581,6 +590,7 @@ fn test_global_forces_branch_none() {
         last_accessed_at: now,
         branch: None, // global=true forces this to None
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: true,
     };
@@ -628,6 +638,7 @@ fn test_dedup_merge_direction_global_survives() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: true,
     };
@@ -650,6 +661,7 @@ fn test_dedup_merge_direction_global_survives() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -723,6 +735,7 @@ fn test_branch_mode_filtering() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -809,6 +822,7 @@ fn test_store_auto_dedup() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -890,6 +904,7 @@ fn test_cluster_assignment() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -972,6 +987,7 @@ fn test_recluster_merge() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1074,6 +1090,7 @@ fn test_pinned_skips_decay() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: false,
     };
@@ -1094,6 +1111,7 @@ fn test_pinned_skips_decay() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1152,6 +1170,7 @@ fn test_pinned_skips_prune() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: false,
     };
@@ -1203,6 +1222,7 @@ fn test_pin_unpin_toggle() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1257,6 +1277,7 @@ fn test_pinned_via_mcp_update() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1315,6 +1336,7 @@ fn make_dead_memory(
         last_accessed_at: created_at,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned,
         global,
     }
@@ -1451,6 +1473,7 @@ fn test_insights_get_most_accessed() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1510,6 +1533,7 @@ fn test_insights_get_never_accessed() {
         last_accessed_at: created_at,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1564,6 +1588,7 @@ fn test_insights_get_below_relevance() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1616,6 +1641,7 @@ fn test_insights_get_storage_rate() {
         last_accessed_at: created_at,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -1670,6 +1696,7 @@ fn test_insights_get_type_distribution() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };

@@ -348,6 +348,7 @@ fn import_old_export_without_sidecar_fields() {
         last_accessed_at: now,
         branch: Some("feat/old".to_string()),
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: false,
     };

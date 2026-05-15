@@ -38,6 +38,7 @@ fn test_memory_crud() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -56,7 +57,7 @@ fn test_memory_crud() {
 fn test_migration_creates_tables() {
     let db = Database::open_in_memory().unwrap();
 
-    // Verify schema_version table exists and has version 4
+    // Verify schema_version table exists and has version 5
     let conn = db.conn.lock().unwrap();
     let version: i64 = conn
         .query_row(
@@ -65,7 +66,7 @@ fn test_migration_creates_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 
     // Verify memory_clusters table exists
     let count: i64 = conn
@@ -148,6 +149,7 @@ fn test_run_migrations_twice_is_idempotent() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     })
@@ -192,6 +194,7 @@ fn test_merge_memories() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -255,6 +258,7 @@ fn test_cluster_operations() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -371,6 +375,7 @@ fn test_migration3_pinned_global_default_false() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
@@ -410,6 +415,7 @@ fn test_migration3_store_and_retrieve_pinned_global() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: true,
     };
@@ -500,6 +506,7 @@ fn test_migration3_project_stats_includes_counts() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned,
         global,
     };
@@ -573,6 +580,7 @@ fn make_handoff_memory(id: &str, project_id: &str, branch: Option<&str>) -> Memo
         last_accessed_at: now,
         branch: branch.map(str::to_string),
         merged_from: None,
+        external_artifacts: None,
         pinned: true,
         global: false,
     }
@@ -779,6 +787,7 @@ fn test_query_handoffs_by_branch() {
         last_accessed_at: now,
         branch: Some("feat/a".to_string()),
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     })
@@ -872,6 +881,7 @@ fn test_query_handoffs_unknown_type_propagates_error() {
                         .and_then(|s| serde_json::from_str(&s).ok()),
                     pinned: row.get::<_, i64>(14)? != 0,
                     global: row.get::<_, i64>(15)? != 0,
+                    external_artifacts: None,
                 })
             })
             .unwrap()
@@ -907,6 +917,7 @@ fn test_count_hook_memories_today() {
             last_accessed_at: now,
             branch: None,
             merged_from: None,
+            external_artifacts: None,
             pinned: false,
             global: false,
         };
@@ -929,6 +940,7 @@ fn test_count_hook_memories_today() {
         last_accessed_at: now,
         branch: None,
         merged_from: None,
+        external_artifacts: None,
         pinned: false,
         global: false,
     };
