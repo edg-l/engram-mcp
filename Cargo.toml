@@ -39,6 +39,8 @@ moka = { version = "0.12", features = ["sync"] }
 regex = "1"
 anyhow = "1"
 rand = "0.9"
+# tempfile remains in [dependencies] (not dev-deps) because the longmemeval-bench
+# [[bin]] uses tempfile::TempDir in non-test code (benchmarks/longmemeval/src/).
 tempfile = "3.27"
 
 [dev-dependencies]
