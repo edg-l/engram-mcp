@@ -1,5 +1,13 @@
 You are writing a session handoff. Gather the state of this session across the seven sections below, then call `handoff_create` with the structured data. Do NOT write the handoff to a file — call the tool directly.
 
+## Shape: summaries, not transcripts
+
+Each section is a SHORT SUMMARY meant to fit on a screen or two. Hard guidance:
+- Keep each section under ~5000 characters; individual list items under ~1000.
+- Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs into sections.
+- If long context matters, store it as a separate memory with `memory_store` (type `debug` / `pattern` / `decision`) — it will auto-link and surface in `handoff_resume` as `linked_memories`. Reference it from the section by a one-line description.
+- Oversized sections trigger an advisory warning in the response. The handoff is still saved, but treat the warning as a signal to split content out next time.
+
 ## Section guidance
 
 **summary** (required)

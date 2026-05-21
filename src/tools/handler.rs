@@ -2248,6 +2248,7 @@ impl ToolHandler {
             input.query.as_deref(),
             input.max_sections,
             input.include_off_branch,
+            input.max_chars_per_section,
         )?;
 
         Ok(json!(result))
@@ -2600,9 +2601,16 @@ mod tests {
         // Call the inner function with a pre-computed query vector so no EmbeddingService
         // is required.  dummy_vec(0.9) matches the "summary" section exactly.
         let query_vec = dummy_vec(0.9);
-        let result =
-            resume_handoff_with_vec(&db, project_id, Some("main"), Some(query_vec), 5, false)
-                .expect("resume_handoff_with_vec must succeed");
+        let result = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            Some(query_vec),
+            5,
+            false,
+            None,
+        )
+        .expect("resume_handoff_with_vec must succeed");
 
         assert!(
             !result.top_sections.is_empty(),
@@ -2657,6 +2665,7 @@ mod tests {
             Some(dummy_vec(0.5)),
             5,
             false,
+            None,
         )
         .expect("resume_handoff_with_vec must succeed");
 

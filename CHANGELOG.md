@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.2] - 2026-05-21
+
+### Added
+- `handoff_resume` accepts `max_chars_per_section` (and `engram-cli handoff resume --max-chars-per-section <N>`). When set and > 0, each returned `section_text` is char-truncated with a `… [truncated, N chars total]` marker. Default behavior unchanged. Use this when a previous resume response was rejected as too large by the caller.
+- `handoff_create` returns advisory `warnings: Vec<String>` for oversized sections (> 5000 chars) or oversized list items (> 1000 chars). The handoff is still stored; the warning points the writer at storing long content as separate `memory_store` entries that auto-link instead of being dumped into sections. CLI prints warnings to stderr.
+
+### Changed
+- `handoff_create` MCP tool description and `prompts/handoff.md` rewritten to forbid transcript dumps and direct long content to separate memories (auto-linked back via `derived_from`).
+
 ## [0.5.1] - 2026-05-15
 
 ### Fixed

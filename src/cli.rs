@@ -302,6 +302,9 @@ enum HandoffCmd {
         /// Include handoffs from all branches
         #[arg(long)]
         include_off_branch: bool,
+        /// Truncate each returned section to this many characters (0 = no cap)
+        #[arg(long)]
+        max_chars_per_section: Option<usize>,
     },
     /// Search handoff sections by content
     Search {
@@ -1894,6 +1897,9 @@ fn cmd_handoff(
             if let Some(ref cf) = result.continues_from {
                 println!("Continues from: {}", cf);
             }
+            for w in &result.warnings {
+                eprintln!("warning: {}", w);
+            }
             if !result.linked_memory_ids.is_empty() {
                 println!(
                     "Auto-linked {} memor{}:",
@@ -1914,6 +1920,7 @@ fn cmd_handoff(
             query,
             max,
             include_off_branch,
+            max_chars_per_section,
         } => {
             let embedding = embedding_service.ok_or_else(|| {
                 MemoryError::InvalidType("embedding service required".to_string())
@@ -1929,6 +1936,7 @@ fn cmd_handoff(
                 query.as_deref(),
                 max,
                 include_off_branch,
+                max_chars_per_section,
             )?;
 
             if let Some(ref msg) = result.message {

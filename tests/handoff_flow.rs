@@ -92,6 +92,7 @@ fn handoff_flow_create_resume_search() {
         Some("embedding pipeline"),
         5,
         false,
+        None,
     )
     .expect("resume must succeed");
 

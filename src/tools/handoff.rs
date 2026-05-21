@@ -21,7 +21,18 @@ pub struct HandoffCreateResult {
     pub linked_memory_ids: Vec<String>,
     /// The `continues_from` field from the sections (sidecar-only, not a graph edge).
     pub continues_from: Option<String>,
+    /// Non-fatal warnings about the handoff shape (e.g. oversized sections).
+    /// Empty when nothing is wrong. The handoff is still stored regardless.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
+
+/// Soft cap, in characters, above which a handoff section triggers a warning at create time.
+/// Sections may still legitimately need to exceed this — the warning is advisory, not an error.
+pub const SECTION_SOFT_CAP_CHARS: usize = 5000;
+
+/// Per-list-item soft cap. Above this we suggest splitting the item out into a linked memory.
+pub const SECTION_ITEM_SOFT_CAP_CHARS: usize = 1000;
 
 /// A scored section match returned by `handoff_resume`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,13 +171,94 @@ pub fn create_handoff(
         Vec::new()
     };
 
-    // Step 10: return result.
+    // Step 10: build advisory warnings about section shape.
+    let warnings = collect_section_warnings(&sections);
+
+    // Step 11: return result.
     let continues_from = sections.continues_from.clone();
     Ok(HandoffCreateResult {
         id,
         linked_memory_ids,
         continues_from,
+        warnings,
     })
+}
+
+/// Inspect a `HandoffSections` for shape problems and return human-readable advisories.
+///
+/// Triggers on (a) any section whose rendered text exceeds `SECTION_SOFT_CAP_CHARS`, and
+/// (b) any individual list item exceeding `SECTION_ITEM_SOFT_CAP_CHARS`. The handoff is
+/// still stored either way — these are advisory, not blocking.
+pub fn collect_section_warnings(sections: &HandoffSections) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    let oversized: Vec<(&str, usize)> = handoff_section_key_texts(sections)
+        .into_iter()
+        .filter_map(|(key, text)| {
+            let len = text.chars().count();
+            (len > SECTION_SOFT_CAP_CHARS).then_some((key, len))
+        })
+        .collect();
+
+    if !oversized.is_empty() {
+        let detail = oversized
+            .iter()
+            .map(|(k, n)| format!("{k} ({n} chars)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "Oversized section(s): {detail}. Sections should be short summaries, not transcripts. \
+             If you have long content (full reports, tool output, file dumps), store it as a \
+             separate memory (memory_store with type=debug/pattern/decision) — it will surface \
+             in handoff_resume via auto-linking — and keep the section text to a brief recap. \
+             Cap is {SECTION_SOFT_CAP_CHARS} chars/section."
+        ));
+    }
+
+    let big_items: Vec<(&str, usize, usize)> = [
+        ("decisions", &sections.decisions),
+        ("todos", &sections.todos),
+        ("blockers", &sections.blockers),
+        ("next_steps", &sections.next_steps),
+    ]
+    .into_iter()
+    .flat_map(|(key, list)| {
+        list.iter().enumerate().filter_map(move |(i, item)| {
+            let len = item.chars().count();
+            (len > SECTION_ITEM_SOFT_CAP_CHARS).then_some((key, i, len))
+        })
+    })
+    .collect();
+
+    if !big_items.is_empty() {
+        let detail = big_items
+            .iter()
+            .map(|(k, i, n)| format!("{k}[{i}] ({n} chars)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "Oversized list item(s): {detail}. Each item should fit on a line or two \
+             (cap {SECTION_ITEM_SOFT_CAP_CHARS} chars). Split long items into their own \
+             memory_store entries and reference them by ID."
+        ));
+    }
+
+    warnings
+}
+
+/// Truncate a section text to at most `max_chars` characters (counted as Unicode chars).
+/// Appends an explicit elision marker so callers can see the section was clipped.
+fn truncate_section_text(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if max_chars == 0 || total <= max_chars {
+        return text.to_string();
+    }
+    let marker = format!("\n… [truncated, {total} chars total]");
+    let marker_len = marker.chars().count();
+    // Reserve room for the marker. If the cap is tinier than the marker itself, just emit the marker.
+    let keep = max_chars.saturating_sub(marker_len);
+    let head: String = text.chars().take(keep).collect();
+    format!("{head}{marker}")
 }
 
 /// Build the ordered list of (section_key, section_text) pairs for a `HandoffSections`.
@@ -300,6 +392,7 @@ pub fn auto_link_handoff_sections(
 /// Separated from the embedding step so the scoring logic can be exercised in tests
 /// without a real `EmbeddingService`.  Pass `query_vec=None` to skip scoring (returns
 /// no section matches); pass `Some(vec)` to score all sections.
+#[allow(clippy::too_many_arguments)]
 pub fn resume_handoff_with_vec(
     db: &Database,
     project_id: &str,
@@ -307,6 +400,7 @@ pub fn resume_handoff_with_vec(
     query_vec: Option<Vec<f32>>,
     max_sections: usize,
     include_off_branch: bool,
+    max_chars_per_section: Option<usize>,
 ) -> Result<HandoffResumeResult, MemoryError> {
     // Step 1: resolve branch; if unresolved, serve off-branch handoffs with explanatory message.
     let (resolved_branch, message, fetch_all) = match branch {
@@ -375,14 +469,23 @@ pub fn resume_handoff_with_vec(
         .filter_map(|hid| db.get_memory(hid).ok().flatten())
         .collect();
 
-    let top_sections = if let Some(ref qvec) = query_vec {
+    let top_sections: Vec<HandoffSectionMatch> = if let Some(ref qvec) = query_vec {
         let mut all_matches = score_handoff_sections(qvec, &chain_memories, db)?;
         all_matches.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all_matches.into_iter().take(max_sections).collect()
+        let mut taken: Vec<HandoffSectionMatch> =
+            all_matches.into_iter().take(max_sections).collect();
+        if let Some(cap) = max_chars_per_section
+            && cap > 0
+        {
+            for m in &mut taken {
+                m.section_text = truncate_section_text(&m.section_text, cap);
+            }
+        }
+        taken
     } else {
         Vec::new()
     };
@@ -488,6 +591,7 @@ pub fn resume_handoff_with_vec(
 /// Resolves the branch, fetches the handoff chain (up to depth 5), scores sections
 /// against the query embedding, and returns the top `max_sections` matches along with
 /// auto-linked memories from the latest handoff.
+#[allow(clippy::too_many_arguments)]
 pub fn resume_handoff(
     db: &Database,
     embedding: &EmbeddingService,
@@ -496,6 +600,7 @@ pub fn resume_handoff(
     query: Option<&str>,
     max_sections: usize,
     include_off_branch: bool,
+    max_chars_per_section: Option<usize>,
 ) -> Result<HandoffResumeResult, MemoryError> {
     // Resolve the query text, embed it, then delegate to the core implementation.
     // We need the latest handoff to derive a fallback query text when query=None.
@@ -543,6 +648,7 @@ pub fn resume_handoff(
         query_vec,
         max_sections,
         include_off_branch,
+        max_chars_per_section,
     )
 }
 
@@ -643,4 +749,109 @@ pub fn search_handoffs(
 ) -> Result<HandoffSearchResult, MemoryError> {
     let query_vec = embedding.embed(query)?;
     search_handoffs_with_vec(db, project_id, query_vec, branch, limit, section_filter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::HandoffSections;
+
+    fn small_sections() -> HandoffSections {
+        HandoffSections {
+            summary: "short summary".into(),
+            decisions: vec!["picked A".into()],
+            todos: vec!["do x".into()],
+            blockers: vec![],
+            mental_model: "tiny".into(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        }
+    }
+
+    #[test]
+    fn warnings_empty_for_small_sections() {
+        let s = small_sections();
+        assert!(collect_section_warnings(&s).is_empty());
+    }
+
+    #[test]
+    fn warnings_flag_oversized_section() {
+        let mut s = small_sections();
+        s.summary = "x".repeat(SECTION_SOFT_CAP_CHARS + 1);
+        let w = collect_section_warnings(&s);
+        assert_eq!(w.len(), 1, "expected one warning, got {:?}", w);
+        assert!(
+            w[0].contains("summary"),
+            "warning should name section: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn warnings_flag_oversized_list_item() {
+        let mut s = small_sections();
+        s.decisions = vec!["ok".into(), "y".repeat(SECTION_ITEM_SOFT_CAP_CHARS + 10)];
+        let w = collect_section_warnings(&s);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("decisions[1]"),
+            "should point at the long item: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn warnings_can_report_both_kinds_independently() {
+        let mut s = small_sections();
+        s.summary = "x".repeat(SECTION_SOFT_CAP_CHARS + 1);
+        s.todos = vec!["z".repeat(SECTION_ITEM_SOFT_CAP_CHARS + 1)];
+        let w = collect_section_warnings(&s);
+        assert_eq!(
+            w.len(),
+            2,
+            "one section warning + one item warning: {:?}",
+            w
+        );
+    }
+
+    #[test]
+    fn truncate_noop_under_cap() {
+        let s = "hello world";
+        assert_eq!(truncate_section_text(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_zero_cap_is_noop() {
+        let s = "hello world";
+        assert_eq!(truncate_section_text(s, 0), s);
+    }
+
+    #[test]
+    fn truncate_applies_marker_with_total_length() {
+        let s = "a".repeat(1000);
+        let out = truncate_section_text(&s, 100);
+        assert!(
+            out.chars().count() <= 100,
+            "result must fit in cap, got {}",
+            out.chars().count()
+        );
+        assert!(
+            out.contains("[truncated"),
+            "marker should be present: {out}"
+        );
+        assert!(
+            out.contains("1000 chars total"),
+            "should report original length: {out}"
+        );
+    }
+
+    #[test]
+    fn truncate_handles_unicode_boundaries() {
+        // 4-byte chars; ensure char-based slicing doesn't panic mid-codepoint.
+        let s = "🦀".repeat(300);
+        let out = truncate_section_text(&s, 50);
+        assert!(out.chars().count() <= 50);
+        assert!(out.contains("[truncated"));
+    }
 }

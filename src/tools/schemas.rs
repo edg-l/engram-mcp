@@ -330,6 +330,10 @@ pub struct HandoffResumeInput {
     /// When true, include handoffs from all branches even if a branch was resolved. Default false.
     #[serde(default = "default_include_off_branch")]
     pub include_off_branch: bool,
+    /// Cap on characters per returned `section_text`. `None` or 0 = no cap.
+    /// When set, oversized sections are truncated and annotated with a marker so the
+    /// caller can recognise the elision and fetch the full text via the handoff ID.
+    pub max_chars_per_section: Option<usize>,
 }
 
 /// Input for the `handoff_search` MCP tool.
@@ -592,7 +596,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Handoff tools ===
         Tool::new(
             "handoff_create",
-            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup and contradiction detection.",
+            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup and contradiction detection.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -602,15 +606,15 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "sections": {
                         "type": "object",
-                        "description": "Structured session sections.",
+                        "description": "Structured session sections. Each section is a short summary — NOT a transcript or full report. Store long content as separate memories and let auto-linking surface them.",
                         "properties": {
-                            "summary": {"type": "string", "description": "High-level summary of the session."},
-                            "decisions": {"type": "array", "items": {"type": "string"}, "description": "Key decisions made."},
-                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items."},
-                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Things preventing forward motion right now (missing access, failing dependency, unanswered question)."},
-                            "mental_model": {"type": "string", "description": "Architecture or context the next session needs."},
-                            "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup."},
-                            "notes": {"type": "string", "description": "Freeform notes (optional)."},
+                            "summary": {"type": "string", "description": "1–3 sentence summary of the session. Keep under ~500 chars."},
+                            "decisions": {"type": "array", "items": {"type": "string"}, "description": "Key decisions, one short line each (what + why, ≤300 chars per item). No transcripts."},
+                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items, one short line each."},
+                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Things preventing forward motion right now (missing access, failing dependency, unanswered question). One short line each."},
+                            "mental_model": {"type": "string", "description": "Architecture or context the next session needs. 1–5 sentences or a short bulleted list. Not a deep dive — link related decision/pattern memories instead."},
+                            "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup. One short line each."},
+                            "notes": {"type": "string", "description": "Freeform short notes (optional). Do not paste reports or logs here."},
                             "continues_from": {"type": "string", "description": "ID of the handoff this continues from (optional)."}
                         },
                         "required": ["summary"]
@@ -645,6 +649,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "include_off_branch": {
                         "type": "boolean",
                         "description": "Include handoffs from all branches (default false)."
+                    },
+                    "max_chars_per_section": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Truncate each returned section_text to this many characters; 0 or omitted = no cap. Use this when a previous resume response was rejected as too large. Truncated sections are marked with '… [truncated, N chars total]' so you know to fetch the full text via handoff_search or the memory:// resource."
                     }
                 }
             })),
