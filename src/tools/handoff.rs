@@ -247,7 +247,8 @@ pub fn collect_section_warnings(sections: &HandoffSections) -> Vec<String> {
 }
 
 /// Truncate a section text to at most `max_chars` characters (counted as Unicode chars).
-/// Appends an explicit elision marker so callers can see the section was clipped.
+/// Prefers paragraph/sentence boundaries within the kept window so the elision lands on a
+/// natural break instead of mid-word. Appends an explicit elision marker.
 fn truncate_section_text(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();
     if max_chars == 0 || total <= max_chars {
@@ -255,10 +256,49 @@ fn truncate_section_text(text: &str, max_chars: usize) -> String {
     }
     let marker = format!("\n… [truncated, {total} chars total]");
     let marker_len = marker.chars().count();
-    // Reserve room for the marker. If the cap is tinier than the marker itself, just emit the marker.
-    let keep = max_chars.saturating_sub(marker_len);
-    let head: String = text.chars().take(keep).collect();
+    let budget = max_chars.saturating_sub(marker_len);
+
+    // Build a char-indexed slice we can search backwards for a boundary.
+    let chars: Vec<char> = text.chars().collect();
+    let window_end = budget.min(chars.len());
+    let window: String = chars[..window_end].iter().collect();
+
+    // Look for the latest natural break in the window, preferring stronger breaks first.
+    // We search by byte offset within `window`, then map back to char count.
+    let cut_byte = ["\n\n", ". ", "! ", "? ", "\n"]
+        .iter()
+        .filter_map(|pat| window.rfind(pat).map(|i| i + pat.len()))
+        // Only honour the boundary if it preserves at least half the budget; otherwise
+        // a stray sentence near the start would chop off too much content.
+        .filter(|i| {
+            let kept_chars = window[..*i].chars().count();
+            kept_chars * 2 >= budget
+        })
+        .max();
+
+    let head: String = match cut_byte {
+        Some(b) => window[..b].trim_end().to_string(),
+        None => window,
+    };
     format!("{head}{marker}")
+}
+
+/// Char count above which `Memory.content` in `linked_memories` is replaced with a
+/// preview. Linked memories surface as navigational hints in `handoff_resume`; the
+/// full body can be fetched via the `memory://{project}/{id}` resource if needed.
+const LINKED_MEMORY_PREVIEW_CHARS: usize = 300;
+
+/// Default cap applied when the caller of `handoff_resume` doesn't specify
+/// `max_chars_per_section`. Picked to keep typical resume responses well under MCP
+/// token budgets even with the max default `max_sections=5`.
+pub const DEFAULT_RESUME_SECTION_CHARS: usize = 1500;
+
+/// Returns `true` when a memory was captured by a Claude Code lifecycle hook
+/// (`PostToolUse`, `UserPromptSubmit`, `SessionEnd`, etc.). Hook captures are advisory
+/// observation data — they should never be auto-linked to handoffs or surfaced as
+/// curated context during resume.
+fn is_hook_captured(memory: &Memory) -> bool {
+    memory.tags.iter().any(|t| t == "hook")
 }
 
 /// Build the ordered list of (section_key, section_text) pairs for a `HandoffSections`.
@@ -314,8 +354,14 @@ pub fn auto_link_handoff_sections(
     let target_types = [MemoryType::Decision, MemoryType::Pattern, MemoryType::Debug];
 
     // Collect candidate memories of the target types.
-    let candidates: Vec<Memory> =
-        db.query_memories(project_id, Some(&target_types), None, None, 1000)?;
+    // Hook-captured memories (tagged "hook") are advisory observation data and must not
+    // be auto-linked — they are noisy by nature (transient tool failures, etc.) and
+    // would otherwise pollute the handoff's linked_memories on resume.
+    let candidates: Vec<Memory> = db
+        .query_memories(project_id, Some(&target_types), None, None, 1000)?
+        .into_iter()
+        .filter(|m| !is_hook_captured(m))
+        .collect();
 
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -469,6 +515,10 @@ pub fn resume_handoff_with_vec(
         .filter_map(|hid| db.get_memory(hid).ok().flatten())
         .collect();
 
+    // Resolve the per-section character cap. Default to DEFAULT_RESUME_SECTION_CHARS when the
+    // caller omits the parameter; an explicit `Some(0)` disables truncation.
+    let resolved_cap = max_chars_per_section.unwrap_or(DEFAULT_RESUME_SECTION_CHARS);
+
     let top_sections: Vec<HandoffSectionMatch> = if let Some(ref qvec) = query_vec {
         let mut all_matches = score_handoff_sections(qvec, &chain_memories, db)?;
         all_matches.sort_by(|a, b| {
@@ -478,11 +528,9 @@ pub fn resume_handoff_with_vec(
         });
         let mut taken: Vec<HandoffSectionMatch> =
             all_matches.into_iter().take(max_sections).collect();
-        if let Some(cap) = max_chars_per_section
-            && cap > 0
-        {
+        if resolved_cap > 0 {
             for m in &mut taken {
-                m.section_text = truncate_section_text(&m.section_text, cap);
+                m.section_text = truncate_section_text(&m.section_text, resolved_cap);
             }
         }
         taken
@@ -499,9 +547,13 @@ pub fn resume_handoff_with_vec(
         .collect();
 
     let linked_memories_map = db.get_memories_batch(&derived_target_ids)?;
+    // Filter out hook-captured memories — they may have been auto-linked by older
+    // versions of `auto_link_handoff_sections` before the hook-tag filter existed.
+    // This keeps responses clean even for handoffs created prior to the fix.
     let mut linked_memories: Vec<Memory> = derived_target_ids
         .iter()
         .filter_map(|id| linked_memories_map.get(id).cloned())
+        .filter(|m| !is_hook_captured(m))
         .collect();
 
     // Step 5b: single-handoff diversity backfill.
@@ -540,6 +592,11 @@ pub fn resume_handoff_with_vec(
                 if !BACKFILL_TYPES.contains(&mem.memory_type) {
                     return None;
                 }
+                // Skip hook-captured memories: they are noisy observation traces, not
+                // curated knowledge worth promoting into the resume context.
+                if is_hook_captured(mem) {
+                    return None;
+                }
                 // Branch filter: candidate must match the handoff branch or be global.
                 if let Some(ref hbranch) = resolved_branch {
                     match &mem.branch {
@@ -569,6 +626,13 @@ pub fn resume_handoff_with_vec(
                     .to_string(),
             );
         }
+    }
+
+    // Step 5c: truncate linked_memories content to a preview. Callers fetch the full
+    // body via the `memory://{project}/{id}` resource on demand. This keeps `handoff_resume`
+    // responses bounded even when a linked memory legitimately holds a large debug note.
+    for m in &mut linked_memories {
+        m.content = truncate_section_text(&m.content, LINKED_MEMORY_PREVIEW_CHARS);
     }
 
     // Step 6: record access on latest handoff.

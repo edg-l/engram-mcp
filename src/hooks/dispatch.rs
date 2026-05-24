@@ -488,20 +488,38 @@ fn tool_response_indicates_failure(
     false
 }
 
-/// Extract a human-readable error description from the tool response.
+/// Hard cap on the extracted error text. Tool responses can be huge (e.g. an `Edit`
+/// failure echoes back the entire file body). Without this cap, hook captures grow
+/// to 100k+ chars and pollute downstream consumers like `handoff_resume`.
+const ERROR_TEXT_MAX_CHARS: usize = 2000;
+
+/// Extract a human-readable error description from the tool response, capped at
+/// `ERROR_TEXT_MAX_CHARS` characters.
 fn extract_error_text(resp: Option<&serde_json::Value>, exit_code: Option<i32>) -> String {
-    if let Some(serde_json::Value::Object(map)) = resp {
+    let raw = if let Some(serde_json::Value::Object(map)) = resp {
+        let mut found: Option<String> = None;
         for key in &["error", "stderr", "message"] {
             if let Some(serde_json::Value::String(s)) = map.get(*key)
                 && !s.is_empty()
             {
-                return s.clone();
+                found = Some(s.clone());
+                break;
             }
         }
-    }
+        found.unwrap_or_else(|| {
+            serde_json::to_string(resp.unwrap()).unwrap_or_else(|_| "<unserializable>".to_string())
+        })
+    } else {
+        match resp {
+            Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string()),
+            None => return format!("exit_code={:?}", exit_code),
+        }
+    };
 
-    match resp {
-        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string()),
-        None => format!("exit_code={:?}", exit_code),
+    let total = raw.chars().count();
+    if total <= ERROR_TEXT_MAX_CHARS {
+        return raw;
     }
+    let head: String = raw.chars().take(ERROR_TEXT_MAX_CHARS).collect();
+    format!("{head}… [truncated, {total} chars total]")
 }

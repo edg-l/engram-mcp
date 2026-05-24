@@ -2426,7 +2426,7 @@ mod tests {
         create_handoff, resume_handoff_with_vec, search_handoffs_with_vec,
     };
     use super::{Database, EmbeddingService, MemoryError, RelationType, SearchMode, ToolHandler};
-    use crate::memory::{HandoffSections, MemoryType};
+    use crate::memory::{HandoffSections, Memory, MemoryType};
     use crate::tools::test_utils::{dummy_vec, insert_test_handoff};
 
     fn test_sections(summary: &str, continues_from: Option<String>) -> HandoffSections {
@@ -2684,6 +2684,119 @@ mod tests {
                 .unwrap()
                 .contains("No current branch"),
             "message must explain the situation"
+        );
+    }
+
+    /// Regression: hook-captured Debug memories must not appear in `linked_memories`
+    /// on resume, even when an older auto-link created the relationship.  Also
+    /// confirms that `Memory.content` in legitimate linked memories is truncated to
+    /// a preview so a single oversized linked memory cannot blow up the response.
+    #[test]
+    fn handoff_resume_filters_hook_captures_and_trims_content() {
+        use crate::memory::{RelationType, Relationship};
+
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "hook-filter-proj";
+        db.get_or_create_project(project_id, "Hook Filter").unwrap();
+
+        let sections = test_sections("Session summary", None);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-main",
+            "main",
+            &sections,
+            &[("summary", dummy_vec(0.5))],
+        );
+
+        // Insert a hook-captured Debug memory and a curated Debug memory, then link
+        // both to the handoff as if a prior auto-link had run.
+        let now = chrono::Utc::now().timestamp();
+        let hook_mem = Memory {
+            id: "mem_hook".to_string(),
+            project_id: project_id.to_string(),
+            memory_type: MemoryType::Debug,
+            content: "Edit failed: ".to_string() + &"x".repeat(50_000),
+            summary: None,
+            tags: vec!["hook".into(), "failure".into(), "Edit".into()],
+            importance: 0.5,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: Some("main".into()),
+            merged_from: None,
+            external_artifacts: None,
+            pinned: false,
+            global: false,
+        };
+        let curated_mem = Memory {
+            id: "mem_curated".to_string(),
+            project_id: project_id.to_string(),
+            memory_type: MemoryType::Debug,
+            content: "Genuine debug note: ".to_string() + &"y".repeat(5_000),
+            summary: None,
+            tags: vec!["manual".into()],
+            ..hook_mem.clone()
+        };
+        db.store_memory(&hook_mem).unwrap();
+        db.store_memory(&curated_mem).unwrap();
+
+        for target in ["mem_hook", "mem_curated"] {
+            db.create_relationship(&Relationship {
+                id: format!("rel_{}", target),
+                source_id: "ho-main".into(),
+                target_id: target.into(),
+                relation_type: RelationType::DerivedFrom,
+                strength: 1.0,
+                created_at: now,
+            })
+            .unwrap();
+        }
+
+        let result = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            Some(dummy_vec(0.5)),
+            5,
+            false,
+            None,
+        )
+        .expect("resume_handoff_with_vec must succeed");
+
+        let ids: Vec<&str> = result
+            .linked_memories
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(
+            !ids.contains(&"mem_hook"),
+            "hook-captured memories must be excluded from linked_memories, got {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&"mem_curated"),
+            "curated memories must still surface, got {:?}",
+            ids
+        );
+
+        // Curated memory content was 5000+ chars; resume must trim to the preview cap.
+        let curated = result
+            .linked_memories
+            .iter()
+            .find(|m| m.id == "mem_curated")
+            .expect("curated memory present");
+        assert!(
+            curated.content.chars().count() <= 400,
+            "linked_memories content must be truncated, got {} chars",
+            curated.content.chars().count()
+        );
+        assert!(
+            curated.content.contains("[truncated"),
+            "truncation marker must be present: {}",
+            curated.content
         );
     }
 

@@ -330,8 +330,9 @@ pub struct HandoffResumeInput {
     /// When true, include handoffs from all branches even if a branch was resolved. Default false.
     #[serde(default = "default_include_off_branch")]
     pub include_off_branch: bool,
-    /// Cap on characters per returned `section_text`. `None` or 0 = no cap.
-    /// When set, oversized sections are truncated and annotated with a marker so the
+    /// Cap on characters per returned `section_text`. Omitted = server default
+    /// (1500); explicit `0` disables truncation. Oversized sections are truncated at
+    /// the nearest paragraph/sentence boundary and annotated with a marker so the
     /// caller can recognise the elision and fetch the full text via the handoff ID.
     pub max_chars_per_section: Option<usize>,
 }
@@ -653,7 +654,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "max_chars_per_section": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Truncate each returned section_text to this many characters; 0 or omitted = no cap. Use this when a previous resume response was rejected as too large. Truncated sections are marked with '… [truncated, N chars total]' so you know to fetch the full text via handoff_search or the memory:// resource."
+                        "description": "Truncate each returned section_text to this many characters. Omitted = server default (1500); explicit 0 disables truncation. Truncated sections cut at the nearest paragraph/sentence boundary and are marked with '… [truncated, N chars total]' so you know to fetch the full text via handoff_search or the memory:// resource."
                     }
                 }
             })),
