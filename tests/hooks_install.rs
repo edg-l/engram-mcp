@@ -76,10 +76,10 @@ fn engram_hook_events(settings: &Value) -> Vec<String> {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-/// `hooks install` creates exactly 4 managed entries, none for SessionStart, Stop, or PreCompact.
-/// A backup file is created if a pre-existing settings.json was present.
+/// `hooks install` creates exactly 3 managed entries, none for SessionStart, Stop, PreCompact,
+/// or PostToolUse. A backup file is created if a pre-existing settings.json was present.
 #[test]
-fn install_creates_four_managed_entries_and_backup() {
+fn install_creates_three_managed_entries_and_backup() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     let claude_dir = home.join(".claude");
@@ -100,23 +100,18 @@ fn install_creates_four_managed_entries_and_backup() {
 
     let settings = read_settings(home);
 
-    // Exactly 4 engram-cli hook entries.
+    // Exactly 3 engram-cli hook entries.
     assert_eq!(
         count_engram_hooks(&settings),
-        4,
-        "expected 4 engram-cli hook entries, got:\n{}",
+        3,
+        "expected 3 engram-cli hook entries, got:\n{}",
         serde_json::to_string_pretty(&settings).unwrap()
     );
 
-    // The 4 expected events are present.
+    // The 3 expected events are present.
     let mut events = engram_hook_events(&settings);
     events.sort();
-    let mut expected = vec![
-        "UserPromptSubmit",
-        "PostToolUse",
-        "SessionEnd",
-        "SubagentStop",
-    ];
+    let mut expected = vec!["UserPromptSubmit", "SessionEnd", "SubagentStop"];
     expected.sort();
     assert_eq!(events, expected, "managed event names do not match");
 
@@ -138,6 +133,12 @@ fn install_creates_four_managed_entries_and_backup() {
         "PreCompact should not be managed"
     );
 
+    // PostToolUse must NOT be present (intentionally excluded as low-signal noise).
+    assert!(
+        !events.contains(&"PostToolUse".to_string()),
+        "PostToolUse should not be managed"
+    );
+
     // A backup file must exist (we pre-seeded a settings.json).
     let bak_count = fs::read_dir(&claude_dir)
         .unwrap()
@@ -151,7 +152,9 @@ fn install_creates_four_managed_entries_and_backup() {
     assert_eq!(bak_count, 1, "expected exactly one backup file");
 }
 
-/// After `install`, user-authored PostToolUse hook survives `uninstall`.
+/// After `install`, user-authored UserPromptSubmit hook coexists with the engram entry
+/// and survives `uninstall`. A user-authored PostToolUse hook is untouched throughout
+/// (engram-cli does not install PostToolUse wiring).
 #[test]
 fn uninstall_removes_only_engram_entries() {
     let tmp = tempfile::tempdir().unwrap();
@@ -159,9 +162,22 @@ fn uninstall_removes_only_engram_entries() {
     let claude_dir = home.join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
 
-    // Pre-seed a settings.json with a user-authored PostToolUse hook (no _source key).
+    // Pre-seed a settings.json with two user-authored hooks (no _source key):
+    // one on UserPromptSubmit (which engram-cli WILL install into) and one on
+    // PostToolUse (which engram-cli intentionally skips).
     let user_hook = serde_json::json!({
         "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "echo user-userpromptsubmit-hook"
+                        }
+                    ]
+                }
+            ],
             "PostToolUse": [
                 {
                     "matcher": "my-tool",
@@ -187,15 +203,25 @@ fn uninstall_removes_only_engram_entries() {
         .assert()
         .success();
 
-    // Verify both user and engram entries coexist under PostToolUse.
+    // Verify user and engram entries coexist under UserPromptSubmit.
     let after_install = read_settings(home);
+    let ups_arr = after_install["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("UserPromptSubmit should be an array");
+    assert_eq!(
+        ups_arr.len(),
+        2,
+        "UserPromptSubmit should have 2 entries after install (user + engram)"
+    );
+
+    // PostToolUse must remain exactly the user entry; engram should not have added one.
     let post_tool_arr = after_install["hooks"]["PostToolUse"]
         .as_array()
-        .expect("PostToolUse should be an array");
+        .expect("PostToolUse should still be an array");
     assert_eq!(
         post_tool_arr.len(),
-        2,
-        "PostToolUse should have 2 entries after install (user + engram)"
+        1,
+        "PostToolUse should keep only the user entry (engram-cli does not install it)"
     );
 
     // Uninstall engram entries.
@@ -213,7 +239,21 @@ fn uninstall_removes_only_engram_entries() {
         "all engram-cli hooks should be removed"
     );
 
-    // User-authored PostToolUse hook must survive.
+    // User-authored UserPromptSubmit hook must survive.
+    let ups_arr_after = after_uninstall["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("UserPromptSubmit key should still exist with user entry");
+    assert_eq!(
+        ups_arr_after.len(),
+        1,
+        "user-authored UserPromptSubmit hook should survive"
+    );
+    let user_cmd = ups_arr_after[0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(user_cmd, "echo user-userpromptsubmit-hook");
+
+    // User-authored PostToolUse hook must also survive (untouched throughout).
     let post_tool_arr_after = after_uninstall["hooks"]["PostToolUse"]
         .as_array()
         .expect("PostToolUse key should still exist with user entry");
@@ -222,10 +262,10 @@ fn uninstall_removes_only_engram_entries() {
         1,
         "user-authored PostToolUse hook should survive"
     );
-    let user_cmd = post_tool_arr_after[0]["hooks"][0]["command"]
+    let post_cmd = post_tool_arr_after[0]["hooks"][0]["command"]
         .as_str()
         .unwrap_or("");
-    assert_eq!(user_cmd, "echo user-posttooluse-hook");
+    assert_eq!(post_cmd, "echo user-posttooluse-hook");
 }
 
 /// Running `hooks install` twice does not duplicate entries.
@@ -241,7 +281,7 @@ fn install_is_idempotent() {
         .success();
 
     let settings_after_first = read_settings(home);
-    assert_eq!(count_engram_hooks(&settings_after_first), 4);
+    assert_eq!(count_engram_hooks(&settings_after_first), 3);
 
     // Second install.
     let output = engram_cli(home)
@@ -254,7 +294,7 @@ fn install_is_idempotent() {
     let settings_after_second = read_settings(home);
     assert_eq!(
         count_engram_hooks(&settings_after_second),
-        4,
+        3,
         "second install should not duplicate entries"
     );
 

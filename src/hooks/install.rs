@@ -26,9 +26,11 @@ use crate::error::MemoryError;
 /// `scripts/engram-hook.sh` and must not be duplicated here.
 /// `Stop` and `PreCompact` are intentionally absent — both are no-ops in
 /// the dispatch layer, so installing wiring for them serves no purpose.
+/// `PostToolUse` is intentionally absent — the dispatch handler still
+/// exists for users who wire it manually, but auto-installing it produces
+/// too much low-signal noise to be useful by default.
 const MANAGED_EVENTS: &[(&str, u32)] = &[
     ("UserPromptSubmit", 4),
-    ("PostToolUse", 4),
     ("SessionEnd", 5),
     ("SubagentStop", 4),
 ];

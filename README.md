@@ -96,18 +96,21 @@ Add to your config file:
 }
 ```
 
-### Auto-capture decisions and failures (Claude Code)
+### Auto-capture decisions and session summaries (Claude Code)
 
-Passively capture decisions, tool failures, and session summaries into Engram
-without any explicit tool calls. One-liner install:
+Passively capture decisions and session summaries into Engram without any
+explicit tool calls. One-liner install:
 
 ```bash
 engram-cli hooks install
 ```
 
-This registers handlers for four lifecycle events: `UserPromptSubmit`,
-`PostToolUse`, `SubagentStop`, and `SessionEnd`. `Stop` and `PreCompact` are
-explicit no-ops (per-turn noise and mid-session duplicates of `SessionEnd`).
+This registers handlers for three lifecycle events: `UserPromptSubmit`,
+`SubagentStop`, and `SessionEnd`. `Stop` and `PreCompact` are explicit no-ops
+(per-turn noise and mid-session duplicates of `SessionEnd`). `PostToolUse` is
+intentionally not installed; the dispatch handler still exists for users who
+want to wire it manually, but auto-installing it produces too much low-signal
+noise to be useful by default.
 All hook stores route through the same dedup path as `memory_store`, so
 near-identical captures are silently skipped (`ENGRAM_HOOK_DEDUP_SKIP`,
 default 0.95). A per-project daily cap (`ENGRAM_HOOK_DAILY_CAP`, default 50)
