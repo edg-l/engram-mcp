@@ -4,6 +4,10 @@ on:
   push:
     tags: ['v*']
 
+# Default workflow token is read-only; creating a release needs write.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
