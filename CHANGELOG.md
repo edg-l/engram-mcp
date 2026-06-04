@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.5] - 2026-06-04
+
+### Fixed
+- Tool dispatch errors now carry the correct JSON-RPC error code. A malformed `tools/call` (e.g. `memory_store` with an empty arguments object, which fails deserialization with `missing field 'content'`) previously returned `-32603 Internal error`, implying a server fault. Client-side faults (bad arguments, invalid type/relation names, unknown memory IDs) now return `-32602 Invalid params`; only genuine server faults (database, embedding, IO) stay `-32603`.
+- Calling an unknown tool returned a `success` result wrapping `{"error": "Unknown tool: ..."}` instead of a protocol error. It now returns `-32602 Invalid params` with an `Unknown tool` message, so callers can detect the failure.
+
 ## [0.5.2] - 2026-05-21
 
 ### Added

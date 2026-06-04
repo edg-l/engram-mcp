@@ -253,7 +253,7 @@ impl ToolHandler {
             "handoff_create" => self.handoff_create(arguments),
             "handoff_resume" => self.handoff_resume(arguments),
             "handoff_search" => self.handoff_search(arguments),
-            _ => Ok(json!({"error": format!("Unknown tool: {}", name)})),
+            _ => Err(MemoryError::UnknownTool(name.to_string())),
         }
     }
 

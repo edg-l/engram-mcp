@@ -35,6 +35,23 @@ use crate::error::MemoryError;
 use crate::tools::schemas::{ToolProfile, get_tool_definitions_for};
 use crate::tools::{ToolHandler, parse_search_mode};
 
+/// Map a `MemoryError` to the appropriate JSON-RPC error. Client-side faults
+/// (malformed arguments, bad type/relation names, unknown tool or memory IDs)
+/// become `invalid_params` (-32602); genuine server faults stay
+/// `internal_error` (-32603).
+fn mcp_error(e: MemoryError) -> McpError {
+    match e {
+        MemoryError::Json(_)
+        | MemoryError::InvalidType(_)
+        | MemoryError::InvalidRelation(_)
+        | MemoryError::UnknownTool(_)
+        | MemoryError::NotFound(_) => McpError::invalid_params(e.to_string(), None),
+        MemoryError::Database(_) | MemoryError::Embedding(_) | MemoryError::Io(_) => {
+            McpError::internal_error(e.to_string(), None)
+        }
+    }
+}
+
 /// Find the git repository root by walking up from current directory.
 /// Returns None if not in a git repository.
 fn find_git_root() -> Option<PathBuf> {
@@ -550,7 +567,7 @@ impl ServerHandler for MemoryServer {
                 .unwrap_or(300);
             let result = handler
                 .handle_tool(&request.name, args_value)
-                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
+                .map_err(mcp_error)?;
 
             let formatted = format::compact_tool_result_with_db(
                 &request.name,

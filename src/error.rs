@@ -20,6 +20,9 @@ pub enum MemoryError {
     #[error("Invalid relation type: {0}")]
     InvalidRelation(String),
 
+    #[error("Unknown tool: {0}")]
+    UnknownTool(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
