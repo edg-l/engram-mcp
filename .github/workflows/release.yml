@@ -7,12 +7,14 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
+          # x86_64-apple-darwin omitted: ort 2.0.0-rc.12 ships no prebuilt
+          # ONNX Runtime for Intel macOS. GitHub macOS runners are Apple
+          # Silicon, so aarch64 covers modern Macs.
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
