@@ -106,11 +106,10 @@ engram-cli hooks install
 ```
 
 This registers handlers for three lifecycle events: `UserPromptSubmit`,
-`SubagentStop`, and `SessionEnd`. `Stop` and `PreCompact` are explicit no-ops
-(per-turn noise and mid-session duplicates of `SessionEnd`). `PostToolUse` is
-intentionally not installed; the dispatch handler still exists for users who
-want to wire it manually, but auto-installing it produces too much low-signal
-noise to be useful by default.
+`SubagentStop`, and `SessionEnd`. `Stop`, `PreCompact`, and `PostToolUse` are
+explicit no-ops (per-turn noise, mid-session duplicates of `SessionEnd`, and
+low-signal tool-call outcomes respectively); tool-call outcomes are never
+captured.
 All hook stores route through the same dedup path as `memory_store`, so
 near-identical captures are silently skipped (`ENGRAM_HOOK_DEDUP_SKIP`,
 default 0.95). A per-project daily cap (`ENGRAM_HOOK_DAILY_CAP`, default 50)
@@ -176,7 +175,7 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 - **Global memories** visible across projects
 - **Semantic deduplication** at store time (≥ 0.90 auto-merge) plus periodic background dedup
 - **Hierarchical clustering** with centroid-based retrieval at scale
-- **Relationship graphs** (`relates_to`, `supersedes`, `derived_from`, `contradicts`)
+- **Relationship graphs** (`relates_to`, `supersedes`, `derived_from`)
 - **Contradiction detection** flags conflicts at cosine > 0.85, scoped to the same non-handoff `MemoryType` (cross-type and handoff-touching matches are suppressed to avoid topical-overlap false positives)
 - **Branch-aware queries** filter by git branch scope
 - **External artifacts**: memories can declare referenced files / URLs / identifiers via `external_artifacts`. Retrieval lists them inline and tags local paths with `[missing]` if absent on the server's filesystem
@@ -202,7 +201,7 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 | `handoff_create` | Capture a session handoff with structured sections (summary, decisions, todos, blockers, mental_model, next_steps, notes) |
 | `handoff_resume` | Retrieve top sections from recent handoffs on the current branch, plus linked memories |
 | `handoff_search` | Search handoff sections by content; filter by branch or section name |
-| `memory_store` | Store a memory with embedding, auto-dedup, auto-cluster, contradiction detection |
+| `memory_store` | Store a memory with embedding, auto-dedup, auto-cluster |
 | `memory_query` | Semantic search with hybrid scoring, pagination, branch filtering |
 | `memory_context` | Load relevant memories for a task (hierarchical retrieval via clusters) |
 | `memory_update` | Update content, tags, importance, pinned status |
@@ -343,9 +342,9 @@ Engram is opinionated for coding agents using git; the others target broader ass
 
 **Why not Mem0?** Mem0 is cloud-default, runs LLM extraction per write, and has no branch model. Great for chat personalization; not aimed at coding agents who switch git contexts mid-day.
 
-**Why not vanilla mcp-memory-service?** Solid generic memory MCP, but no handoff structure, no branch awareness, no contradiction detection. Engram trades breadth for opinionation around coding-agent workflows.
+**Why not vanilla mcp-memory-service?** Solid generic memory MCP, but no handoff structure, no branch awareness. Engram trades breadth for opinionation around coding-agent workflows.
 
-**Why not a vector DB directly?** A vector DB is one component. Engram adds decay, dedup, contradiction detection, clustering, and the MCP layer — none of which a raw Qdrant/Chroma instance gives you.
+**Why not a vector DB directly?** A vector DB is one component. Engram adds decay, dedup, clustering, and the MCP layer — none of which a raw Qdrant/Chroma instance gives you.
 
 **Why SQLite over Postgres/libSQL?** Zero-ops local-first. Embeddings are 256-dim MRL (quantized ONNX), small enough that SQLite's row size and query plan are fine for the corpus sizes a single developer accumulates. If you need multi-tenant, this isn't the tool.
 
@@ -409,7 +408,7 @@ Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blocker
 
 - **Branch chaining** via `continues_from` in the sidecar (no graph edge). `handoff_resume` walks the chain up to depth 5 with cycle detection.
 - **Auto-linking**: each section is scored against existing `decision` / `pattern` / `debug` memories. Matches at cosine ≥ 0.75 get a `derived_from` edge, capped at 10 links per handoff.
-- **Bypass rules**: handoffs skip dedup and contradiction detection. Pinned by default.
+- **Bypass rules**: handoffs skip dedup. Pinned by default.
 
 ## Status and limits
 

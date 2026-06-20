@@ -318,7 +318,6 @@ pub enum RelationType {
     RelatesTo,
     Supersedes,
     DerivedFrom,
-    Contradicts,
 }
 
 impl RelationType {
@@ -327,7 +326,6 @@ impl RelationType {
             Self::RelatesTo => "relates_to",
             Self::Supersedes => "supersedes",
             Self::DerivedFrom => "derived_from",
-            Self::Contradicts => "contradicts",
         }
     }
 }
@@ -351,7 +349,6 @@ impl FromStr for RelationType {
             "relates_to" => Ok(Self::RelatesTo),
             "supersedes" => Ok(Self::Supersedes),
             "derived_from" => Ok(Self::DerivedFrom),
-            "contradicts" => Ok(Self::Contradicts),
             _ => Err(ParseRelationTypeError(s.to_string())),
         }
     }

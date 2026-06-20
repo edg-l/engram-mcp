@@ -42,7 +42,6 @@ Memories can link to other memories:
 - `relates_to` - general association
 - `supersedes` - newer info replacing old
 - `derived_from` - conclusion from evidence
-- `contradicts` - conflicting information (flag for review)
 
 ## Architecture
 
@@ -113,7 +112,7 @@ CREATE TABLE relationships (
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    relation_type TEXT NOT NULL,  -- relates_to, supersedes, derived_from, contradicts
+    relation_type TEXT NOT NULL,  -- relates_to, supersedes, derived_from
     strength REAL DEFAULT 1.0,
     created_at INTEGER NOT NULL,
     UNIQUE(source_id, target_id, relation_type)
@@ -343,7 +342,6 @@ When a memory is accessed:
 ### Potential Features
 - **Memory compression**: Summarize old/low-relevance memories
 - **Clustering**: Auto-group related memories
-- **Conflict resolution**: UI for resolving contradictions
 - **Multi-project**: Share memories across related projects
 - **Sync**: Cloud backup/sync for memories
 - **Hooks**: Trigger actions when memories match patterns

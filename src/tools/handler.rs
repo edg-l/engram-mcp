@@ -90,32 +90,14 @@ pub struct MemoryStoreResult {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub potential_contradictions: Vec<PotentialContradiction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_info: Option<MergeInfo>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PotentialContradiction {
-    pub memory_id: String,
-    pub summary: String,
-    pub similarity: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ContradictionWarning {
-    pub memory_id: String,
-    pub contradicts_id: String,
-    pub content_preview: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MemoryQueryResult {
     pub memories: Vec<MemoryWithScore>,
     pub count: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub contradiction_warnings: Vec<ContradictionWarning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,14 +291,11 @@ impl ToolHandler {
             global: input.global,
         };
 
-        // Generate embedding locally — needed for both dedup and contradiction scan.
+        // Generate embedding locally — needed for dedup.
         let embedding = self.embedding.embed_memory(memory_type, &input.content)?;
 
-        // Fetch all embeddings and memories now for the contradiction scan after store.
+        // Fetch memories now so we can build a content preview if a dedup merge occurs.
         // (store_with_dedup will re-fetch internally for dedup; that's acceptable here.)
-        let pre_store_embeddings = self
-            .db
-            .get_all_embeddings_for_project_and_global(&self.project_id)?;
         let pre_store_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
         let pre_store_memories: std::collections::HashMap<String, Memory> = pre_store_memories_list
             .into_iter()
@@ -370,42 +349,6 @@ impl ToolHandler {
             }
         };
 
-        // Contradictions are only meaningful within the same non-handoff type; handoffs are session snapshots and warrant no warning either way.
-        let mut potential_contradictions: Vec<PotentialContradiction> = Vec::new();
-        const CONTRADICTION_THRESHOLD: f32 = 0.85;
-        let merged_id: Option<&str> = merge_info.as_ref().map(|mi| mi.merged_with.as_str());
-
-        if memory_type != MemoryType::Handoff {
-            for (existing_id, existing_vec) in &pre_store_embeddings {
-                if existing_id.as_str() == final_id.as_str() {
-                    continue; // Skip self
-                }
-                if merged_id == Some(existing_id.as_str()) {
-                    continue; // Skip the merged-away duplicate
-                }
-                let Some(existing_memory) = pre_store_memories.get(existing_id) else {
-                    continue; // Defensive: embedding exists but memory row missing
-                };
-                if existing_memory.memory_type == MemoryType::Handoff {
-                    continue; // Handoff on the existing side: skip
-                }
-                if existing_memory.memory_type != memory_type {
-                    continue; // Cross-type: not a meaningful contradiction
-                }
-                let similarity = cosine_similarity(&embedding, existing_vec);
-                if similarity >= CONTRADICTION_THRESHOLD {
-                    potential_contradictions.push(PotentialContradiction {
-                        memory_id: existing_id.clone(),
-                        summary: existing_memory
-                            .summary
-                            .clone()
-                            .unwrap_or_else(|| existing_memory.content.chars().take(100).collect()),
-                        similarity: similarity as f64,
-                    });
-                }
-            }
-        } // end if memory_type != MemoryType::Handoff (contradiction check)
-
         // Create relationships to related memories
         for related_id in input.related_to {
             let rel = Relationship {
@@ -432,20 +375,14 @@ impl ToolHandler {
 
         let message = if merge_info.is_some() {
             "Memory stored and merged with duplicate".to_string()
-        } else if potential_contradictions.is_empty() {
-            "Memory stored successfully".to_string()
         } else {
-            format!(
-                "Memory stored. Warning: {} potential contradiction(s) detected - consider using memory_link with 'supersedes' or 'contradicts' relation.",
-                potential_contradictions.len()
-            )
+            "Memory stored successfully".to_string()
         };
 
         Ok(json!(MemoryStoreResult {
             id: final_id,
             message,
             branch,
-            potential_contradictions,
             merge_info,
         }))
     }
@@ -497,7 +434,6 @@ impl ToolHandler {
             return Ok(json!(MemoryQueryResult {
                 count: results.len(),
                 memories: results,
-                contradiction_warnings: vec![],
             }));
         }
 
@@ -730,65 +666,10 @@ impl ToolHandler {
             let _ = self.db.record_access_batch(&result_ids);
         }
 
-        // Batch check for contradiction relationships among returned memories
-        let contradiction_warnings = self.check_contradictions_batch(&result_ids)?;
-
         Ok(json!(MemoryQueryResult {
             count: results.len(),
             memories: results,
-            contradiction_warnings,
         }))
-    }
-
-    /// Check for contradiction relationships among a set of memory IDs using batch operations.
-    fn check_contradictions_batch(
-        &self,
-        result_ids: &[String],
-    ) -> Result<Vec<ContradictionWarning>, MemoryError> {
-        if result_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let result_id_set: HashSet<&String> = result_ids.iter().collect();
-
-        // Batch fetch all outgoing relationships (1 query instead of N)
-        let relationships_map = self.db.get_relationships_from_batch(result_ids)?;
-
-        // Collect IDs of targets that are contradicted AND in our result set
-        let mut target_ids_to_fetch: Vec<String> = Vec::new();
-        let mut contradiction_pairs: Vec<(String, String)> = Vec::new();
-
-        for (source_id, rels) in &relationships_map {
-            for rel in rels {
-                if rel.relation_type == RelationType::Contradicts
-                    && result_id_set.contains(&rel.target_id)
-                {
-                    target_ids_to_fetch.push(rel.target_id.clone());
-                    contradiction_pairs.push((source_id.clone(), rel.target_id.clone()));
-                }
-            }
-        }
-
-        if contradiction_pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Batch fetch target memories for content preview (1 query instead of M)
-        let targets_map = self.db.get_memories_batch(&target_ids_to_fetch)?;
-
-        // Build warnings
-        let mut warnings: Vec<ContradictionWarning> = Vec::new();
-        for (source_id, target_id) in contradiction_pairs {
-            if let Some(target) = targets_map.get(&target_id) {
-                warnings.push(ContradictionWarning {
-                    memory_id: source_id,
-                    contradicts_id: target_id,
-                    content_preview: target.content.chars().take(100).collect(),
-                });
-            }
-        }
-
-        Ok(warnings)
     }
 
     fn memory_update(&self, arguments: Value) -> Result<Value, MemoryError> {

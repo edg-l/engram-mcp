@@ -1,9 +1,9 @@
 # Engram Claude Code Lifecycle Hooks
 
-Engram passively captures decisions, failures, and session summaries from
+Engram passively captures decisions and session summaries from
 Claude Code lifecycle events, storing them as typed memories without any
 explicit `memory_store` calls. Each event handler filters, redacts, and
-dispatches to the appropriate storage path (handoff, Debug, Decision, or Fact).
+dispatches to the appropriate storage path (handoff or Fact).
 For loading context at the start of a session, see `scripts/engram-hook.sh`,
 which handles the `SessionStart` event separately.
 
@@ -29,7 +29,7 @@ is created at `settings.json.bak.<timestamp>` before writing.
 |---|---|---|---|
 | `SessionStart` | (context load, no store) | Every session start | Handled by `scripts/engram-hook.sh`, not by `hooks install`. See [SessionStart loader](#sessionstart-loader). |
 | `UserPromptSubmit` | `Decision` | Prompt contains a cue word and is >= `ENGRAM_HOOK_MIN_CHARS` chars | Cue regex default: `let's`, `decided`, `we'll`, `going to`, `switched to`, `use`, `prefer`, `chose`, `choose`, `reason`, `because`. |
-| `PostToolUse` | `Debug` | Tool execution fails (non-zero exit code or error in response) and tool is not in the denylist | Default denylist: `Read,Glob,Grep,WebFetch,WebSearch`. Only failure events are captured. |
+| `PostToolUse` | (none, no-op) | Never | Tool-call outcomes are deliberately not captured — low-signal noise that bloats the store. The dispatch handler validates the payload and returns immediately. |
 | `Stop` | `handoff` (or `Fact` fallback when no git branch) | `last_assistant_message` >= 200 chars and `stop_hook_active` is not `true` | `stop_hook_active=true` means a Stop hook is already running; skipped to prevent reentrance. |
 | `PreCompact` | `handoff` (or `Fact` fallback when no git branch) | Always fires when Claude Code compacts context | Uses `custom_instructions` as the summary if present, otherwise stores a timestamp marker. |
 | `SessionEnd` | `Fact` (importance 0.3) | Session ends for any reason except `clear` or `resume` | Low importance. Skipped on `reason: "clear"` and `reason: "resume"`. |
@@ -40,7 +40,6 @@ is created at `settings.json.bak.<timestamp>` before writing.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` | `true` | Enable/disable the UserPromptSubmit handler. |
-| `ENGRAM_HOOK_POSTTOOLUSE_ENABLED` | `true` | Enable/disable the PostToolUse handler. |
 | `ENGRAM_HOOK_STOP_ENABLED` | `true` | Enable/disable the Stop handler. |
 | `ENGRAM_HOOK_PRECOMPACT_ENABLED` | `true` | Enable/disable the PreCompact handler. |
 | `ENGRAM_HOOK_SESSIONEND_ENABLED` | `true` | Enable/disable the SessionEnd handler. |
@@ -48,8 +47,6 @@ is created at `settings.json.bak.<timestamp>` before writing.
 | `ENGRAM_HOOK_SESSIONSTART_ENABLED` | `true` | Controls the SessionStart handler in dispatch. No effect on `hooks install` (SessionStart is never managed). |
 | `ENGRAM_HOOK_MIN_CHARS` | `40` | Minimum byte length for prompt content to be processed by UserPromptSubmit. |
 | `ENGRAM_HOOK_MIN_IMPORTANCE` | `0.5` | Minimum importance score for hook-stored memories. |
-| `ENGRAM_HOOK_TOOL_ALLOWLIST` | (empty) | Comma-separated tool names. When set and non-empty, only listed tools are processed by PostToolUse. Takes precedence over the denylist. |
-| `ENGRAM_HOOK_TOOL_DENYLIST` | `Read,Glob,Grep,WebFetch,WebSearch` | Comma-separated tool names to ignore in PostToolUse. Ignored when allowlist is set. |
 | `ENGRAM_HOOK_PROMPT_CUE_REGEX` | (built-in regex) | Override the cue word pattern for UserPromptSubmit. Must be a valid Rust `regex` crate pattern. |
 
 Set any per-event toggle to `0`, `false`, or `no` to disable; `1`, `true`, or
@@ -96,7 +93,6 @@ of them to test a specific handler:
 
 ```bash
 engram-cli hook-event Stop --dry-run < hooks/fixtures/stop.json
-engram-cli hook-event PostToolUse --dry-run < hooks/fixtures/post_tool_use_failure.json
 ```
 
 ## Uninstall
@@ -170,5 +166,5 @@ permissions.
 
 **Hook fires but nothing is stored.** Run the payload through `--dry-run` to
 see which skip reason is returned (`prompt_too_short`, `prompt_no_cue_match`,
-`tool_denied`, `tool_succeeded`, `stop_reentrant`, `reason_filtered`, etc.).
+`posttooluse_noop`, `stop_noop`, `reason_filtered`, etc.).
 The dispatch logic lives in `src/hooks/dispatch.rs`.

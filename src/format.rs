@@ -277,23 +277,6 @@ fn compact_store(result: &Value) -> String {
         ));
     }
 
-    let contradictions = result
-        .get("potential_contradictions")
-        .and_then(|v| v.as_array());
-    if let Some(arr) = contradictions
-        && !arr.is_empty()
-    {
-        out.push_str(&format!(
-            "\nWarning: {} potential contradiction(s):",
-            arr.len()
-        ));
-        for c in arr {
-            let cid = c.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
-            let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("\n  {} - {}", cid, truncate_str(summary, 80)));
-        }
-    }
-
     out
 }
 
@@ -354,23 +337,6 @@ fn compact_query(result: &Value, content_length: usize, db: Option<&Database>) -
             .get("external_artifacts")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         out.push_str(&render_artifacts(&artifacts));
-    }
-
-    // Contradiction warnings
-    if let Some(warnings) = result
-        .get("contradiction_warnings")
-        .and_then(|v| v.as_array())
-        && !warnings.is_empty()
-    {
-        out.push_str("\nContradictions detected:");
-        for w in warnings {
-            let a = w.get("memory_id").and_then(|v| v.as_str()).unwrap_or("?");
-            let b = w
-                .get("contradicts_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            out.push_str(&format!("\n  {} contradicts {}", a, b));
-        }
     }
 
     out
@@ -662,8 +628,7 @@ mod tests {
                     "semantic_score": 0.7,
                     "keyword_score": 0.3
                 }
-            ],
-            "contradiction_warnings": []
+            ]
         });
 
         let compact = compact_tool_result("memory_query", &result, 300);
@@ -691,18 +656,13 @@ mod tests {
     fn test_compact_store_result() {
         let result = json!({
             "id": "mem_789",
-            "message": "Memory stored successfully",
-            "potential_contradictions": []
+            "message": "Memory stored successfully"
         });
 
         let compact = compact_tool_result("memory_store", &result, 300);
 
         assert!(compact.contains("mem_789"), "Should contain memory ID");
         assert!(compact.starts_with("Stored"), "Should start with 'Stored'");
-        assert!(
-            !compact.contains("contradiction"),
-            "No contradictions to show"
-        );
     }
 
     #[test]
@@ -729,8 +689,7 @@ mod tests {
                     "semantic_score": 0.88,
                     "keyword_score": 0.45
                 }
-            ],
-            "contradiction_warnings": []
+            ]
         });
 
         let full_json = serde_json::to_string(&full_result).unwrap();

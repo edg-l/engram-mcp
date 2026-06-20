@@ -107,61 +107,13 @@ pub fn dispatch(
         }
 
         HookEvent::PostToolUse => {
-            let payload = match serde_json::from_str::<PostToolUsePayload>(raw_json) {
-                Ok(p) => p,
+            // Tool-call outcomes (including failures) are deliberately not captured:
+            // they are low-signal noise and bloat the store. Validate then no-op.
+            match serde_json::from_str::<PostToolUsePayload>(raw_json) {
+                Ok(_) => {}
                 Err(_) => return Ok(DispatchOutcome::Skipped("parse_error")),
-            };
-
-            let tool_name = payload.tool_name.as_deref().unwrap_or("unknown");
-
-            if !tool_response_indicates_failure(payload.tool_response.as_ref(), payload.exit_code) {
-                return Ok(DispatchOutcome::Skipped("tool_succeeded"));
             }
-
-            if !filter::allow_tool(tool_name) {
-                return Ok(DispatchOutcome::Skipped("tool_denied"));
-            }
-
-            let error_text = extract_error_text(payload.tool_response.as_ref(), payload.exit_code);
-
-            let input_str = payload
-                .tool_input
-                .as_ref()
-                .map(|i| {
-                    let s = i.to_string();
-                    if s.len() > 500 {
-                        format!("{}…", &s[..s.floor_char_boundary(500)])
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_default();
-
-            let content_raw = format!("{} failed: {}\nInput: {}", tool_name, error_text, input_str);
-            let content = redact::redact(&content_raw);
-            let branch = current_branch();
-            let tags = vec!["hook", "failure", tool_name];
-
-            if dry_run {
-                return Ok(DispatchOutcome::DryRun(format!(
-                    "PostToolUse: would store Debug for tool '{}' failure",
-                    tool_name
-                )));
-            }
-
-            let outcome = store_memory(
-                db,
-                embedding_service,
-                project_id,
-                &content,
-                MemoryType::Debug,
-                &tags,
-                hook_importance_cap(0.6),
-                branch.as_deref(),
-                false,
-                false,
-            )?;
-            Ok(outcome_to_dispatch(outcome))
+            Ok(DispatchOutcome::Skipped("posttooluse_noop"))
         }
 
         HookEvent::Stop => {
@@ -437,89 +389,4 @@ fn find_git_root() -> Option<std::path::PathBuf> {
             return None;
         }
     }
-}
-
-/// Returns `true` if the tool response or exit code signals a failure.
-///
-/// Checks (in order of reliability):
-/// 1. `resp` is a JSON object with a non-empty `error` or `stderr` string field.
-/// 2. `resp` is a JSON object with a nested numeric `exit_code`, `returncode`, or `code` field != 0.
-/// 3. Top-level `exit_code` is `Some(c)` with `c != 0` (UNVERIFIED: not a guaranteed field).
-/// 4. Last resort: compact JSON serialization lowercased contains "error", "failed", or "panic".
-fn tool_response_indicates_failure(
-    resp: Option<&serde_json::Value>,
-    exit_code: Option<i32>,
-) -> bool {
-    if let Some(serde_json::Value::Object(map)) = resp {
-        // Check for non-empty error/stderr string fields
-        for key in &["error", "stderr"] {
-            if let Some(serde_json::Value::String(s)) = map.get(*key)
-                && !s.is_empty()
-            {
-                return true;
-            }
-        }
-
-        // Check for nested numeric exit code fields
-        for key in &["exit_code", "returncode", "code"] {
-            if let Some(serde_json::Value::Number(n)) = map.get(*key)
-                && n.as_i64().is_some_and(|v| v != 0)
-            {
-                return true;
-            }
-        }
-    }
-
-    // Top-level exit_code fallback (UNVERIFIED weak signal)
-    if exit_code.is_some_and(|c| c != 0) {
-        return true;
-    }
-
-    // Last resort: compact JSON string scan
-    if let Some(v) = resp
-        && let Ok(compact) = serde_json::to_string(v)
-    {
-        let lower = compact.to_lowercase();
-        if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Hard cap on the extracted error text. Tool responses can be huge (e.g. an `Edit`
-/// failure echoes back the entire file body). Without this cap, hook captures grow
-/// to 100k+ chars and pollute downstream consumers like `handoff_resume`.
-const ERROR_TEXT_MAX_CHARS: usize = 2000;
-
-/// Extract a human-readable error description from the tool response, capped at
-/// `ERROR_TEXT_MAX_CHARS` characters.
-fn extract_error_text(resp: Option<&serde_json::Value>, exit_code: Option<i32>) -> String {
-    let raw = if let Some(serde_json::Value::Object(map)) = resp {
-        let mut found: Option<String> = None;
-        for key in &["error", "stderr", "message"] {
-            if let Some(serde_json::Value::String(s)) = map.get(*key)
-                && !s.is_empty()
-            {
-                found = Some(s.clone());
-                break;
-            }
-        }
-        found.unwrap_or_else(|| {
-            serde_json::to_string(resp.unwrap()).unwrap_or_else(|_| "<unserializable>".to_string())
-        })
-    } else {
-        match resp {
-            Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string()),
-            None => return format!("exit_code={:?}", exit_code),
-        }
-    };
-
-    let total = raw.chars().count();
-    if total <= ERROR_TEXT_MAX_CHARS {
-        return raw;
-    }
-    let head: String = raw.chars().take(ERROR_TEXT_MAX_CHARS).collect();
-    format!("{head}… [truncated, {total} chars total]")
 }

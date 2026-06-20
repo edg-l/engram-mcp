@@ -24,11 +24,10 @@ use crate::error::MemoryError;
 ///
 /// `SessionStart` is intentionally absent — the canonical loader is
 /// `scripts/engram-hook.sh` and must not be duplicated here.
-/// `Stop` and `PreCompact` are intentionally absent — both are no-ops in
-/// the dispatch layer, so installing wiring for them serves no purpose.
-/// `PostToolUse` is intentionally absent — the dispatch handler still
-/// exists for users who wire it manually, but auto-installing it produces
-/// too much low-signal noise to be useful by default.
+/// `Stop`, `PreCompact`, and `PostToolUse` are intentionally absent — all
+/// three are no-ops in the dispatch layer, so installing wiring for them
+/// serves no purpose. (Tool-call outcomes are deliberately not captured;
+/// they are low-signal noise that bloats the store.)
 const MANAGED_EVENTS: &[(&str, u32)] = &[
     ("UserPromptSubmit", 4),
     ("SessionEnd", 5),

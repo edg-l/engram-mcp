@@ -19,28 +19,6 @@ pub fn allow_event(event: HookEvent) -> bool {
     }
 }
 
-/// Returns `true` if the named tool should be processed by hooks.
-///
-/// Allowlist (checked first): `ENGRAM_HOOK_TOOL_ALLOWLIST` — comma-separated names.
-///   If set and non-empty, only those tools are allowed.
-/// Denylist (fallback): `ENGRAM_HOOK_TOOL_DENYLIST` — comma-separated names.
-///   Default denylist: `"Read,Glob,Grep,WebFetch,WebSearch"`.
-pub fn allow_tool(tool: &str) -> bool {
-    // Allowlist check — takes precedence over denylist
-    if let Ok(allowlist_env) = std::env::var("ENGRAM_HOOK_TOOL_ALLOWLIST") {
-        let allowlist = allowlist_env.trim().to_string();
-        if !allowlist.is_empty() {
-            return allowlist.split(',').any(|t| t.trim() == tool);
-        }
-    }
-
-    // Denylist check
-    let denylist_env =
-        std::env::var("ENGRAM_HOOK_TOOL_DENYLIST").unwrap_or_else(|_| default_denylist());
-    let denied = denylist_env.split(',').any(|t| t.trim() == tool);
-    !denied
-}
-
 /// Returns the minimum prompt/message length (in bytes) for content to be stored.
 /// Reads `ENGRAM_HOOK_MIN_CHARS`, default `40`.
 pub fn min_chars() -> usize {
@@ -120,10 +98,6 @@ fn event_env_name(event: HookEvent) -> &'static str {
     }
 }
 
-fn default_denylist() -> String {
-    "Read,Glob,Grep,WebFetch,WebSearch".to_string()
-}
-
 fn default_prompt_cue_regex() -> &'static str {
     r"(?i)\b(decided?|chose|prefer(?:s|red|ence)?|switch(?:ed)? to)\b"
 }
@@ -136,19 +110,6 @@ mod tests {
     // To avoid a `serial_test` dependency we instead use resolver-injection helpers
     // that accept an explicit lookup closure so no real env is touched.
 
-    fn allow_tool_with<F: Fn(&str) -> Option<String>>(tool: &str, lookup: F) -> bool {
-        let allowlist = lookup("ENGRAM_HOOK_TOOL_ALLOWLIST");
-        if let Some(allowlist_env) = allowlist {
-            let allowlist_env = allowlist_env.trim().to_string();
-            if !allowlist_env.is_empty() {
-                return allowlist_env.split(',').any(|t| t.trim() == tool);
-            }
-        }
-        let denylist_env = lookup("ENGRAM_HOOK_TOOL_DENYLIST").unwrap_or_else(default_denylist);
-        let denied = denylist_env.split(',').any(|t| t.trim() == tool);
-        !denied
-    }
-
     fn allow_event_with<F: Fn(&str) -> Option<String>>(event: HookEvent, lookup: F) -> bool {
         let var_name = format!("ENGRAM_HOOK_{}_ENABLED", event_env_name(event));
         match lookup(&var_name).as_deref() {
@@ -156,11 +117,6 @@ mod tests {
             Some("1") | Some("true") | Some("yes") => true,
             _ => !matches!(event, HookEvent::SubagentStop | HookEvent::UserPromptSubmit),
         }
-    }
-
-    #[allow(dead_code)]
-    fn default_denylist_test() -> String {
-        default_denylist()
     }
 
     fn min_chars_with<F: Fn(&str) -> Option<String>>(lookup: F) -> usize {
@@ -180,37 +136,6 @@ mod tests {
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| v.clamp(0.5, 1.0))
             .unwrap_or(0.95)
-    }
-
-    #[test]
-    fn denylist_default_blocks_read() {
-        let no_env = |_: &str| None::<String>;
-        assert!(!allow_tool_with("Read", no_env));
-        assert!(!allow_tool_with("Glob", no_env));
-        assert!(!allow_tool_with("WebSearch", no_env));
-    }
-
-    #[test]
-    fn denylist_default_allows_bash() {
-        let no_env = |_: &str| None::<String>;
-        assert!(allow_tool_with("Bash", no_env));
-        assert!(allow_tool_with("Edit", no_env));
-    }
-
-    #[test]
-    fn allowlist_overrides_denylist() {
-        // When allowlist is set, only the listed tools are allowed
-        let allowlist_only_bash = |key: &str| -> Option<String> {
-            if key == "ENGRAM_HOOK_TOOL_ALLOWLIST" {
-                Some("Bash,Edit".to_string())
-            } else {
-                None
-            }
-        };
-        assert!(allow_tool_with("Bash", allowlist_only_bash));
-        assert!(allow_tool_with("Edit", allowlist_only_bash));
-        // Read is in default denylist but NOT in allowlist — should be denied
-        assert!(!allow_tool_with("Read", allowlist_only_bash));
     }
 
     #[test]
@@ -271,21 +196,6 @@ mod tests {
             }
         };
         assert!(allow_event_with(HookEvent::SubagentStop, subagent_enabled));
-    }
-
-    #[test]
-    fn custom_denylist() {
-        let custom_deny = |key: &str| -> Option<String> {
-            if key == "ENGRAM_HOOK_TOOL_DENYLIST" {
-                Some("Bash,Edit".to_string())
-            } else {
-                None
-            }
-        };
-        assert!(!allow_tool_with("Bash", custom_deny));
-        assert!(!allow_tool_with("Edit", custom_deny));
-        // Read is NOT in the custom denylist, should be allowed
-        assert!(allow_tool_with("Read", custom_deny));
     }
 
     #[test]

@@ -94,51 +94,31 @@ fn dispatch_user_prompt_submit_no_cue_skipped() {
     );
 }
 
-// ---- Task 4a.4 ----
+// ---- PostToolUse no-op ----
 
 #[test]
-fn dispatch_post_tool_use_success_skipped() {
+fn dispatch_post_tool_use_is_noop() {
     let (_dir, db) = fresh_db();
-    // exit_code 0 and a benign tool_response — not a failure
-    let raw = r#"{"tool_name":"Bash","exit_code":0,"tool_response":{"ok":true}}"#;
-    let outcome = dispatch(
-        HookEvent::PostToolUse,
-        raw,
-        false,
-        &db,
-        None,
-        "test-project",
-    )
-    .expect("dispatch ok");
-    assert!(
-        matches!(outcome, DispatchOutcome::Skipped("tool_succeeded")),
-        "expected Skipped(\"tool_succeeded\"), got {:?}",
-        outcome
-    );
-}
-
-// ---- Task 4a.5 ----
-
-#[test]
-fn dispatch_post_tool_use_denylisted_tool_skipped() {
-    let (_dir, db) = fresh_db();
-    // "Read" is in the default denylist; exit_code 1 triggers the failure path,
-    // which then hits allow_tool and yields "tool_denied".
-    let raw = r#"{"tool_name":"Read","exit_code":1}"#;
-    let outcome = dispatch(
-        HookEvent::PostToolUse,
-        raw,
-        false,
-        &db,
-        None,
-        "test-project",
-    )
-    .expect("dispatch ok");
-    assert!(
-        matches!(outcome, DispatchOutcome::Skipped("tool_denied")),
-        "expected Skipped(\"tool_denied\"), got {:?}",
-        outcome
-    );
+    // Tool-call outcomes are never captured — neither failures nor successes.
+    for raw in [
+        r#"{"tool_name":"Bash","exit_code":0,"tool_response":{"ok":true}}"#,
+        r#"{"tool_name":"Bash","exit_code":1,"tool_response":{"error":"boom"}}"#,
+    ] {
+        let outcome = dispatch(
+            HookEvent::PostToolUse,
+            raw,
+            false,
+            &db,
+            None,
+            "test-project",
+        )
+        .expect("dispatch ok");
+        assert!(
+            matches!(outcome, DispatchOutcome::Skipped("posttooluse_noop")),
+            "expected Skipped(\"posttooluse_noop\"), got {:?}",
+            outcome
+        );
+    }
 }
 
 // ---- Task 4a.6 ----

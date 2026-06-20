@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0] - 2026-06-20
+
+### Removed
+- **Contradiction detection, entirely.** Store-time auto-detection on `memory_store` (the `potential_contradictions` scan at cosine similarity ≥ 0.85 within a type) is gone — it false-positived on legitimate supersession (e.g. a new handoff continuing a chain flagged its predecessors). Query-time `contradiction_warnings` on `memory_query` and the underlying relationship batch check are also removed, along with the `potential_contradictions` / `contradiction_warnings` response fields.
+- **`contradicts` relation type.** `RelationType::Contradicts` is removed from `memory_link` / `memory_graph` (valid relations are now `relates_to`, `supersedes`, `derived_from`). Existing stored `contradicts` edges load safely as `relates_to` (the DB read path falls back via `unwrap_or(RelationType::RelatesTo)`), so no migration is required.
+
+### Changed
+- **`PostToolUse` hook is now a no-op.** Tool-call outcomes — including failures — are no longer captured as `Debug` memories. They were low-signal noise that bloated the store. The handler validates its payload and returns immediately, matching `Stop` / `PreCompact`.
+- Removed the now-unused `ENGRAM_HOOK_TOOL_ALLOWLIST` and `ENGRAM_HOOK_TOOL_DENYLIST` env vars (they only gated the PostToolUse capture path).
+
 ## [0.5.5] - 2026-06-04
 
 ### Fixed

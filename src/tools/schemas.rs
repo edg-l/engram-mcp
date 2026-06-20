@@ -474,13 +474,13 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Relationship tools (use when tracking how knowledge connects) ===
         Tool::new(
             "memory_link",
-            "Create a typed relationship between two memories. Use when one memory supersedes another (newer decision replaces older), when memories contradict each other, or when you want to track that two memories are related or one is derived from another.",
+            "Create a typed relationship between two memories. Use when one memory supersedes another (newer decision replaces older), or when you want to track that two memories are related or one is derived from another.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "source_id": {"type": "string", "description": "ID of the source memory."},
                     "target_id": {"type": "string", "description": "ID of the target memory."},
-                    "relation": {"type": "string", "enum": ["relates_to", "supersedes", "derived_from", "contradicts"], "description": "relates_to=general connection, supersedes=source replaces target, derived_from=source was based on target, contradicts=source conflicts with target."},
+                    "relation": {"type": "string", "enum": ["relates_to", "supersedes", "derived_from"], "description": "relates_to=general connection, supersedes=source replaces target, derived_from=source was based on target."},
                     "strength": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Relationship strength (default 1.0)."}
                 },
                 "required": ["source_id", "target_id", "relation"]
@@ -494,7 +494,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to start traversal from."},
                     "depth": {"type": "integer", "minimum": 1, "maximum": 5, "description": "How many hops to traverse (default 2)."},
-                    "relation_types": {"type": "array", "items": {"type": "string"}, "description": "Filter to specific relation types: relates_to, supersedes, derived_from, contradicts."}
+                    "relation_types": {"type": "array", "items": {"type": "string"}, "description": "Filter to specific relation types: relates_to, supersedes, derived_from."}
                 },
                 "required": ["id"]
             })),
@@ -597,7 +597,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Handoff tools ===
         Tool::new(
             "handoff_create",
-            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup and contradiction detection.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
+            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
