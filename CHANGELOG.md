@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0] - 2026-06-28
+
+### Added
+- **Architecture Decision Records (ADRs).** A new `MemoryType::Adr` with an `adr_sections` sidecar table (migration 6). ADRs have fixed Nygard-style sections (title, context, decision, consequences), per-project sequential numbering (`MAX(existing)+1`, allocated in-transaction with a `UNIQUE(project_id, adr_number)` guard), and a status lifecycle: `proposed → accepted → superseded/deprecated`, plus `rejected → proposed` and `deprecated → accepted`. Transitions are validated; `superseded` is only reachable via supersession.
+- **5 MCP tools**: `adr_create`, `adr_update_status`, `adr_list`, `adr_show`, `adr_export`. `adr_create`/`adr_show`/`adr_list` are in the `core` tool profile (now 14 tools); `adr_update_status`/`adr_export` are `full`-only (now 23). None are in `minimal`.
+- **CLI**: `engram-cli adr create/update-status/list/show/export`.
+- **File export**: `adr_export` writes Nygard-style `docs/adr/NNNN-kebab-title.md` files (target dir via `ENGRAM_ADR_DIR`, default `docs/adr`). Dry-run by default; pass `--write` (CLI) / `dry_run: false` (MCP) to write to disk.
+- `memory_stats` now reports `adr_count`.
+
+### Changed
+- ADRs are project-global (never branch-scoped), pinned by default (exempt from decay/prune), and bypass both deduplication and clustering. Superseding an ADR flips the old one to `superseded` and creates a `Supersedes` edge, atomically with the new ADR's creation.
+- JSON export format bumped to `1.2` (adds optional ADR sidecar fields). Import still accepts `1.0`, `1.1`, and `1.2`; ADR number collisions on import are skipped with a warning rather than aborting.
+
 ## [0.6.0] - 2026-06-20
 
 ### Removed

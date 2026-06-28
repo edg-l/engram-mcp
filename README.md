@@ -193,6 +193,7 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 | `debug` | Past issues and solutions | "OOM was caused by unbounded channel buffer" |
 | `entity` | People, systems, services | "UserService handles all auth logic" |
 | `handoff` | Session snapshots with structured sections | Created via `handoff_create`; not available in `memory_store` |
+| `adr` | Architecture Decision Records (numbered, status-tracked) | Created via `adr_create`; not available in `memory_store` |
 
 ## MCP tool reference
 
@@ -216,6 +217,11 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 | `memory_prune` | Remove low-relevance memories (dry run by default) |
 | `memory_dedup` | Find and merge duplicate memories (dry run by default) |
 | `memory_promote` | Promote a branch-local memory to global scope |
+| `adr_create` | Create a numbered, Nygard-style ADR; optionally supersede an existing ADR |
+| `adr_update_status` | Advance an ADR through its lifecycle (proposed/accepted/deprecated/rejected) |
+| `adr_list` | List the project's ADRs, optionally filtered by status |
+| `adr_show` | Show a single ADR by number |
+| `adr_export` | Export ADRs to Nygard-style Markdown files (dry run by default) |
 
 ### Storing memories
 
@@ -310,7 +316,8 @@ engram-cli health
 | `ENGRAM_DECAY_INTERVAL` | Decay job interval (seconds) | `3600` (1 hour) |
 | `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
 | `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
-| `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (18 tools), `core` (11), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
+| `ENGRAM_ADR_DIR` | Target directory for `adr_export` Markdown files | `docs/adr` |
+| `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (23 tools), `core` (14), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
 | `ENGRAM_HOOK_DEDUP_SKIP` | Similarity threshold above which hook captures are silently dropped (clamped to `[0.5, 1.0]`) | `0.95` |
 | `ENGRAM_HOOK_DAILY_CAP` | Max hook-captured memories per project per UTC day; `0` = unlimited | `50` |
 
