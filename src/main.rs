@@ -1,5 +1,6 @@
 #![allow(clippy::manual_async_fn)]
 
+mod adr_export;
 mod cache;
 mod db;
 mod decay;

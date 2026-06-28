@@ -228,6 +228,7 @@ fn export_import_preserves_handoff_sections() {
         relationships,
         None,
         sidecars,
+        &std::collections::HashMap::new(),
         Some("test-model".to_string()),
     );
 
@@ -360,6 +361,9 @@ fn import_old_export_without_sidecar_fields() {
         sections: None,
         section_embedding_keys: None,
         section_embeddings: None,
+        adr_number: None,
+        adr_status: None,
+        adr_sections: None,
     };
 
     // Store the memory row (simulating what memory_import does for the old format).

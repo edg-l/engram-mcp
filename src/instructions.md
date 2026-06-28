@@ -41,3 +41,7 @@ Use `memory_query` when you need to recall a specific piece of knowledge -- "wha
 Use `handoff_create` at session end and `handoff_resume` at session start to preserve and restore working context across sessions. Handoffs capture structured sections (summary, decisions, todos, blockers, mental model, next steps, notes) and are pinned so they never decay. Use `handoff_search` to find specific section content across past sessions.
 
 Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
+
+# Architecture decisions
+
+Use `adr_create` for formal, numbered, status-tracked architecture decisions that warrant a durable record (technology choices, structural constraints, API contracts). ADRs are project-global, pinned, and exempt from decay. Use `memory_store type=decision` for lightweight rationale or in-the-moment choices that do not need a formal lifecycle (proposed/accepted/superseded/deprecated/rejected).

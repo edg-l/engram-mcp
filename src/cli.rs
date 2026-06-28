@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod adr_export;
 mod cache;
 mod db;
 mod decay;
@@ -17,7 +18,9 @@ use db::Database;
 use embedding::EmbeddingService;
 use error::MemoryError;
 use hooks::HookEvent;
-use memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship};
+use memory::{
+    AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, RelationType, Relationship,
+};
 use summarize::{generate_summary, should_auto_summarize};
 
 #[derive(Parser)]
@@ -225,6 +228,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: HandoffCmd,
     },
+    /// Architecture Decision Record management
+    Adr {
+        #[command(subcommand)]
+        cmd: AdrCmd,
+    },
     /// Process a Claude Code lifecycle hook event
     HookEvent {
         /// Hook event name (e.g. SessionStart, UserPromptSubmit, PostToolUse)
@@ -336,6 +344,70 @@ enum HooksCmd {
     Uninstall,
     /// Show which events are managed by engram-cli
     Status,
+}
+
+/// Subcommands for `engram-cli adr`.
+#[derive(Subcommand)]
+enum AdrCmd {
+    /// Create a new ADR (project-global, pinned by default)
+    Create {
+        /// Short, imperative-mood title
+        #[arg(long)]
+        title: Option<String>,
+        /// Forces and constraints that drove this decision
+        #[arg(long)]
+        context: Option<String>,
+        /// The decision made
+        #[arg(long)]
+        decision: Option<String>,
+        /// Positive and negative consequences
+        #[arg(long)]
+        consequences: Option<String>,
+        /// Initial lifecycle status
+        #[arg(long, default_value = "proposed")]
+        status: String,
+        /// ADR number this decision supersedes
+        #[arg(long)]
+        supersedes: Option<u32>,
+        /// Importance score (0.0-1.0)
+        #[arg(long, default_value_t = 0.85)]
+        importance: f64,
+        /// Do NOT pin this ADR (it is pinned by default)
+        #[arg(long)]
+        no_pin: bool,
+        /// Read sections from a Markdown file instead of interactive prompts
+        #[arg(long)]
+        from_file: Option<PathBuf>,
+    },
+    /// Update the lifecycle status of an ADR
+    UpdateStatus {
+        /// ADR number to update
+        number: u32,
+        /// New status (proposed, accepted, deprecated, rejected)
+        status: String,
+    },
+    /// List all ADRs for the current project
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Show full details of an ADR by number
+    Show {
+        /// ADR number
+        number: u32,
+    },
+    /// Export ADRs to Markdown files
+    Export {
+        /// Export a single ADR by number; omit to export all
+        number: Option<u32>,
+        /// Output directory (default: docs/adr)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Actually write files (default: dry run)
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -456,6 +528,7 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
             handoff_cmd,
             HandoffCmd::Create { .. } | HandoffCmd::Resume { .. } | HandoffCmd::Search { .. }
         ),
+        Commands::Adr { cmd: adr_cmd } => matches!(adr_cmd, AdrCmd::Create { .. }),
         Commands::HookEvent { .. } => true,
         Commands::Hooks { .. } => false,
         _ => false,
@@ -688,6 +761,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_branch.as_deref(),
                 handoff_cmd,
             )?;
+        }
+        Commands::Adr { cmd: adr_cmd } => {
+            cmd_adr(&db, &project_id, embedding_service.as_ref(), adr_cmd)?;
         }
         Commands::HookEvent {
             event,
@@ -1151,6 +1227,8 @@ fn cmd_export(
     // Collect handoff sidecar data for Handoff memories.
     let mut handoff_sidecars: std::collections::HashMap<String, export::HandoffSidecar> =
         std::collections::HashMap::new();
+    // Collect ADR sidecar data for ADR memories.
+    let mut adr_sidecars: export::AdrSidecarMap = std::collections::HashMap::new();
     for memory in &memories {
         if memory.memory_type == MemoryType::Handoff
             && let Some((sections, section_vecs)) = db.get_handoff_sections(&memory.id)?
@@ -1168,6 +1246,11 @@ fn cmd_export(
                 },
             );
         }
+        if memory.memory_type == MemoryType::Adr
+            && let Some((num, status, sections)) = db.get_adr_sections(&memory.id)?
+        {
+            adr_sidecars.insert(memory.id.clone(), (num, status, sections));
+        }
     }
 
     let export_data = export::create_export(
@@ -1176,6 +1259,7 @@ fn cmd_export(
         relationships,
         embeddings,
         handoff_sidecars,
+        &adr_sidecars,
         None,
     );
 
@@ -1220,11 +1304,31 @@ fn cmd_import(
         let sections = exported.sections;
         let section_embedding_keys = exported.section_embedding_keys;
         let encoded_section_embeddings = exported.section_embeddings;
+        let adr_number = exported.adr_number;
+        let adr_status_str = exported.adr_status;
+        let adr_sections_data = exported.adr_sections;
+        let mem_created_at = memory.created_at;
+        let mem_updated_at = memory.updated_at;
         memory.project_id = project_id.to_string();
         memory.updated_at = now;
 
         if import_mode == export::ImportMode::Merge && db.get_memory(&memory.id)?.is_some() {
             skipped += 1;
+            continue;
+        }
+
+        // For ADR memories with a known number, pre-check the number BEFORE storing
+        // the memory row.  If the number is already taken, skip the entire memory
+        // (memory row + embedding + sidecar) to keep them consistent.
+        if memory.memory_type == MemoryType::Adr
+            && let Some(num) = adr_number
+            && db.get_adr_by_number(project_id, num)?.is_some()
+        {
+            skipped += 1;
+            eprintln!(
+                "Warning: skipping imported ADR {} — number {} already exists in project",
+                memory.id, num
+            );
             continue;
         }
 
@@ -1283,6 +1387,39 @@ fn cmd_import(
                     eprintln!(
                         "Notice: handoff {} imported without sidecar (old export format).",
                         memory.id
+                    );
+                }
+            }
+        }
+
+        // Import ADR sidecar if present.
+        // Number-conflict check above guarantees the number is free at this point.
+        if memory.memory_type == MemoryType::Adr
+            && let (Some(num), Some(status_str), Some(adr_sec)) =
+                (adr_number, adr_status_str, adr_sections_data)
+        {
+            use std::str::FromStr;
+            match AdrStatus::from_str(&status_str) {
+                Ok(status) => {
+                    if let Err(e) = db.insert_adr_sidecar(
+                        &memory.id,
+                        project_id,
+                        num,
+                        status,
+                        &adr_sec,
+                        mem_created_at,
+                        mem_updated_at,
+                    ) {
+                        eprintln!(
+                            "Warning: failed to insert ADR sidecar for {} (number {}): {}",
+                            memory.id, num, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: skipping ADR sidecar for {} — invalid status '{}': {}",
+                        memory.id, status_str, e
                     );
                 }
             }
@@ -2052,6 +2189,193 @@ fn cmd_handoff(
                     println!("Created: {}", format_timestamp(memory.created_at));
                     println!("\nContent:\n{}", memory.content);
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch ADR subcommands.
+fn cmd_adr(
+    db: &Database,
+    project_id: &str,
+    embedding_service: Option<&EmbeddingService>,
+    cmd: AdrCmd,
+) -> Result<(), MemoryError> {
+    use std::str::FromStr;
+
+    match cmd {
+        AdrCmd::Create {
+            title,
+            context,
+            decision,
+            consequences,
+            status,
+            supersedes,
+            importance,
+            no_pin,
+            from_file,
+        } => {
+            let embedding = embedding_service.ok_or_else(|| {
+                MemoryError::InvalidType("embedding service required".to_string())
+            })?;
+
+            let sections = if let Some(path) = from_file {
+                let content = std::fs::read_to_string(&path)?;
+                AdrSections::parse_markdown(&content)?
+            } else {
+                let title_text = if let Some(t) = title {
+                    t
+                } else {
+                    let t = prompt_line("Title");
+                    if t.is_empty() {
+                        return Err(MemoryError::InvalidType(
+                            "adr: title is required".to_string(),
+                        ));
+                    }
+                    t
+                };
+
+                let context_text = if let Some(c) = context {
+                    c
+                } else {
+                    prompt_line("Context")
+                };
+
+                let decision_text = if let Some(d) = decision {
+                    d
+                } else {
+                    let d = prompt_line("Decision");
+                    if d.is_empty() {
+                        return Err(MemoryError::InvalidType(
+                            "adr: decision is required".to_string(),
+                        ));
+                    }
+                    d
+                };
+
+                let consequences_text = if let Some(c) = consequences {
+                    c
+                } else {
+                    prompt_line("Consequences")
+                };
+
+                AdrSections {
+                    title: title_text,
+                    context: context_text,
+                    decision: decision_text,
+                    consequences: consequences_text,
+                }
+            };
+
+            let parsed_status = AdrStatus::from_str(&status)
+                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+
+            let result = tools::create_adr(
+                db,
+                embedding,
+                project_id,
+                sections,
+                parsed_status,
+                importance,
+                !no_pin,
+                supersedes,
+            )?;
+
+            println!(
+                "ADR-{:04} created (status: {})",
+                result.adr_number, result.status
+            );
+            if let Some(ref sid) = result.superseded_id {
+                println!("Superseded: {}", sid);
+            }
+        }
+
+        AdrCmd::UpdateStatus { number, status } => {
+            let target_status = AdrStatus::from_str(&status)
+                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+
+            if target_status == AdrStatus::Superseded {
+                return Err(MemoryError::InvalidType(
+                    "use adr create --supersedes to mark an ADR superseded".to_string(),
+                ));
+            }
+
+            let id = db
+                .get_adr_by_number(project_id, number)?
+                .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", number)))?;
+
+            let (_, current_status, _) = db
+                .get_adr_sections(&id)?
+                .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", id)))?;
+
+            if !current_status.can_transition_to(target_status) {
+                return Err(MemoryError::InvalidType(format!(
+                    "invalid ADR status transition: {} -> {}",
+                    current_status, target_status
+                )));
+            }
+
+            db.update_adr_status(&id, target_status)?;
+            println!("ADR-{:04} status updated to {}", number, target_status);
+        }
+
+        AdrCmd::List { status } => {
+            let status_filter = status
+                .as_deref()
+                .map(AdrStatus::from_str)
+                .transpose()
+                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+
+            let rows = db.list_adrs(project_id, status_filter)?;
+
+            if rows.is_empty() {
+                println!("No ADRs found.");
+                return Ok(());
+            }
+
+            println!("{:<6}  {:<12}  TITLE", "NUMBER", "STATUS");
+            println!("{}", "-".repeat(60));
+            for (number, adr_status, title, _id) in rows {
+                println!("ADR-{:04}  {:<12}  {}", number, adr_status, title);
+            }
+        }
+
+        AdrCmd::Show { number } => {
+            let id = db
+                .get_adr_by_number(project_id, number)?
+                .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", number)))?;
+
+            let (num, adr_status, sections) = db
+                .get_adr_sections(&id)?
+                .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", id)))?;
+
+            let _ = db.record_access(&id);
+
+            println!("ADR-{:04}: {}", num, sections.title);
+            println!("Status: {}", adr_status);
+            println!("ID: {}", id);
+            println!("\n## Context\n\n{}", sections.context);
+            println!("\n## Decision\n\n{}", sections.decision);
+            println!("\n## Consequences\n\n{}", sections.consequences);
+        }
+
+        AdrCmd::Export { number, dir, write } => {
+            let dry_run = !write;
+            let target_dir =
+                adr_export::adr_export_target_dir(dir.as_deref().and_then(|p| p.to_str()));
+            let paths =
+                adr_export::export_adr_to_disk(db, project_id, &target_dir, number, dry_run)?;
+            for path in &paths {
+                if dry_run {
+                    println!("would write: {}", path.display());
+                } else {
+                    println!("wrote: {}", path.display());
+                }
+            }
+            if paths.is_empty() {
+                println!("No ADRs found for project '{}'.", project_id);
             }
         }
     }

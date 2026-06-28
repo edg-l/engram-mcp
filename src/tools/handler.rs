@@ -13,12 +13,15 @@ use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::export::{self, ExportData, ExportedMemory, HandoffSidecar, ImportMode, ImportStats};
 use crate::memory::{
-    HandoffSections, Memory, MemoryType, MemoryWithScore, ProjectStats, RelationType, Relationship,
+    AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, MemoryWithScore, ProjectStats,
+    RelationType, Relationship,
 };
 use crate::summarize::{generate_summary, should_auto_summarize};
 
+use super::adr::create_adr;
 use super::handoff::{create_handoff, handoff_section_key_texts, resume_handoff, search_handoffs};
 use super::schemas::{
+    AdrCreateInput, AdrExportInput, AdrListInput, AdrShowInput, AdrUpdateStatusInput,
     HandoffCreateInput, HandoffResumeInput, HandoffSearchInput, MemoryContextInput,
     MemoryDedupInput, MemoryDeleteBatchInput, MemoryDeleteInput, MemoryExportInput,
     MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryPromoteInput, MemoryPruneInput,
@@ -29,6 +32,7 @@ use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
     compute_tag_boost, rrf_fuse,
 };
+use crate::adr_export::{adr_export_target_dir, export_adr_to_disk};
 
 // ============================================
 // Per-process profile + once-warning
@@ -235,6 +239,11 @@ impl ToolHandler {
             "handoff_create" => self.handoff_create(arguments),
             "handoff_resume" => self.handoff_resume(arguments),
             "handoff_search" => self.handoff_search(arguments),
+            "adr_create" => self.adr_create(arguments),
+            "adr_update_status" => self.adr_update_status(arguments),
+            "adr_list" => self.adr_list(arguments),
+            "adr_show" => self.adr_show(arguments),
+            "adr_export" => self.adr_export(arguments),
             _ => Err(MemoryError::UnknownTool(name.to_string())),
         }
     }
@@ -1130,6 +1139,8 @@ impl ToolHandler {
         // Collect handoff sidecar data for all Handoff-type memories.
         let mut handoff_sidecars: std::collections::HashMap<String, HandoffSidecar> =
             std::collections::HashMap::new();
+        // Collect ADR sidecar data for all ADR-type memories.
+        let mut adr_sidecars: export::AdrSidecarMap = std::collections::HashMap::new();
         for memory in &memories {
             if memory.memory_type == MemoryType::Handoff
                 && let Some((sections, section_vecs)) = self.db.get_handoff_sections(&memory.id)?
@@ -1150,6 +1161,11 @@ impl ToolHandler {
                     },
                 );
             }
+            if memory.memory_type == MemoryType::Adr
+                && let Some((num, status, sections)) = self.db.get_adr_sections(&memory.id)?
+            {
+                adr_sidecars.insert(memory.id.clone(), (num, status, sections));
+            }
         }
 
         let export_data = export::create_export(
@@ -1158,6 +1174,7 @@ impl ToolHandler {
             relationships,
             embeddings,
             handoff_sidecars,
+            &adr_sidecars,
             Some(self.embedding.model_version().to_string()),
         );
 
@@ -1205,7 +1222,13 @@ impl ToolHandler {
                 sections,
                 section_embedding_keys,
                 section_embeddings: encoded_section_embeddings,
+                adr_number,
+                adr_status: adr_status_str,
+                adr_sections: adr_sections_data,
             } = exported;
+
+            let mem_created_at = memory.created_at;
+            let mem_updated_at = memory.updated_at;
 
             // Update project_id to current project
             memory.project_id = self.project_id.clone();
@@ -1214,6 +1237,22 @@ impl ToolHandler {
             // Check if memory already exists (in merge mode)
             if mode == ImportMode::Merge && self.db.get_memory(&memory.id)?.is_some() {
                 stats.memories_skipped += 1;
+                continue;
+            }
+
+            // For ADR memories with a known number, pre-check the number BEFORE storing
+            // the memory row.  If the number is already taken, skip the entire memory
+            // (memory row + embedding + sidecar) to keep them consistent.
+            if memory.memory_type == MemoryType::Adr
+                && let Some(num) = adr_number
+                && self.db.get_adr_by_number(&self.project_id, num)?.is_some()
+            {
+                stats.memories_skipped += 1;
+                tracing::warn!(
+                    "skipping imported ADR {} — number {} already exists in project",
+                    memory.id,
+                    num
+                );
                 continue;
             }
 
@@ -1289,6 +1328,42 @@ impl ToolHandler {
                         tracing::info!(
                             "handoff {} imported without sidecar (old export format; sections not available)",
                             memory.id
+                        );
+                    }
+                }
+            }
+
+            // Import ADR sidecar if present (ADR memories only).
+            // Number-conflict check above guarantees the number is free at this point.
+            if memory.memory_type == MemoryType::Adr
+                && let (Some(num), Some(status_str), Some(adr_sec)) =
+                    (adr_number, adr_status_str, adr_sections_data)
+            {
+                match status_str.parse::<AdrStatus>() {
+                    Ok(status) => {
+                        if let Err(e) = self.db.insert_adr_sidecar(
+                            &memory.id,
+                            &self.project_id,
+                            num,
+                            status,
+                            &adr_sec,
+                            mem_created_at,
+                            mem_updated_at,
+                        ) {
+                            tracing::warn!(
+                                "failed to insert ADR sidecar for {} (number {}): {}",
+                                memory.id,
+                                num,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "skipping ADR sidecar for {} — invalid status '{}': {}",
+                            memory.id,
+                            status_str,
+                            e
                         );
                     }
                 }
@@ -2155,6 +2230,156 @@ impl ToolHandler {
         Ok(json!(result))
     }
 
+    fn adr_create(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: AdrCreateInput = serde_json::from_value(arguments)?;
+
+        let status = input
+            .status
+            .parse::<AdrStatus>()
+            .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+
+        let sections = AdrSections {
+            title: input.title,
+            context: input.context,
+            decision: input.decision,
+            consequences: input.consequences,
+        };
+
+        let result = create_adr(
+            &self.db,
+            &self.embedding,
+            &self.project_id,
+            sections,
+            status,
+            input.importance,
+            input.pinned,
+            input.supersedes,
+        )?;
+
+        self.invalidate_search_cache();
+
+        Ok(json!(result))
+    }
+
+    fn adr_update_status(&self, arguments: Value) -> Result<Value, MemoryError> {
+        use std::str::FromStr;
+
+        let input: AdrUpdateStatusInput = serde_json::from_value(arguments)?;
+
+        let old_id = self
+            .db
+            .get_adr_by_number(&self.project_id, input.number)?
+            .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", input.number)))?;
+
+        let target_status = AdrStatus::from_str(&input.status)
+            .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+
+        if target_status == AdrStatus::Superseded {
+            return Err(MemoryError::InvalidType(
+                "use adr_create with the 'supersedes' field to mark an ADR superseded".to_string(),
+            ));
+        }
+
+        let (_, current_status, _) = self
+            .db
+            .get_adr_sections(&old_id)?
+            .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", old_id)))?;
+
+        if !current_status.can_transition_to(target_status) {
+            return Err(MemoryError::InvalidType(format!(
+                "invalid ADR status transition: {} -> {}",
+                current_status, target_status
+            )));
+        }
+
+        self.db.update_adr_status(&old_id, target_status)?;
+
+        Ok(json!({
+            "id": old_id,
+            "number": input.number,
+            "status": target_status.as_str(),
+        }))
+    }
+
+    fn adr_list(&self, arguments: Value) -> Result<Value, MemoryError> {
+        use std::str::FromStr;
+
+        let input: AdrListInput = serde_json::from_value(arguments)?;
+
+        let status_filter = input
+            .status
+            .as_deref()
+            .map(AdrStatus::from_str)
+            .transpose()
+            .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+
+        let rows = self.db.list_adrs(&self.project_id, status_filter)?;
+
+        let items: Vec<Value> = rows
+            .into_iter()
+            .map(|(number, status, title, id)| {
+                json!({
+                    "number": number,
+                    "status": status.as_str(),
+                    "title": title,
+                    "id": id,
+                })
+            })
+            .collect();
+
+        Ok(json!(items))
+    }
+
+    fn adr_show(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: AdrShowInput = serde_json::from_value(arguments)?;
+
+        let id = self
+            .db
+            .get_adr_by_number(&self.project_id, input.number)?
+            .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", input.number)))?;
+
+        let (number, status, sections) = self
+            .db
+            .get_adr_sections(&id)?
+            .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", id)))?;
+
+        let _ = self.db.record_access(&id);
+
+        Ok(json!({
+            "id": id,
+            "number": number,
+            "status": status.as_str(),
+            "title": sections.title,
+            "context": sections.context,
+            "decision": sections.decision,
+            "consequences": sections.consequences,
+        }))
+    }
+
+    fn adr_export(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: AdrExportInput = serde_json::from_value(arguments)?;
+
+        let dir = adr_export_target_dir(input.dir.as_deref());
+        let paths = export_adr_to_disk(
+            &self.db,
+            &self.project_id,
+            &dir,
+            input.number,
+            input.dry_run,
+        )?;
+
+        let files: Vec<String> = paths
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
+        Ok(json!({
+            "dry_run": input.dry_run,
+            "dir": dir.to_string_lossy(),
+            "files": files,
+        }))
+    }
+
     /// Generate a cluster summary from member memories.
     /// Uses the first sentence of the highest-importance member + top keywords across all members.
     fn generate_cluster_summary(&self, member_ids: &[String]) -> Result<String, MemoryError> {
@@ -2995,6 +3220,332 @@ mod tests {
             post_vecs.len(),
             orig_vecs.len(),
             "sidecar section count must be unchanged"
+        );
+    }
+
+    // ============================================
+    // 5.1: ADR handler tests
+    // ============================================
+
+    /// 5.1 test 1: adr_create_assigns_number_and_pins
+    /// Call adr_create handler; assert returned adr_number == 1, stored memory is pinned,
+    /// memory_type == Adr, and branch == None (project-global).
+    #[test]
+    fn adr_create_assigns_number_and_pins() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "adr-handler-proj";
+        db.get_or_create_project(project_id, "ADR Handler Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        let result = handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Use SQLite for local storage",
+                    "context": "We need a local, zero-dep database.",
+                    "decision": "We will use SQLite via rusqlite.",
+                    "consequences": "Simple deployment; no concurrent writes."
+                }),
+            )
+            .expect("adr_create must succeed");
+
+        assert_eq!(result["adr_number"], 1, "first ADR should be number 1");
+
+        // Verify stored memory row.
+        let adr_id = result["id"].as_str().expect("id must be a string");
+        let memory = db.get_memory(adr_id).unwrap().unwrap();
+        assert_eq!(
+            memory.memory_type,
+            MemoryType::Adr,
+            "memory_type must be Adr"
+        );
+        assert!(memory.pinned, "ADR must be pinned by default");
+        assert!(
+            memory.branch.is_none(),
+            "ADR must be project-global (branch == None)"
+        );
+    }
+
+    /// 5.1 test 2: adr_create_bypasses_dedup
+    /// Create two near-identical ADRs; assert numbers 1 and 2 and both persist
+    /// (dedup did not merge them).
+    #[test]
+    fn adr_create_bypasses_dedup() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "adr-dedup-proj";
+        db.get_or_create_project(project_id, "ADR Dedup Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        let first = handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Use SQLite for local storage",
+                    "context": "We need a local, zero-dep database.",
+                    "decision": "We will use SQLite via rusqlite.",
+                    "consequences": "Simple deployment; no concurrent writes."
+                }),
+            )
+            .expect("first adr_create must succeed");
+
+        // Near-identical second ADR — dedup would merge this if it were memory_store.
+        let second = handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Use SQLite for local storage",
+                    "context": "We need a local, zero-dep database.",
+                    "decision": "We will use SQLite via rusqlite.",
+                    "consequences": "Simple deployment; no concurrent writes."
+                }),
+            )
+            .expect("second adr_create must succeed");
+
+        assert_eq!(first["adr_number"], 1, "first ADR should be number 1");
+        assert_eq!(second["adr_number"], 2, "second ADR should be number 2");
+
+        // Both memory rows must still exist.
+        let id1 = first["id"].as_str().unwrap();
+        let id2 = second["id"].as_str().unwrap();
+        assert!(db.get_memory(id1).unwrap().is_some(), "ADR-1 must persist");
+        assert!(db.get_memory(id2).unwrap().is_some(), "ADR-2 must persist");
+    }
+
+    /// 5.1 test 3: adr_update_status_valid_and_invalid
+    /// proposed->accepted succeeds; accepted->proposed is rejected (InvalidType);
+    /// a direct update to superseded is rejected with the "use ... supersede" message.
+    #[test]
+    fn adr_update_status_valid_and_invalid() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "adr-status-proj";
+        db.get_or_create_project(project_id, "ADR Status Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        // Create an ADR in the proposed state.
+        handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Use SQLite",
+                    "context": "Need a DB.",
+                    "decision": "Use SQLite.",
+                    "consequences": "Easy to embed."
+                }),
+            )
+            .unwrap();
+
+        // Valid transition: proposed -> accepted.
+        let ok = handler.handle_tool(
+            "adr_update_status",
+            json!({"number": 1, "status": "accepted"}),
+        );
+        assert!(ok.is_ok(), "proposed->accepted must succeed, got {:?}", ok);
+
+        // Invalid transition: accepted -> proposed.
+        let err = handler.handle_tool(
+            "adr_update_status",
+            json!({"number": 1, "status": "proposed"}),
+        );
+        assert!(
+            matches!(err, Err(MemoryError::InvalidType(_))),
+            "accepted->proposed must be InvalidType, got {:?}",
+            err
+        );
+
+        // Superseded must always be rejected via adr_update_status.
+        let err_super = handler.handle_tool(
+            "adr_update_status",
+            json!({"number": 1, "status": "superseded"}),
+        );
+        assert!(
+            matches!(err_super, Err(MemoryError::InvalidType(ref msg)) if msg.contains("supersede")),
+            "direct superseded transition must be rejected with 'supersede' message, got {:?}",
+            err_super
+        );
+    }
+
+    /// 5.1 test 4: adr_supersede_flips_status_and_creates_edge
+    /// Create ADR-1, then create ADR-2 with supersedes=1; assert ADR-1 becomes
+    /// Superseded AND a Supersedes relationship from ADR-2 -> ADR-1 exists.
+    #[test]
+    fn adr_supersede_flips_status_and_creates_edge() {
+        use crate::memory::RelationType;
+
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "adr-supersede-proj";
+        db.get_or_create_project(project_id, "ADR Supersede Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        // Create ADR-1 (accepted — supersession requires accepted or proposed->accepted first).
+        let adr1_result = handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Use SQLite",
+                    "context": "Need a DB.",
+                    "decision": "Use SQLite.",
+                    "consequences": "Easy to embed.",
+                    "status": "accepted"
+                }),
+            )
+            .unwrap();
+        let adr1_id = adr1_result["id"].as_str().unwrap().to_string();
+
+        // Create ADR-2 that supersedes ADR-1.
+        let adr2_result = handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Use PostgreSQL",
+                    "context": "Need a DB with concurrent writes.",
+                    "decision": "Use PostgreSQL.",
+                    "consequences": "Better concurrency.",
+                    "supersedes": 1
+                }),
+            )
+            .unwrap();
+        let adr2_id = adr2_result["id"].as_str().unwrap().to_string();
+
+        // ADR-1 must now be Superseded.
+        let (_, adr1_status, _) = db.get_adr_sections(&adr1_id).unwrap().unwrap();
+        assert_eq!(
+            adr1_status,
+            crate::memory::AdrStatus::Superseded,
+            "ADR-1 must be Superseded after supersession"
+        );
+
+        // A Supersedes relationship from ADR-2 -> ADR-1 must exist.
+        let rels = db.get_relationships_from(&adr2_id).unwrap();
+        let supersedes_rel = rels
+            .iter()
+            .find(|r| r.target_id == adr1_id && r.relation_type == RelationType::Supersedes);
+        assert!(
+            supersedes_rel.is_some(),
+            "Supersedes relationship from ADR-2 to ADR-1 must exist, got: {:?}",
+            rels
+        );
+    }
+
+    /// 5.1 test 5: create_with_invalid_supersede_does_not_create_adr
+    ///
+    /// Attempting to create an ADR that supersedes a non-existent number must return Err
+    /// AND must not leave any new ADR in the database (no orphan).
+    ///
+    /// Also verifies that superseding a `proposed` ADR (which cannot transition to
+    /// `superseded` directly) returns Err without creating a new ADR.
+    #[test]
+    fn create_with_invalid_supersede_does_not_create_adr() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "adr-no-orphan-proj";
+        db.get_or_create_project(project_id, "No Orphan Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        // Case 1: supersede a non-existent ADR number.
+        let before = db.list_adrs(project_id, None).unwrap().len();
+        let err = handler.handle_tool(
+            "adr_create",
+            json!({
+                "title": "Should Not Exist",
+                "context": "ctx",
+                "decision": "dec",
+                "consequences": "cons",
+                "supersedes": 999
+            }),
+        );
+        assert!(
+            matches!(err, Err(MemoryError::NotFound(_))),
+            "superseding non-existent ADR must return NotFound, got {:?}",
+            err
+        );
+        let after = db.list_adrs(project_id, None).unwrap().len();
+        assert_eq!(
+            before, after,
+            "no ADR must be created when supersession target does not exist (orphan check)"
+        );
+
+        // Case 2: create a proposed ADR, then attempt to supersede it via adr_create
+        // (proposed -> superseded is not a valid transition — proposed can only go to
+        // accepted or rejected first).
+        handler
+            .handle_tool(
+                "adr_create",
+                json!({
+                    "title": "Proposed ADR",
+                    "context": "ctx",
+                    "decision": "dec",
+                    "consequences": "cons",
+                    "status": "proposed"
+                }),
+            )
+            .expect("creating the proposed ADR must succeed");
+
+        let count_after_first = db.list_adrs(project_id, None).unwrap().len();
+        assert_eq!(count_after_first, 1, "exactly one ADR must exist now");
+
+        let err2 = handler.handle_tool(
+            "adr_create",
+            json!({
+                "title": "Superseder",
+                "context": "ctx",
+                "decision": "dec",
+                "consequences": "cons",
+                "supersedes": 1
+            }),
+        );
+        assert!(
+            matches!(err2, Err(MemoryError::InvalidType(_))),
+            "superseding a proposed ADR must return InvalidType, got {:?}",
+            err2
+        );
+        let count_after_failed = db.list_adrs(project_id, None).unwrap().len();
+        assert_eq!(
+            count_after_first, count_after_failed,
+            "failed supersede must not leave an orphan ADR"
         );
     }
 }

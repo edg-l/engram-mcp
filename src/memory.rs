@@ -14,6 +14,7 @@ pub enum MemoryType {
     Debug,
     Entity,
     Handoff,
+    Adr,
 }
 
 impl MemoryType {
@@ -26,6 +27,7 @@ impl MemoryType {
             Self::Debug => "debug",
             Self::Entity => "entity",
             Self::Handoff => "handoff",
+            Self::Adr => "adr",
         }
     }
 }
@@ -59,7 +61,80 @@ impl FromStr for MemoryType {
             "debug" => Ok(Self::Debug),
             "entity" => Ok(Self::Entity),
             "handoff" => Ok(Self::Handoff),
+            "adr" => Ok(Self::Adr),
             _ => Err(ParseMemoryTypeError(s.to_string())),
+        }
+    }
+}
+
+/// Status lifecycle for an ADR memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Used by ADR create/update/query tools (Phase 2)
+pub enum AdrStatus {
+    Proposed,
+    Accepted,
+    Superseded,
+    Deprecated,
+    Rejected,
+}
+
+#[allow(dead_code)] // Used by ADR create/update/query tools (Phase 2)
+impl AdrStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Accepted => "accepted",
+            Self::Superseded => "superseded",
+            Self::Deprecated => "deprecated",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    /// Returns true when transitioning from `self` to `to` is a valid lifecycle move.
+    pub fn can_transition_to(self, to: AdrStatus) -> bool {
+        if self == to {
+            return true;
+        }
+        match self {
+            Self::Proposed => matches!(to, Self::Accepted | Self::Rejected | Self::Deprecated),
+            Self::Accepted => matches!(to, Self::Deprecated | Self::Superseded),
+            Self::Rejected => matches!(to, Self::Proposed),
+            Self::Deprecated => matches!(to, Self::Accepted),
+            Self::Superseded => false,
+        }
+    }
+}
+
+impl fmt::Display for AdrStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used by ADR create/update/query tools (Phase 2)
+pub struct ParseAdrStatusError(pub String);
+
+impl fmt::Display for ParseAdrStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid ADR status: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseAdrStatusError {}
+
+impl FromStr for AdrStatus {
+    type Err = ParseAdrStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "proposed" => Ok(Self::Proposed),
+            "accepted" => Ok(Self::Accepted),
+            "superseded" => Ok(Self::Superseded),
+            "deprecated" => Ok(Self::Deprecated),
+            "rejected" => Ok(Self::Rejected),
+            _ => Err(ParseAdrStatusError(s.to_string())),
         }
     }
 }
@@ -312,6 +387,177 @@ impl HandoffSections {
     }
 }
 
+/// Structured sections for a `MemoryType::Adr` memory (Nygard-style).
+///
+/// The canonical text (stored in `memories.content`) is produced by `render_markdown`
+/// and can be partially round-tripped via `parse_markdown` (status/number/date are not
+/// recovered from markdown — those live in the `adr_sections` sidecar table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // Used by ADR create/update/query tools (Phase 2)
+pub struct AdrSections {
+    pub title: String,
+    pub context: String,
+    pub decision: String,
+    pub consequences: String,
+}
+
+#[allow(dead_code)] // Used by ADR create/update/query tools (Phase 2)
+impl AdrSections {
+    /// Render sections into Nygard-style markdown stored in `memories.content`.
+    pub fn render_markdown(&self, number: u32, status: AdrStatus, date_unix: i64) -> String {
+        let date = chrono::DateTime::from_timestamp(date_unix, 0)
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "1970-01-01".to_string());
+
+        format!(
+            "# {:04}. {}\n\n## Status\n\n{} \u{2014} {}\n\n## Context\n\n{}\n\n## Decision\n\n{}\n\n## Consequences\n\n{}",
+            number, self.title, status, date, self.context, self.decision, self.consequences,
+        )
+    }
+
+    /// Parse Nygard-style markdown back into `AdrSections`.
+    ///
+    /// Recovers `title` (from `# NNNN. {title}` heading), `context`, `decision`,
+    /// and `consequences`. Status, number, and date are NOT parsed; they live in
+    /// the `adr_sections` sidecar table.
+    ///
+    /// Returns `MemoryError::InvalidType("adr: malformed sections")` if Title or
+    /// Decision is empty.
+    pub fn parse_markdown(content: &str) -> Result<AdrSections, MemoryError> {
+        let malformed = || MemoryError::InvalidType("adr: malformed sections".to_string());
+
+        let mut title = String::new();
+        let mut context = String::new();
+        let mut decision = String::new();
+        let mut consequences = String::new();
+
+        #[derive(PartialEq)]
+        enum Section {
+            None,
+            Status,
+            Context,
+            Decision,
+            Consequences,
+        }
+
+        let mut current = Section::None;
+        let mut body_lines: Vec<&str> = Vec::new();
+
+        let flush = |current: &Section,
+                     body_lines: &[&str],
+                     context: &mut String,
+                     decision: &mut String,
+                     consequences: &mut String| {
+            let body = body_lines.join("\n").trim().to_string();
+            match current {
+                Section::Context => *context = body,
+                Section::Decision => *decision = body,
+                Section::Consequences => *consequences = body,
+                Section::Status | Section::None => {}
+            }
+        };
+
+        for line in content.lines() {
+            // Top-level heading: # NNNN. Title
+            if let Some(heading) = line.strip_prefix("# ") {
+                // Extract title after optional "NNNN. " prefix
+                let raw = heading.trim();
+                let extracted = if let Some(dot_pos) = raw.find(". ") {
+                    let prefix = &raw[..dot_pos];
+                    if prefix.chars().all(|c| c.is_ascii_digit()) {
+                        raw[dot_pos + 2..].to_string()
+                    } else {
+                        raw.to_string()
+                    }
+                } else {
+                    raw.to_string()
+                };
+                title = extracted;
+                continue;
+            }
+
+            if let Some(heading) = line.strip_prefix("## ") {
+                flush(
+                    &current,
+                    &body_lines,
+                    &mut context,
+                    &mut decision,
+                    &mut consequences,
+                );
+                body_lines.clear();
+
+                current = match heading.trim() {
+                    "Status" => Section::Status,
+                    "Context" => Section::Context,
+                    "Decision" => Section::Decision,
+                    "Consequences" => Section::Consequences,
+                    _ => Section::None,
+                };
+            } else {
+                body_lines.push(line);
+            }
+        }
+
+        // Flush last section
+        flush(
+            &current,
+            &body_lines,
+            &mut context,
+            &mut decision,
+            &mut consequences,
+        );
+
+        if title.is_empty() || decision.is_empty() {
+            return Err(malformed());
+        }
+
+        Ok(AdrSections {
+            title,
+            context,
+            decision,
+            consequences,
+        })
+    }
+}
+
+/// Convert a title string into a URL-friendly kebab-case slug.
+///
+/// Lowercases the input, keeps ASCII alphanumerics, collapses runs of other chars to a
+/// single `-`, trims leading/trailing `-`, caps at 60 chars on a `-` boundary (last `-`
+/// before 60), or hard-caps at 60 if no boundary exists. Returns an empty string for
+/// all-punctuation input.
+#[allow(dead_code)] // Used by ADR create tool (Phase 2)
+pub fn kebab_title(title: &str) -> String {
+    let lower = title.to_lowercase();
+
+    // Build slug: alphanumerics pass through; anything else becomes a separator.
+    let mut slug = String::new();
+    let mut last_was_sep = true; // suppress leading `-`
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_sep = false;
+        } else if !last_was_sep {
+            slug.push('-');
+            last_was_sep = true;
+        }
+    }
+    // Trim trailing `-`
+    let slug = slug.trim_end_matches('-').to_string();
+
+    if slug.len() <= 60 {
+        return slug;
+    }
+
+    // Cap at 60 on a `-` boundary.
+    let prefix = &slug[..60];
+    if let Some(pos) = prefix.rfind('-') {
+        slug[..pos].to_string()
+    } else {
+        prefix.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationType {
@@ -440,6 +686,9 @@ pub struct ProjectStats {
     pub handoff_count: usize,
     /// Unix timestamp of the most recent handoff in this project, or `None` if no handoffs exist.
     pub latest_handoff_at: Option<i64>,
+    /// Number of `MemoryType::Adr` memories in this project.
+    #[serde(default)]
+    pub adr_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,5 +805,157 @@ mod tests {
     fn test_memory_type_unknown_returns_error() {
         let result: Result<MemoryType, _> = "unknown_type".parse();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn memory_type_adr_roundtrip() {
+        let mt = MemoryType::Adr;
+        assert_eq!(mt.as_str(), "adr");
+        assert_eq!(mt.to_string(), "adr");
+        let parsed: MemoryType = "adr".parse().unwrap();
+        assert_eq!(parsed, MemoryType::Adr);
+    }
+
+    #[test]
+    fn adr_status_from_str_and_display() {
+        for (s, expected) in [
+            ("proposed", AdrStatus::Proposed),
+            ("accepted", AdrStatus::Accepted),
+            ("superseded", AdrStatus::Superseded),
+            ("deprecated", AdrStatus::Deprecated),
+            ("rejected", AdrStatus::Rejected),
+        ] {
+            let parsed: AdrStatus = s.parse().unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), s);
+        }
+
+        let err = "unknown".parse::<AdrStatus>();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn adr_status_transition_rules() {
+        // Idempotent
+        for status in [
+            AdrStatus::Proposed,
+            AdrStatus::Accepted,
+            AdrStatus::Superseded,
+            AdrStatus::Deprecated,
+            AdrStatus::Rejected,
+        ] {
+            assert!(
+                status.can_transition_to(status),
+                "{status} -> {status} should be allowed"
+            );
+        }
+
+        // Allowed transitions
+        assert!(AdrStatus::Proposed.can_transition_to(AdrStatus::Accepted));
+        assert!(AdrStatus::Proposed.can_transition_to(AdrStatus::Rejected));
+        assert!(AdrStatus::Proposed.can_transition_to(AdrStatus::Deprecated));
+        assert!(AdrStatus::Accepted.can_transition_to(AdrStatus::Deprecated));
+        assert!(AdrStatus::Accepted.can_transition_to(AdrStatus::Superseded));
+        assert!(AdrStatus::Rejected.can_transition_to(AdrStatus::Proposed));
+        assert!(AdrStatus::Deprecated.can_transition_to(AdrStatus::Accepted));
+
+        // Denied transitions
+        assert!(!AdrStatus::Proposed.can_transition_to(AdrStatus::Superseded));
+        assert!(!AdrStatus::Accepted.can_transition_to(AdrStatus::Proposed));
+        assert!(!AdrStatus::Accepted.can_transition_to(AdrStatus::Rejected));
+        assert!(!AdrStatus::Rejected.can_transition_to(AdrStatus::Accepted));
+        assert!(!AdrStatus::Rejected.can_transition_to(AdrStatus::Deprecated));
+        assert!(!AdrStatus::Rejected.can_transition_to(AdrStatus::Superseded));
+        assert!(!AdrStatus::Deprecated.can_transition_to(AdrStatus::Proposed));
+        assert!(!AdrStatus::Deprecated.can_transition_to(AdrStatus::Rejected));
+        assert!(!AdrStatus::Deprecated.can_transition_to(AdrStatus::Superseded));
+        assert!(!AdrStatus::Superseded.can_transition_to(AdrStatus::Proposed));
+        assert!(!AdrStatus::Superseded.can_transition_to(AdrStatus::Accepted));
+        assert!(!AdrStatus::Superseded.can_transition_to(AdrStatus::Rejected));
+        assert!(!AdrStatus::Superseded.can_transition_to(AdrStatus::Deprecated));
+    }
+
+    #[test]
+    fn adr_sections_render_parse_round_trip() {
+        let sections = AdrSections {
+            title: "Use SQLite for storage".to_string(),
+            context: "We need a lightweight embedded database.".to_string(),
+            decision: "We will use SQLite via rusqlite.".to_string(),
+            consequences: "Simple deployment; limited concurrency.".to_string(),
+        };
+        let md = sections.render_markdown(1, AdrStatus::Accepted, 1_700_000_000);
+        let parsed = AdrSections::parse_markdown(&md).unwrap();
+
+        assert_eq!(parsed.title, sections.title);
+        assert_eq!(parsed.context, sections.context);
+        assert_eq!(parsed.decision, sections.decision);
+        assert_eq!(parsed.consequences, sections.consequences);
+    }
+
+    #[test]
+    fn adr_render_includes_status_and_date() {
+        let sections = AdrSections {
+            title: "Choose database".to_string(),
+            context: "We need persistence.".to_string(),
+            decision: "Use SQLite.".to_string(),
+            consequences: "Simple.".to_string(),
+        };
+        // 2023-11-14 22:13:20 UTC
+        let md = sections.render_markdown(42, AdrStatus::Accepted, 1_700_000_000);
+
+        assert!(
+            md.contains("# 0042. Choose database"),
+            "heading missing: {md}"
+        );
+        assert!(md.contains("## Status"), "status section missing");
+        assert!(md.contains("accepted"), "status value missing");
+        assert!(md.contains("2023-11-14"), "date missing");
+        assert!(md.contains("\u{2014}"), "em-dash separator missing");
+        assert!(md.contains("## Context"), "context section missing");
+        assert!(md.contains("## Decision"), "decision section missing");
+        assert!(
+            md.contains("## Consequences"),
+            "consequences section missing"
+        );
+    }
+
+    #[test]
+    fn adr_parse_missing_decision_errors() {
+        let md = "# 0001. Some ADR\n\n## Status\n\nproposed\n\n## Context\n\nsome context\n";
+        let result = AdrSections::parse_markdown(md);
+        assert!(
+            matches!(result, Err(MemoryError::InvalidType(_))),
+            "expected InvalidType for missing decision"
+        );
+    }
+
+    #[test]
+    fn kebab_title_spaces_punct_length_and_empty() {
+        // Basic conversion
+        assert_eq!(kebab_title("Hello World"), "hello-world");
+
+        // Punctuation collapse
+        assert_eq!(kebab_title("Foo, Bar! Baz"), "foo-bar-baz");
+
+        // Leading/trailing separators trimmed
+        assert_eq!(kebab_title("  hello  "), "hello");
+
+        // All-punctuation returns empty
+        assert_eq!(kebab_title("!!!"), "");
+
+        // Empty string
+        assert_eq!(kebab_title(""), "");
+
+        // Length cap at 60-char boundary
+        // "aaaa-bbbb" repeated until > 60 chars
+        let long = "word-".repeat(15); // 75 chars
+        let slug = kebab_title(&long);
+        assert!(slug.len() <= 60, "slug too long: {}", slug.len());
+        assert!(!slug.ends_with('-'), "slug should not end with '-'");
+
+        // No '-' boundary before 60: hard cap at 60
+        let no_boundary = "a".repeat(70);
+        let slug2 = kebab_title(&no_boundary);
+        assert_eq!(slug2.len(), 60);
     }
 }

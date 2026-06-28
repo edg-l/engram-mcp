@@ -625,7 +625,7 @@ fn test_batch_store_and_export_import() {
 
     // Export
     let r = call(&h, "memory_export", json!({"include_embeddings": true}));
-    assert_eq!(r["version"].as_str().unwrap(), "1.1");
+    assert_eq!(r["version"].as_str().unwrap(), "1.2");
     assert_eq!(r["memories"].as_array().unwrap().len(), 3);
     assert!(r["model_version"].is_string());
 

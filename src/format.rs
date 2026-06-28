@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::db::Database;
-use crate::memory::{HandoffSections, Memory};
+use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory};
 use serde_json::Value;
 
 /// Return true if `path` looks like a local filesystem path that should be
@@ -127,40 +127,128 @@ pub fn format_handoff(memory: &Memory, sections: &HandoffSections) -> String {
     out.trim_end().to_string()
 }
 
-/// Format memory content for display, with section-aware rendering for handoffs.
+/// Render an ADR memory as a human-readable section-aware view.
+///
+/// Emits a header line `[adr-{:04} | {status}]` followed by the four Nygard sections.
+pub fn format_adr(number: u32, status: AdrStatus, sections: &AdrSections) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!("[adr-{:04} | {}]\n", number, status));
+
+    out.push_str("\n## Context\n");
+    out.push_str(&sections.context);
+    out.push('\n');
+
+    out.push_str("\n## Decision\n");
+    out.push_str(&sections.decision);
+    out.push('\n');
+
+    out.push_str("\n## Consequences\n");
+    out.push_str(&sections.consequences);
+    out.push('\n');
+
+    out.trim_end().to_string()
+}
+
+/// Parse the ADR number from the `# NNNN. Title` heading in rendered ADR markdown.
+fn parse_adr_number_from_content(content: &str) -> Option<u32> {
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("# ") {
+            let raw = rest.trim();
+            if let Some(dot_pos) = raw.find(". ") {
+                let prefix = &raw[..dot_pos];
+                if let Ok(n) = prefix.parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse the ADR status from the `## Status\n\n{status} — {date}` section in rendered markdown.
+fn parse_adr_status_from_content(content: &str) -> Option<AdrStatus> {
+    let mut in_status = false;
+    for line in content.lines() {
+        if line.trim() == "## Status" {
+            in_status = true;
+            continue;
+        }
+        if in_status {
+            // A new section heading ends the Status block.
+            if line.starts_with("## ") {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Status line: "{status} — {date}" or just "{status}"
+            let status_word = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('\u{2014}')
+                .trim();
+            return status_word.parse::<AdrStatus>().ok();
+        }
+    }
+    None
+}
+
+/// Format memory content for display, with section-aware rendering for handoffs and ADRs.
 ///
 /// When `mem_type` is `"handoff"`, attempts to parse structured sections from
 /// `content` via `HandoffSections::parse_markdown` and delegates to `format_handoff`.
-/// Falls back to plain `content` on parse failure or for non-handoff types.
+/// When `mem_type` is `"adr"`, parses number/status from markdown headings and
+/// delegates to `format_adr`. Falls back to plain `content` on parse failure or for
+/// other memory types.
 pub fn format_memory_content(memory: &Memory, max_len: usize) -> String {
-    if memory.memory_type == crate::memory::MemoryType::Handoff {
-        match HandoffSections::parse_markdown(&memory.content) {
+    use crate::memory::MemoryType;
+    match memory.memory_type {
+        MemoryType::Handoff => match HandoffSections::parse_markdown(&memory.content) {
             Ok(sections) => {
                 let rendered = format_handoff(memory, &sections);
                 truncate_str(&rendered, max_len)
             }
             Err(_) => truncate_str(&memory.content, max_len),
-        }
-    } else {
-        truncate_str(&memory.content, max_len)
+        },
+        MemoryType::Adr => match AdrSections::parse_markdown(&memory.content) {
+            Ok(sections) => {
+                let number = parse_adr_number_from_content(&memory.content).unwrap_or(0);
+                let status =
+                    parse_adr_status_from_content(&memory.content).unwrap_or(AdrStatus::Proposed);
+                let rendered = format_adr(number, status, &sections);
+                truncate_str(&rendered, max_len)
+            }
+            Err(_) => truncate_str(&memory.content, max_len),
+        },
+        _ => truncate_str(&memory.content, max_len),
     }
 }
 
-/// Render a Handoff memory using the sidecar `handoff_sections` DB row.
+/// Render a Handoff or ADR memory using the DB sidecar row.
 ///
-/// Calls `db.get_handoff_sections(memory_id)`. On success (`Some`), renders via
-/// `format_handoff`. Falls back to `format_memory_content` on DB miss or error.
+/// For Handoff: calls `db.get_handoff_sections`. For ADR: calls `db.get_adr_sections`.
+/// Falls back to `format_memory_content` on DB miss or error.
 fn format_memory_content_with_db(memory: &Memory, db: &Database, max_len: usize) -> String {
-    if memory.memory_type == crate::memory::MemoryType::Handoff {
-        match db.get_handoff_sections(&memory.id) {
+    use crate::memory::MemoryType;
+    match memory.memory_type {
+        MemoryType::Handoff => match db.get_handoff_sections(&memory.id) {
             Ok(Some((sections, _))) => {
                 let rendered = format_handoff(memory, &sections);
                 truncate_str(&rendered, max_len)
             }
             _ => format_memory_content(memory, max_len),
-        }
-    } else {
-        format_memory_content(memory, max_len)
+        },
+        MemoryType::Adr => match db.get_adr_sections(&memory.id) {
+            Ok(Some((number, status, sections))) => {
+                let rendered = format_adr(number, status, &sections);
+                truncate_str(&rendered, max_len)
+            }
+            _ => format_memory_content(memory, max_len),
+        },
+        _ => format_memory_content(memory, max_len),
     }
 }
 

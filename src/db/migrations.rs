@@ -217,6 +217,34 @@ impl Database {
             )?;
         }
 
+        // Migration 6: add adr_sections sidecar table for ADR memories.
+        if current_version < 6 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS adr_sections (
+                    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                    project_id TEXT NOT NULL,
+                    adr_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    context TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    consequences TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(project_id, adr_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_adr_project_number ON adr_sections(project_id, adr_number);
+                CREATE INDEX IF NOT EXISTS idx_adr_status ON adr_sections(project_id, status);
+                "#,
+            )?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![6],
+            )?;
+        }
+
         Ok(())
     }
 }

@@ -709,6 +709,12 @@ impl Database {
             |row| row.get(0),
         )?;
 
+        let adr_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE project_id = ?1 AND memory_type = 'adr'",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+
         Ok(ProjectStats {
             memory_count: memory_count as usize,
             relationship_count: relationship_count as usize,
@@ -717,6 +723,7 @@ impl Database {
             global_count: global_count as usize,
             handoff_count: handoff_count as usize,
             latest_handoff_at,
+            adr_count: adr_count as usize,
         })
     }
 

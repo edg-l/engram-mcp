@@ -47,6 +47,9 @@ const CORE_TOOLS: &[&str] = &[
     "handoff_create",
     "memory_store_batch",
     "memory_delete_batch",
+    "adr_create",
+    "adr_show",
+    "adr_list",
 ];
 
 fn filter_by_name(all: &[Tool], names: &[&str]) -> Vec<Tool> {
@@ -139,6 +142,18 @@ fn default_max_sections() -> usize {
 
 fn default_include_off_branch() -> bool {
     false
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_adr_importance() -> f64 {
+    0.85
+}
+
+fn default_proposed_status() -> String {
+    "proposed".into()
 }
 
 // ============================================
@@ -349,6 +364,54 @@ pub struct HandoffSearchInput {
     /// Filter results to these section names only (e.g. `["blockers", "todos"]`).
     /// Case-insensitive. `None` means all sections.
     pub section_filter: Option<Vec<String>>,
+}
+
+/// Input for the `adr_create` MCP tool.
+#[derive(Debug, Deserialize)]
+pub struct AdrCreateInput {
+    pub title: String,
+    pub context: String,
+    pub decision: String,
+    pub consequences: String,
+    #[serde(default = "default_proposed_status")]
+    pub status: String,
+    #[serde(default = "default_adr_importance")]
+    pub importance: f64,
+    #[serde(default = "default_true")]
+    pub pinned: bool,
+    #[serde(default)]
+    pub supersedes: Option<u32>,
+}
+
+/// Input for the `adr_update_status` MCP tool.
+#[derive(Debug, Deserialize)]
+pub struct AdrUpdateStatusInput {
+    pub number: u32,
+    pub status: String,
+}
+
+/// Input for the `adr_list` MCP tool.
+#[derive(Debug, Deserialize)]
+pub struct AdrListInput {
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Input for the `adr_show` MCP tool.
+#[derive(Debug, Deserialize)]
+pub struct AdrShowInput {
+    pub number: u32,
+}
+
+/// Input for the `adr_export` MCP tool.
+#[derive(Debug, Deserialize)]
+pub struct AdrExportInput {
+    #[serde(default)]
+    pub number: Option<u32>,
+    #[serde(default)]
+    pub dir: Option<String>,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
 }
 
 // ============================================
@@ -684,6 +747,124 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     }
                 },
                 "required": ["query"]
+            })),
+        ),
+        // === ADR tools ===
+        Tool::new(
+            "adr_create",
+            "Create an Architecture Decision Record (ADR) in Nygard style. ADRs are project-global (no branch scope), pinned by default, exempt from decay, and bypass dedup. Use `supersedes` to mark an existing ADR as superseded when this decision replaces it.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short, imperative-mood title (e.g. 'Use SQLite for local storage')."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Forces that drove this decision: constraints, requirements, and alternatives considered."
+                    },
+                    "decision": {
+                        "type": "string",
+                        "description": "The decision made, stated in full."
+                    },
+                    "consequences": {
+                        "type": "string",
+                        "description": "Positive and negative consequences of this decision."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["proposed", "accepted", "superseded", "deprecated", "rejected"],
+                        "description": "Lifecycle status (default: proposed)."
+                    },
+                    "importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Importance score (default 0.85)."
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": "Pin this ADR so it is exempt from decay and auto-prune (default true)."
+                    },
+                    "supersedes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "ADR number this decision supersedes. Marks the old ADR as 'superseded' and creates a Supersedes relationship."
+                    }
+                },
+                "required": ["title", "context", "decision", "consequences"]
+            })),
+        ),
+        Tool::new(
+            "adr_update_status",
+            "Advance an ADR through its lifecycle (proposed → accepted → deprecated/superseded, etc.). Use adr_create with supersedes to mark an ADR superseded via a new decision. Direct 'superseded' transitions via this tool are rejected — use adr_create with the supersedes field instead.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "ADR number to update."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["proposed", "accepted", "deprecated", "rejected"],
+                        "description": "New lifecycle status. 'superseded' is not allowed here; use adr_create with supersedes instead."
+                    }
+                },
+                "required": ["number", "status"]
+            })),
+        ),
+        Tool::new(
+            "adr_list",
+            "List ADRs for the current project, ordered by ADR number. ADRs are project-global.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["proposed", "accepted", "superseded", "deprecated", "rejected"],
+                        "description": "Filter to ADRs with this status. Omit to return all."
+                    }
+                }
+            })),
+        ),
+        Tool::new(
+            "adr_show",
+            "Retrieve full details of a single ADR by number.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "ADR number to retrieve."
+                    }
+                },
+                "required": ["number"]
+            })),
+        ),
+        Tool::new(
+            "adr_export",
+            "Export one or all ADRs to Markdown files on disk. `dry_run` (default true) lists what would be written without creating files. Set `dry_run: false` to write — existing files are overwritten silently. `dir` sets the output directory (default: docs/adr relative to the server's cwd). `number` exports a single ADR; omit to export all.",
+            make_input_schema(json!({
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "ADR number to export. Omit to export all ADRs."
+                    },
+                    "dir": {
+                        "type": "string",
+                        "description": "Output directory for Markdown files (default: docs/adr)."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), list files that would be written without creating them. Set false to write."
+                    }
+                }
             })),
         ),
     ]

@@ -5,6 +5,7 @@
 // `unused_imports` under `-D warnings` during lib-test/bin compilation.
 #![allow(unused_imports)]
 
+mod adr;
 mod handler;
 mod handoff;
 pub mod schemas;
@@ -14,6 +15,7 @@ pub mod store;
 #[cfg(test)]
 mod test_utils;
 
+pub use adr::{AdrCreateResult, create_adr};
 pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
 pub use schemas::{

@@ -6,6 +6,7 @@ use crate::error::MemoryError;
 
 mod util;
 
+mod adrs;
 mod batch;
 mod clusters;
 mod embeddings;

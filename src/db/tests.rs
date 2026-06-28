@@ -1,7 +1,7 @@
 use rusqlite::params;
 
 use crate::error::MemoryError;
-use crate::memory::{HandoffSections, Memory, MemoryType, Project};
+use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, Project};
 
 use super::Database;
 use super::handoffs::{decode_section_embeddings, encode_section_embeddings};
@@ -57,7 +57,7 @@ fn test_memory_crud() {
 fn test_migration_creates_tables() {
     let db = Database::open_in_memory().unwrap();
 
-    // Verify schema_version table exists and has version 5
+    // Verify schema_version table exists and has version 6
     let conn = db.conn.lock().unwrap();
     let version: i64 = conn
         .query_row(
@@ -66,7 +66,7 @@ fn test_migration_creates_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 
     // Verify memory_clusters table exists
     let count: i64 = conn
@@ -97,6 +97,12 @@ fn test_migration_creates_tables() {
         .query_row("SELECT COUNT(*) FROM handoff_sections", [], |row| {
             row.get(0)
         })
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // Verify adr_sections table exists (migration 6)
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM adr_sections", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
 }
@@ -948,4 +954,251 @@ fn test_count_hook_memories_today() {
 
     let count = db.count_hook_memories_today("proj").unwrap();
     assert_eq!(count, 2, "expected 2 hook memories, got {}", count);
+}
+
+// ---- ADR DB helpers ----
+
+fn make_adr_sections(title: &str) -> AdrSections {
+    AdrSections {
+        title: title.to_string(),
+        context: format!("Context for {}", title),
+        decision: format!("Decision for {}", title),
+        consequences: format!("Consequences for {}", title),
+    }
+}
+
+fn fake_embedding() -> Vec<f32> {
+    vec![0.1f32; 256]
+}
+
+fn store_test_adr(db: &Database, id: &str, project_id: &str, title: &str) -> (String, u32) {
+    let sections = make_adr_sections(title);
+    let now = chrono::Utc::now().timestamp();
+    db.store_adr_atomic(
+        id,
+        project_id,
+        &sections,
+        AdrStatus::Proposed,
+        0.7,
+        false,
+        &fake_embedding(),
+        "test",
+        now,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn adr_numbering_is_sequential_and_gapfree() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("adr-seq", "adr-seq").unwrap();
+
+    let (_, n1) = store_test_adr(&db, "adr-s1", "adr-seq", "First ADR");
+    let (_, n2) = store_test_adr(&db, "adr-s2", "adr-seq", "Second ADR");
+    let (_, n3) = store_test_adr(&db, "adr-s3", "adr-seq", "Third ADR");
+
+    assert_eq!(n1, 1, "first ADR should be number 1");
+    assert_eq!(n2, 2, "second ADR should be number 2");
+    assert_eq!(n3, 3, "third ADR should be number 3");
+}
+
+#[test]
+fn adr_numbering_is_per_project() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("proj-a", "proj-a").unwrap();
+    db.get_or_create_project("proj-b", "proj-b").unwrap();
+
+    let (_, na1) = store_test_adr(&db, "adr-a1", "proj-a", "ADR A1");
+    let (_, nb1) = store_test_adr(&db, "adr-b1", "proj-b", "ADR B1");
+    let (_, na2) = store_test_adr(&db, "adr-a2", "proj-a", "ADR A2");
+    let (_, nb2) = store_test_adr(&db, "adr-b2", "proj-b", "ADR B2");
+
+    assert_eq!(na1, 1, "project-a first ADR should be 1");
+    assert_eq!(na2, 2, "project-a second ADR should be 2");
+    assert_eq!(
+        nb1, 1,
+        "project-b first ADR should be 1 (independent sequence)"
+    );
+    assert_eq!(nb2, 2, "project-b second ADR should be 2");
+}
+
+#[test]
+fn adr_unique_number_constraint() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("adr-uniq", "adr-uniq").unwrap();
+
+    // Store a memory row first so the FK is satisfied.
+    let now = chrono::Utc::now().timestamp();
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO memories \
+             (id, project_id, memory_type, content, summary, tags, importance, \
+              relevance_score, access_count, created_at, updated_at, last_accessed_at, \
+              branch, merged_from, pinned, global) \
+             VALUES ('adr-dup-a', 'adr-uniq', 'adr', 'content', NULL, '[]', 0.5, 1.0, 0, \
+                     ?1, ?1, ?1, NULL, NULL, 0, 0)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories \
+             (id, project_id, memory_type, content, summary, tags, importance, \
+              relevance_score, access_count, created_at, updated_at, last_accessed_at, \
+              branch, merged_from, pinned, global) \
+             VALUES ('adr-dup-b', 'adr-uniq', 'adr', 'content', NULL, '[]', 0.5, 1.0, 0, \
+                     ?1, ?1, ?1, NULL, NULL, 0, 0)",
+            params![now],
+        )
+        .unwrap();
+    }
+
+    let sections = make_adr_sections("Duplicate");
+    db.insert_adr_sidecar(
+        "adr-dup-a",
+        "adr-uniq",
+        42,
+        AdrStatus::Proposed,
+        &sections,
+        now,
+        now,
+    )
+    .unwrap();
+
+    // Inserting with the same (project_id, adr_number) must fail.
+    let result = db.insert_adr_sidecar(
+        "adr-dup-b",
+        "adr-uniq",
+        42,
+        AdrStatus::Proposed,
+        &sections,
+        now,
+        now,
+    );
+    assert!(
+        matches!(result, Err(MemoryError::Database(_))),
+        "duplicate (project_id, adr_number) must produce a Database error"
+    );
+}
+
+#[test]
+fn update_adr_status_roundtrip() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("adr-upd", "adr-upd").unwrap();
+
+    let (id, _) = store_test_adr(&db, "adr-upd-1", "adr-upd", "Status Roundtrip");
+
+    // Start: Proposed
+    let (_, status, _) = db.get_adr_sections(&id).unwrap().unwrap();
+    assert_eq!(status, AdrStatus::Proposed);
+
+    // Transition: Proposed -> Accepted
+    let updated = db.update_adr_status(&id, AdrStatus::Accepted).unwrap();
+    assert!(updated, "update should return true when row exists");
+
+    let (_, status, _) = db.get_adr_sections(&id).unwrap().unwrap();
+    assert_eq!(status, AdrStatus::Accepted);
+
+    // Absent memory_id returns false.
+    let updated_missing = db
+        .update_adr_status("nonexistent", AdrStatus::Deprecated)
+        .unwrap();
+    assert!(!updated_missing, "update on missing id should return false");
+}
+
+#[test]
+fn list_adrs_filter_by_status() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("adr-list", "adr-list").unwrap();
+
+    store_test_adr(&db, "adr-l1", "adr-list", "ADR One");
+    store_test_adr(&db, "adr-l2", "adr-list", "ADR Two");
+    store_test_adr(&db, "adr-l3", "adr-list", "ADR Three");
+
+    // Transition the second one to Accepted.
+    db.update_adr_status("adr-l2", AdrStatus::Accepted).unwrap();
+
+    // Unfiltered: all three.
+    let all = db.list_adrs("adr-list", None).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].0, 1);
+    assert_eq!(all[1].0, 2);
+    assert_eq!(all[2].0, 3);
+
+    // Filter proposed: first and third.
+    let proposed = db.list_adrs("adr-list", Some(AdrStatus::Proposed)).unwrap();
+    assert_eq!(proposed.len(), 2);
+    assert!(
+        proposed
+            .iter()
+            .all(|(_, s, _, _)| *s == AdrStatus::Proposed)
+    );
+
+    // Filter accepted: only the second.
+    let accepted = db.list_adrs("adr-list", Some(AdrStatus::Accepted)).unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].2, "ADR Two");
+}
+
+#[test]
+fn get_adr_by_number_found_and_missing() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("adr-bynum", "adr-bynum").unwrap();
+
+    let (id, number) = store_test_adr(&db, "adr-bn1", "adr-bynum", "By Number Test");
+    assert_eq!(number, 1);
+
+    let found = db.get_adr_by_number("adr-bynum", 1).unwrap();
+    assert_eq!(found, Some(id));
+
+    let missing = db.get_adr_by_number("adr-bynum", 999).unwrap();
+    assert!(missing.is_none());
+}
+
+#[test]
+fn insert_adr_sidecar_explicit_number() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("adr-explicit", "adr-explicit")
+        .unwrap();
+
+    // Insert a memory row manually so the FK is satisfied.
+    let now = chrono::Utc::now().timestamp();
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO memories \
+             (id, project_id, memory_type, content, summary, tags, importance, \
+              relevance_score, access_count, created_at, updated_at, last_accessed_at, \
+              branch, merged_from, pinned, global) \
+             VALUES ('adr-exp-1', 'adr-explicit', 'adr', 'content', NULL, '[]', 0.7, 1.0, 0, \
+                     ?1, ?1, ?1, NULL, NULL, 0, 0)",
+            params![now],
+        )
+        .unwrap();
+    }
+
+    let sections = make_adr_sections("Explicit Number ADR");
+
+    // Insert with explicit number 7.
+    db.insert_adr_sidecar(
+        "adr-exp-1",
+        "adr-explicit",
+        7,
+        AdrStatus::Accepted,
+        &sections,
+        now,
+        now,
+    )
+    .unwrap();
+
+    // Verify retrieval.
+    let (num, status, retrieved) = db.get_adr_sections("adr-exp-1").unwrap().unwrap();
+    assert_eq!(num, 7);
+    assert_eq!(status, AdrStatus::Accepted);
+    assert_eq!(retrieved.title, "Explicit Number ADR");
+
+    // Verify get_adr_by_number works.
+    let mid = db.get_adr_by_number("adr-explicit", 7).unwrap();
+    assert_eq!(mid, Some("adr-exp-1".to_string()));
 }

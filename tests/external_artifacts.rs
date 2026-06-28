@@ -244,6 +244,7 @@ fn export_import_roundtrips_artifacts() {
         vec![],
         None,
         std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
         None,
     );
     assert!(validate_import(&export_data).is_ok());
