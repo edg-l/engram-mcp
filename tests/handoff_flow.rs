@@ -441,6 +441,7 @@ fn cross_worktree_handoff_targeting() {
         project_id,
         Some("feature-x"),
         sections_for_b,
+        None,
         0.8,
         true,
         false,
@@ -461,6 +462,8 @@ fn cross_worktree_handoff_targeting() {
         None,
         5,
         false,
+        None,
+        None,
         None,
     )
     .expect("resume on worktree B must succeed");
