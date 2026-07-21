@@ -280,6 +280,10 @@ enum HandoffCmd {
         /// Git branch to scope the handoff to (defaults to current branch)
         #[arg(long)]
         branch: Option<String>,
+        /// Topic/thread name scoping this handoff (e.g. "auth-refactor"). Use for
+        /// independent/parallel work on a branch that may already have other handoffs.
+        #[arg(long)]
+        topic: Option<String>,
         /// ID of the handoff this session continues from
         #[arg(long)]
         continues_from: Option<String>,
@@ -304,6 +308,12 @@ enum HandoffCmd {
         /// Query string for section scoring (defaults to latest handoff summary)
         #[arg(long)]
         query: Option<String>,
+        /// Resume from this specific handoff ID instead of the latest on the branch
+        #[arg(long)]
+        handoff_id: Option<String>,
+        /// Scope the resume to handoffs tagged with this topic
+        #[arg(long)]
+        topic: Option<String>,
         /// Maximum number of top sections to show (default 5)
         #[arg(long, default_value = "5")]
         max: usize,
@@ -1936,6 +1946,7 @@ fn cmd_handoff(
             next_steps,
             notes,
             branch,
+            topic,
             continues_from,
             importance,
             no_pin,
@@ -2025,6 +2036,7 @@ fn cmd_handoff(
                 project_id,
                 resolved_branch.as_deref(),
                 sections,
+                topic.as_deref(),
                 importance,
                 !no_pin,
                 !no_auto_link,
@@ -2055,6 +2067,8 @@ fn cmd_handoff(
         HandoffCmd::Resume {
             branch,
             query,
+            handoff_id,
+            topic,
             max,
             include_off_branch,
             max_chars_per_section,
@@ -2074,6 +2088,8 @@ fn cmd_handoff(
                 max,
                 include_off_branch,
                 max_chars_per_section,
+                topic.as_deref(),
+                handoff_id.as_deref(),
             )?;
 
             if let Some(ref msg) = result.message {
