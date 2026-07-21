@@ -9,6 +9,7 @@ mod embedding;
 mod error;
 mod export;
 mod format;
+mod gitutil;
 mod hooks;
 mod memory;
 mod summarize;
@@ -431,100 +432,6 @@ fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
         })
 }
 
-/// Find the git repository root by walking up from current directory.
-/// Returns None if not in a git repository.
-fn find_git_root() -> Option<PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-/// Determine project ID from git root path or current directory.
-fn get_project_id(cli_project: Option<String>) -> String {
-    // 1. Explicit override via CLI or env var
-    if let Some(project) = cli_project {
-        return project;
-    }
-    if let Ok(project) = std::env::var("ENGRAM_PROJECT") {
-        return project;
-    }
-
-    // 2. Try git root path
-    if let Some(git_root) = find_git_root() {
-        return git_root.to_string_lossy().to_string();
-    }
-
-    // 3. Fall back to current directory path
-    if let Ok(cwd) = std::env::current_dir() {
-        return cwd.to_string_lossy().to_string();
-    }
-
-    // 4. Ultimate fallback
-    "default".to_string()
-}
-
-/// Detect the current git branch.
-/// Returns None if not in a git repository or on error.
-/// Priority: ENGRAM_BRANCH env var > git detection
-fn get_current_branch() -> Option<String> {
-    // Check environment variable override first
-    if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
-        && !branch.is_empty()
-    {
-        return Some(branch);
-    }
-
-    // Find git root
-    let git_root = find_git_root()?;
-    let git_dir = git_root.join(".git");
-
-    // Try reading .git/HEAD directly (faster than spawning git process)
-    if let Ok(head_content) = std::fs::read_to_string(git_dir.join("HEAD")) {
-        let head = head_content.trim();
-        if let Some(branch_ref) = head.strip_prefix("ref: refs/heads/") {
-            return Some(branch_ref.to_string());
-        }
-        // Detached HEAD - use short SHA
-        if head.len() >= 7 {
-            return Some(format!("detached-{}", &head[..7]));
-        }
-    }
-
-    // Fallback: try git command
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&git_root)
-        .output()
-        && output.status.success()
-    {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if branch == "HEAD" {
-            // Detached HEAD - get short SHA
-            if let Ok(sha_output) = std::process::Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .current_dir(&git_root)
-                .output()
-                && sha_output.status.success()
-            {
-                let sha = String::from_utf8_lossy(&sha_output.stdout)
-                    .trim()
-                    .to_string();
-                return Some(format!("detached-{}", sha));
-            }
-        } else {
-            return Some(branch);
-        }
-    }
-
-    None
-}
-
 /// Check if command needs embedding service (lazy initialization).
 fn needs_embedding_service(cmd: &Commands) -> bool {
     match cmd {
@@ -549,7 +456,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let db_path = get_db_path(cli.database);
-    let project_id = get_project_id(cli.project);
+    let project_id = gitutil::get_project_id(cli.project);
 
     // Ensure database directory exists
     if let Some(parent) = db_path.parent() {
@@ -567,7 +474,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Detect current branch once for commands that need it
-    let current_branch = get_current_branch();
+    let current_branch = gitutil::get_current_branch();
 
     match cli.command {
         Commands::Query {

@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod error;
 pub mod export;
 pub mod format;
+pub mod gitutil;
 pub mod hooks;
 pub mod memory;
 pub mod summarize;
