@@ -755,6 +755,10 @@ impl ToolHandler {
             memory.pinned = pinned;
         }
 
+        if let Some(global) = input.global {
+            memory.global = global;
+        }
+
         // external_artifacts update semantics:
         //   - input.external_artifacts is None  -> preserve existing (omit = keep)
         //   - input.external_artifacts is Some([]) -> clear (empty array = delete)
@@ -1982,19 +1986,19 @@ impl ToolHandler {
             .get_memory(&input.id)?
             .ok_or_else(|| MemoryError::NotFound(input.id.clone()))?;
 
-        // Check if already global
+        // Check if branch is already unset (visible on all branches within this project)
         if memory.branch.is_none() {
             return Ok(json!({
                 "success": true,
                 "id": input.id,
-                "message": "Memory is already global",
+                "message": "Memory already has no branch restriction (visible on all branches in this project). Note: this is unrelated to cross-project visibility, controlled by the `global` field via memory_update.",
                 "was_branch": null
             }));
         }
 
         let was_branch = memory.branch.clone();
 
-        // Promote to global
+        // Clear the branch restriction
         let promoted = self.db.promote_memory(&input.id)?;
 
         if promoted {
@@ -2004,7 +2008,7 @@ impl ToolHandler {
             Ok(json!({
                 "success": true,
                 "id": input.id,
-                "message": format!("Memory promoted from branch '{}' to global", was_branch.as_deref().unwrap_or("?")),
+                "message": format!("Memory promoted from branch '{}' to all branches within this project (use memory_update's `global` field for cross-project visibility)", was_branch.as_deref().unwrap_or("?")),
                 "was_branch": was_branch
             }))
         } else {

@@ -219,6 +219,8 @@ pub struct MemoryUpdateInput {
     pub pinned: Option<bool>,
     /// Replace external_artifacts list. Pass empty array to clear; omit to preserve existing.
     pub external_artifacts: Option<Vec<String>>,
+    /// Make this memory visible across all projects (true) or restrict it back to its own project (false).
+    pub global: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,7 +515,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Replace external_artifacts list. Pass empty array to clear; omit to preserve existing."
-                    }
+                    },
+                    "global": {"type": "boolean", "description": "Set to true to make this memory visible across all projects, or false to restrict it back to its own project."}
                 },
                 "required": ["id"]
             })),
@@ -637,11 +640,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_promote",
-            "Make a branch-scoped memory visible globally. Use when a branch-specific finding should be preserved across all branches.",
+            "Clear a memory's branch so it's visible on every branch within this project (sets branch to null). This does NOT make it visible to other projects — use memory_update's `global` field for that.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Memory ID to promote from branch-local to global."}
+                    "id": {"type": "string", "description": "Memory ID to promote from branch-local to all-branches-within-this-project."}
                 },
                 "required": ["id"]
             })),
