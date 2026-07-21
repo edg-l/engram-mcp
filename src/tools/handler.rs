@@ -2179,6 +2179,7 @@ impl ToolHandler {
             &self.project_id,
             resolved_branch,
             input.sections,
+            input.topic.as_deref(),
             input.importance,
             input.pinned,
             input.auto_link,
@@ -2205,6 +2206,8 @@ impl ToolHandler {
             input.max_sections,
             input.include_off_branch,
             input.max_chars_per_section,
+            input.topic.as_deref(),
+            input.handoff_id.as_deref(),
         )?;
 
         Ok(json!(result))
@@ -2533,7 +2536,7 @@ mod tests {
     };
     use super::{Database, EmbeddingService, MemoryError, RelationType, SearchMode, ToolHandler};
     use crate::memory::{HandoffSections, Memory, MemoryType};
-    use crate::tools::test_utils::{dummy_vec, insert_test_handoff};
+    use crate::tools::test_utils::{dummy_vec, insert_test_handoff, insert_test_handoff_with_tags};
 
     fn test_sections(summary: &str, continues_from: Option<String>) -> HandoffSections {
         HandoffSections {
@@ -2616,7 +2619,9 @@ mod tests {
 
         // branch=None simulates a detached HEAD or non-git workspace.
         // create_handoff rejects this before making any embedding call.
-        let result = create_handoff(&db, &embedding, "proj", None, sections, 0.85, true, false);
+        let result = create_handoff(
+            &db, &embedding, "proj", None, sections, None, 0.85, true, false,
+        );
 
         assert!(
             matches!(result, Err(MemoryError::InvalidType(ref msg)) if msg.contains("handoff requires a branch")),
@@ -2715,6 +2720,8 @@ mod tests {
             5,
             false,
             None,
+            None,
+            None,
         )
         .expect("resume_handoff_with_vec must succeed");
 
@@ -2771,6 +2778,8 @@ mod tests {
             Some(dummy_vec(0.5)),
             5,
             false,
+            None,
+            None,
             None,
         )
         .expect("resume_handoff_with_vec must succeed");
@@ -2868,6 +2877,8 @@ mod tests {
             Some(dummy_vec(0.5)),
             5,
             false,
+            None,
+            None,
             None,
         )
         .expect("resume_handoff_with_vec must succeed");
@@ -3077,6 +3088,7 @@ mod tests {
             project_id,
             Some("main"),
             sections,
+            None,
             0.85,
             true,
             false,
@@ -3167,6 +3179,7 @@ mod tests {
             project_id,
             Some("main"),
             sections.clone(),
+            None,
             0.85,
             true,
             false,
@@ -3546,6 +3559,290 @@ mod tests {
         assert_eq!(
             count_after_first, count_after_failed,
             "failed supersede must not leave an orphan ADR"
+        );
+    }
+
+    // ============================================
+    // Topic scoping / handoff_id resume tests
+    // ============================================
+
+    /// Two handoffs on the same branch tagged with different topics. Resuming with
+    /// `topic` set must pick the tagged handoff even when it is not the most recent;
+    /// resuming with `topic=None` must preserve today's behaviour (global latest on
+    /// branch, ignoring any topic tags) — this is the backward-compatibility guarantee.
+    #[test]
+    fn handoff_resume_topic_filters_candidates() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "topic-filter-proj";
+        db.get_or_create_project(project_id, "Topic Filter Test")
+            .unwrap();
+
+        let sections_alpha = test_sections("Alpha thread session", None);
+        insert_test_handoff_with_tags(
+            &db,
+            project_id,
+            "ho-alpha",
+            "main",
+            &["topic:alpha"],
+            &sections_alpha,
+            &[("summary", dummy_vec(0.1))],
+        );
+
+        // Sleep so beta gets a strictly later created_at (Unix-seconds precision) and
+        // would win a plain "latest on branch" lookup.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let sections_beta = test_sections("Beta thread session", None);
+        insert_test_handoff_with_tags(
+            &db,
+            project_id,
+            "ho-beta",
+            "main",
+            &["topic:beta"],
+            &sections_beta,
+            &[("summary", dummy_vec(0.2))],
+        );
+
+        // topic="alpha" must return ho-alpha even though ho-beta is more recent.
+        let result_alpha = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            None,
+            5,
+            false,
+            None,
+            Some("alpha"),
+            None,
+        )
+        .expect("resume with topic must succeed");
+        assert_eq!(
+            result_alpha.latest_handoff_id.as_deref(),
+            Some("ho-alpha"),
+            "topic filter must select the tagged handoff, not the global latest"
+        );
+
+        // topic=None must preserve today's behaviour: global latest on branch, ignoring tags.
+        let result_default = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            None,
+            5,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("resume without topic must succeed");
+        assert_eq!(
+            result_default.latest_handoff_id.as_deref(),
+            Some("ho-beta"),
+            "without a topic filter, resume must return the global latest handoff (backward compat)"
+        );
+    }
+
+    /// An explicit `handoff_id` must bypass "latest on branch" entirely, even when a
+    /// newer handoff exists on the same branch.
+    #[test]
+    fn handoff_resume_handoff_id_bypasses_latest() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "handoff-id-proj";
+        db.get_or_create_project(project_id, "Handoff Id Test")
+            .unwrap();
+
+        let sections_old = test_sections("Older session", None);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-old",
+            "main",
+            &sections_old,
+            &[("summary", dummy_vec(0.3))],
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let sections_new = test_sections("Newer session", None);
+        insert_test_handoff(
+            &db,
+            project_id,
+            "ho-new",
+            "main",
+            &sections_new,
+            &[("summary", dummy_vec(0.4))],
+        );
+
+        let result = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            None,
+            5,
+            false,
+            None,
+            None,
+            Some("ho-old"),
+        )
+        .expect("resume with explicit handoff_id must succeed");
+
+        assert_eq!(
+            result.latest_handoff_id.as_deref(),
+            Some("ho-old"),
+            "explicit handoff_id must win over the newer handoff on the branch"
+        );
+    }
+
+    /// An explicit `handoff_id` that does not exist must return `MemoryError::NotFound`.
+    #[test]
+    fn handoff_resume_handoff_id_not_found() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "handoff-id-missing-proj";
+        db.get_or_create_project(project_id, "Handoff Id Missing Test")
+            .unwrap();
+
+        let result = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            None,
+            5,
+            false,
+            None,
+            None,
+            Some("does-not-exist"),
+        );
+
+        assert!(
+            matches!(result, Err(MemoryError::NotFound(ref id)) if id == "does-not-exist"),
+            "expected NotFound for a missing handoff_id, got: {:?}",
+            result
+        );
+    }
+
+    /// An explicit `handoff_id` pointing at a memory that is not a `Handoff` must also
+    /// return `MemoryError::NotFound` rather than silently treating it as a handoff.
+    #[test]
+    fn handoff_resume_handoff_id_wrong_type() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "handoff-id-wrong-type-proj";
+        db.get_or_create_project(project_id, "Handoff Id Wrong Type Test")
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let fact = Memory {
+            id: "not-a-handoff".to_string(),
+            project_id: project_id.to_string(),
+            memory_type: MemoryType::Fact,
+            content: "just a fact".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.5,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: Some("main".to_string()),
+            merged_from: None,
+            external_artifacts: None,
+            pinned: false,
+            global: false,
+        };
+        db.store_memory(&fact).unwrap();
+
+        let result = resume_handoff_with_vec(
+            &db,
+            project_id,
+            Some("main"),
+            None,
+            5,
+            false,
+            None,
+            None,
+            Some("not-a-handoff"),
+        );
+
+        assert!(
+            matches!(result, Err(MemoryError::NotFound(ref id)) if id == "not-a-handoff"),
+            "expected NotFound for a non-handoff memory ID, got: {:?}",
+            result
+        );
+    }
+
+    /// `create_handoff` with a `topic` must store a slugified `topic:<slug>` tag.
+    #[test]
+    fn handoff_create_stores_topic_tag() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "topic-tag-proj";
+        db.get_or_create_project(project_id, "Topic Tag Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let sections = test_sections("Session on the auth refactor", None);
+
+        let result = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections,
+            Some("Auth Refactor!"),
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed");
+
+        let memory = db.get_memory(&result.id).unwrap().unwrap();
+        assert!(
+            memory.tags.contains(&"topic:auth-refactor".to_string()),
+            "expected topic:auth-refactor tag, got {:?}",
+            memory.tags
+        );
+    }
+
+    /// When `continues_from` points at a handoff whose topic tag differs from this
+    /// handoff's own topic, `create_handoff` must still store the handoff (no hard
+    /// error) but must surface a warning about the mismatch.
+    #[test]
+    fn handoff_create_continues_from_topic_mismatch_warns() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "topic-mismatch-proj";
+        db.get_or_create_project(project_id, "Topic Mismatch Test")
+            .unwrap();
+
+        let sections_a = test_sections("Alpha thread session", None);
+        insert_test_handoff_with_tags(
+            &db,
+            project_id,
+            "ho-a",
+            "main",
+            &["topic:alpha"],
+            &sections_a,
+            &[("summary", dummy_vec(0.1))],
+        );
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let sections_b = test_sections("Beta thread session", Some("ho-a".to_string()));
+
+        let result = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections_b,
+            Some("beta"),
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed despite topic mismatch");
+
+        assert!(
+            result.warnings.iter().any(|w| w.contains("topic")),
+            "expected a topic-mismatch warning, got {:?}",
+            result.warnings
         );
     }
 }

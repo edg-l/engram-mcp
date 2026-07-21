@@ -51,6 +51,7 @@ fn handoff_flow_create_resume_search() {
         project_id,
         Some("feat/x"),
         sections_a,
+        None,
         0.85,
         true,
         false,
@@ -75,6 +76,7 @@ fn handoff_flow_create_resume_search() {
         project_id,
         Some("feat/x"),
         sections_b,
+        None,
         0.85,
         true,
         false,
@@ -92,6 +94,8 @@ fn handoff_flow_create_resume_search() {
         Some("embedding pipeline"),
         5,
         false,
+        None,
+        None,
         None,
     )
     .expect("resume must succeed");
@@ -179,6 +183,7 @@ fn export_import_preserves_handoff_sections() {
         project_id,
         Some("feat/export-test"),
         sections.clone(),
+        None,
         0.85,
         true,
         false,

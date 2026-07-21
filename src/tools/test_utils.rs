@@ -31,6 +31,20 @@ pub(super) fn insert_test_handoff(
     sections: &HandoffSections,
     section_vecs: &[(&str, Vec<f32>)],
 ) {
+    insert_test_handoff_with_tags(db, project_id, id, branch, &[], sections, section_vecs)
+}
+
+/// Like `insert_test_handoff`, but with explicit tags (e.g. a `topic:<slug>` tag).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_test_handoff_with_tags(
+    db: &Database,
+    project_id: &str,
+    id: &str,
+    branch: &str,
+    tags: &[&str],
+    sections: &HandoffSections,
+    section_vecs: &[(&str, Vec<f32>)],
+) {
     let now = chrono::Utc::now().timestamp();
     let memory = Memory {
         id: id.to_string(),
@@ -38,7 +52,7 @@ pub(super) fn insert_test_handoff(
         memory_type: MemoryType::Handoff,
         content: sections.render_markdown(),
         summary: None,
-        tags: vec![],
+        tags: tags.iter().map(|s| s.to_string()).collect(),
         importance: 0.85,
         relevance_score: 1.0,
         access_count: 0,

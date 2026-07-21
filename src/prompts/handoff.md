@@ -35,6 +35,10 @@ Freeform notes that don't fit elsewhere: environment quirks, partial workarounds
 
 Before calling `handoff_create`, scrub: API tokens, passwords, private URLs, customer data, internal hostnames. If unsure whether something is sensitive, omit it.
 
+## Topic scoping for parallel work
+
+Handoffs are keyed by (project, branch). If this session is independent/parallel work on a branch that may already have other handoffs (a second task in the same checkout, work that isn't a continuation of whatever `handoff_resume` last returned), pass a top-level `topic` (a short slug, e.g. `"auth-refactor"`) so a later `handoff_resume --topic ...` can find this thread specifically instead of just the branch's latest handoff. Ask the user for a topic name if it isn't obvious, or infer one from the task and state it so they can correct you. Skip `topic` for normal single-threaded work.
+
 ## Calling the tool
 
 After gathering all sections, call `handoff_create` with:
@@ -50,8 +54,9 @@ After gathering all sections, call `handoff_create` with:
     "next_steps": ["...", "..."],
     "notes": "...",
     "continues_from": "<id of the handoff this session resumed from, if any>"
-  }
+  },
+  "topic": "<short topic slug, only for independent/parallel work on this branch>"
 }
 ```
 
-Omit any section that has nothing real to say. The `summary` field is the only required one.
+Omit any section that has nothing real to say. The `summary` field is the only required one. Omit `topic` entirely for normal single-threaded work. If `continues_from` is set and points at a handoff with a different topic, the tool returns a non-blocking warning — the handoff is still saved.
