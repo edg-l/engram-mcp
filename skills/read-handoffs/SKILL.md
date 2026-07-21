@@ -8,7 +8,7 @@ Load session context from Engram via the `mcp__engram__handoff_resume` MCP tool.
 
 ## Steps
 
-1. **Call `mcp__engram__handoff_resume`** with no arguments. Defaults: current branch, `max_sections: 5`, `include_off_branch: false`.
+1. **Call `mcp__engram__handoff_resume`** with no arguments. Defaults: current branch, `max_sections: 5`, `include_off_branch: false`. This returns the single most recent handoff on the branch — see "Multiple handoffs on the same branch" below before trusting that it's the right one.
 
 2. **Inspect the result.** Engram returns:
    - `branch` — the resolved branch (or `null` if detached HEAD)
@@ -35,6 +35,16 @@ Load session context from Engram via the `mcp__engram__handoff_resume` MCP tool.
 ## Why this matters
 
 The handoff chain encodes session-to-session continuity: each `continues_from` link means "the next agent should pick up from here". The top-sections retrieval is hybrid (similarity + recency); a single old but highly-relevant section can outrank newer but generic content. Trust the ranking; do not just present the latest handoff verbatim.
+
+## Multiple handoffs on the same branch
+
+Handoffs are keyed by (project, branch), not by task or thread. If two sessions worked independently on the same branch (e.g. two parallel tasks in the same checkout), a plain `handoff_resume` call returns whichever one is most recent — which may not be the thread the user actually wants to continue. Before assuming the returned handoff is the right one:
+
+- If the `summary` or `top_sections` don't match what the user asked you to resume, treat that as a signal something is off, not as a reason to proceed anyway.
+- Check for other recent handoffs (`mcp__engram__handoff_search` with no section filter, or ask the user) rather than silently committing to the one `handoff_resume` happened to return.
+- If you find more than one plausible candidate, surface the ambiguity explicitly, e.g.: "I found 2 recent handoffs on this branch: topic `auth-refactor` (2h ago) and topic `db-migration` (10m ago) — which should I resume?"
+- Once you know which thread you want, call `mcp__engram__handoff_resume` again with `topic: "<slug>"` to scope to that thread's chain, or `handoff_id: "<id>"` to resume from a specific handoff directly (this also anchors the `continues_from` chain walk at that id instead of the branch's latest).
+- If the user is starting a new independent thread rather than resuming, tell the `handoff` skill to pass a `topic` when it creates the next handoff, so this doesn't recur.
 
 ## Specific lookups
 

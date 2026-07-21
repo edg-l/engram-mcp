@@ -46,6 +46,23 @@ Each new handoff sets `continues_from` to the previous one on the same branch, f
 
 When a branch has only one handoff, `handoff_resume` supplements `linked_memories` with related `decision` / `pattern` / `debug` memories surfaced via vector search against the query — so even a fresh branch with a single capture comes back with cross-cutting context, not five slices of the same document.
 
+### Parallel work on the same branch
+
+Handoffs are keyed by `(project, branch)`, and `handoff_resume` defaults to the single latest handoff on that branch. If two sessions work independently on the same branch (e.g. two parallel tasks against the same checkout), pass `--topic` (or the MCP `topic` param) to `handoff create` to tag the handoff with a slugified topic (`topic:<slug>`), and pass the same `--topic`/`topic` to `handoff resume` to scope the resume to that thread instead of whichever handoff happens to be newest:
+
+```bash
+engram-cli handoff create --topic auth-refactor ...
+engram-cli handoff resume --topic auth-refactor
+```
+
+You can also resume a specific handoff directly by ID, bypassing the "latest on branch" lookup entirely (still walks `continues_from` from that ID):
+
+```bash
+engram-cli handoff resume --handoff-id mem_xyz
+```
+
+Handoffs created before this feature (no topic tag) are unaffected — omitting `topic` behaves exactly as before: `handoff_resume` returns the global latest handoff on the branch. If `continues_from` points at a handoff with a different topic, `handoff_create` still stores the handoff but returns a non-blocking warning.
+
 ## Installation
 
 ```bash
@@ -199,8 +216,8 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 
 | Tool | Description |
 |------|-------------|
-| `handoff_create` | Capture a session handoff with structured sections (summary, decisions, todos, blockers, mental_model, next_steps, notes) |
-| `handoff_resume` | Retrieve top sections from recent handoffs on the current branch, plus linked memories |
+| `handoff_create` | Capture a session handoff with structured sections (summary, decisions, todos, blockers, mental_model, next_steps, notes). Optional `topic` scopes it to a specific thread for parallel work on the same branch |
+| `handoff_resume` | Retrieve top sections from recent handoffs on the current branch, plus linked memories. Optional `topic` filters to a thread; optional `handoff_id` resumes a specific handoff directly instead of the branch's latest |
 | `handoff_search` | Search handoff sections by content; filter by branch or section name |
 | `memory_store` | Store a memory with embedding, auto-dedup, auto-cluster |
 | `memory_query` | Semantic search with hybrid scoring, pagination, branch filtering |
@@ -262,7 +279,10 @@ Branch modes: `current` (global + current branch), `global` (global only), `all`
 # Handoffs
 engram-cli handoff create                        # interactive section prompts
 engram-cli handoff create --from-file session.md # ingest pre-written markdown
+engram-cli handoff create --topic auth-refactor  # scope to a thread for parallel work on this branch
 engram-cli handoff resume --branch feat/x        # load context from recent handoffs
+engram-cli handoff resume --topic auth-refactor  # scope resume to a specific thread
+engram-cli handoff resume --handoff-id mem_xyz   # resume a specific handoff, bypassing "latest on branch"
 engram-cli handoff search "auth refactor" --section blockers,todos
 
 # Search
@@ -312,7 +332,7 @@ engram-cli health
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ENGRAM_DB` | SQLite database path | `~/.local/share/engram/memories.db` |
-| `ENGRAM_PROJECT` | Project scope identifier | Git root directory name |
+| `ENGRAM_PROJECT` | Project scope identifier | Git project root directory name (worktree-aware, see [Worktrees](#worktrees)) |
 | `ENGRAM_DECAY_INTERVAL` | Decay job interval (seconds) | `3600` (1 hour) |
 | `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
 | `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
@@ -320,6 +340,25 @@ engram-cli health
 | `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (23 tools), `core` (14), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
 | `ENGRAM_HOOK_DEDUP_SKIP` | Similarity threshold above which hook captures are silently dropped (clamped to `[0.5, 1.0]`) | `0.95` |
 | `ENGRAM_HOOK_DAILY_CAP` | Max hook-captured memories per project per UTC day; `0` = unlimited | `50` |
+
+## Worktrees
+
+`project_id` is derived from git's shared "common dir" (`git rev-parse --git-common-dir`), not the
+working directory itself, so every `git worktree` checkout of the same repository (e.g.
+`<repo>/.tree/feature-x`) resolves to the same `project_id` as the main checkout. This means a
+session working in one worktree sees memories, decisions, and handoffs captured while working in
+any other worktree (or the main checkout) of the same repo. Set `ENGRAM_PROJECT` explicitly per
+worktree if you want the old per-worktree isolation instead.
+
+A session in one worktree/branch can hand off discovered work belonging to a different
+branch without derailing its own task, e.g. `handoff_create(branch: "other-branch", ...)`; the
+session checked out on `other-branch` (in its own worktree) will see it on its next
+`handoff_resume`, since branch is otherwise auto-detected from the caller's own git state.
+
+**Caveat:** this does not migrate existing data. Worktree checkouts that already accumulated
+memories/handoffs under their old, worktree-local `project_id` keep that data under the old ID —
+it will not appear in the newly unified scope. Use `engram-cli export`/`engram-cli import` to
+manually merge old per-worktree data into the unified project if desired.
 
 ## Retrieval benchmark
 
@@ -416,6 +455,8 @@ Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blocker
 - **Branch chaining** via `continues_from` in the sidecar (no graph edge). `handoff_resume` walks the chain up to depth 5 with cycle detection.
 - **Auto-linking**: each section is scored against existing `decision` / `pattern` / `debug` memories. Matches at cosine ≥ 0.75 get a `derived_from` edge, capped at 10 links per handoff.
 - **Bypass rules**: handoffs skip dedup. Pinned by default.
+- **Topic scoping**: an optional `topic` on `handoff_create` is slugified and stored as a `topic:<slug>` tag on the memory (no schema migration — tags are a plain JSON array). `handoff_resume`'s optional `topic` filters candidate handoffs to that tag before picking "latest on branch"; omitting it preserves the original global-latest-on-branch behavior. `continues_from` chains spanning a topic mismatch are stored anyway, with a warning.
+- **Explicit resume**: `handoff_resume`'s optional `handoff_id` starts the `continues_from` chain walk at that specific handoff instead of "latest on branch"; it must resolve to an existing `MemoryType::Handoff` or the call errors.
 
 ## Status and limits
 

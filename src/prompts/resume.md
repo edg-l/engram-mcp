@@ -25,3 +25,5 @@ You are resuming a work session. Call `handoff_resume` to load context from the 
 4. Propose the next concrete action: the exact first step the user should take, referencing specific files, functions, or commands where possible.
 
 5. If the chain is long or there are many linked memories, offer to search for specific context with `handoff_search`.
+
+6. **If the result doesn't match what you were asked to resume**, don't assume it's right just because it's the latest. Handoffs are keyed by branch, not by task — two independent sessions on the same branch will otherwise collide. Check for other recent handoffs (`handoff_search`, or ask the user) and, if there's more than one plausible thread, ask which to resume rather than silently picking the newest, e.g.: "I found 2 recent handoffs on this branch: topic `auth-refactor` (2h ago) and topic `db-migration` (10m ago) — which should I resume?" Once you know, call `handoff_resume` again with `topic: "<slug>"` to scope to that thread, or `handoff_id: "<id>"` to resume a specific handoff directly.

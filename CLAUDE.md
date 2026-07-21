@@ -22,6 +22,7 @@ src/
   summarize.rs - extractive summarization for large content
   export.rs    - import/export JSON format
   error.rs     - MemoryError enum
+  gitutil.rs   - shared git helpers: find_git_root, resolve_project_root (worktree-aware), get_current_branch
   hooks/       - Claude Code lifecycle hook handlers: dispatch, filter, redact, install, payload structs
 ```
 
@@ -111,9 +112,11 @@ Section-based session capture (`summary, decisions, todos, blockers, mental_mode
 
 Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 
+Since `project_id` is unified across git worktrees of the same repo, a session can capture discovered work belonging to a different branch/worktree via `handoff_create(branch: "<other-branch>", ...)` without derailing its own task; the session in that other worktree sees it on its next `handoff_resume` (branch is otherwise auto-detected).
+
 ## Config (env vars)
 - `ENGRAM_DB` - SQLite path (default: ~/.local/share/engram/memories.db)
-- `ENGRAM_PROJECT` - project scope (default: cwd name)
+- `ENGRAM_PROJECT` - project scope override (default: git project root, worktree-aware — all `git worktree` checkouts of the same repo share one project_id via `git rev-parse --git-common-dir`; falls back to cwd name outside git)
 - `ENGRAM_DECAY_INTERVAL` - decay job interval in seconds (default: 3600)
 - `ENGRAM_RECLUSTER_INTERVAL` - re-clustering job interval in seconds (default: 21600)
 - `ENGRAM_MAX_CANDIDATES` - max candidate memories to score during search (default: 200)

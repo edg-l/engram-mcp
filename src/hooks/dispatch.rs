@@ -331,62 +331,7 @@ fn store_memory(
     }
 }
 
-/// Detect the current git branch, identical logic to `cli.rs::get_current_branch`.
+/// Detect the current git branch. Delegates to the shared `gitutil` implementation.
 fn current_branch() -> Option<String> {
-    if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
-        && !branch.is_empty()
-    {
-        return Some(branch);
-    }
-
-    let git_root = find_git_root()?;
-    let git_dir = git_root.join(".git");
-
-    if let Ok(head_content) = std::fs::read_to_string(git_dir.join("HEAD")) {
-        let head = head_content.trim();
-        if let Some(branch_ref) = head.strip_prefix("ref: refs/heads/") {
-            return Some(branch_ref.to_string());
-        }
-        if head.len() >= 7 {
-            return Some(format!("detached-{}", &head[..7]));
-        }
-    }
-
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&git_root)
-        .output()
-        && output.status.success()
-    {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if branch == "HEAD" {
-            if let Ok(sha_output) = std::process::Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .current_dir(&git_root)
-                .output()
-                && sha_output.status.success()
-            {
-                let sha = String::from_utf8_lossy(&sha_output.stdout)
-                    .trim()
-                    .to_string();
-                return Some(format!("detached-{}", sha));
-            }
-        } else {
-            return Some(branch);
-        }
-    }
-
-    None
-}
-
-fn find_git_root() -> Option<std::path::PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
+    crate::gitutil::get_current_branch()
 }
