@@ -131,6 +131,12 @@ enum Commands {
         /// Clear all external artifacts (sets list to empty).
         #[arg(long)]
         clear_artifacts: bool,
+        /// Make this memory visible across all projects
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+        /// Restrict this memory back to its own project (undo --global)
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
     },
     /// Link two memories
     Link {
@@ -175,7 +181,7 @@ enum Commands {
         #[arg(long)]
         confirm: bool,
     },
-    /// Promote a branch-local memory to global
+    /// Clear a memory's branch so it's visible on all branches in this project (not cross-project; use `update --global` for that)
     Promote {
         /// Memory ID to promote
         id: String,
@@ -637,6 +643,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary,
             artifacts,
             clear_artifacts,
+            global,
+            local,
         } => {
             // external_artifacts semantics for CLI:
             //   --clear-artifacts       -> Some([]) (clear)
@@ -649,6 +657,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            // --global/--local are mutually exclusive (enforced by clap); neither -> preserve.
+            let global = if global {
+                Some(true)
+            } else if local {
+                Some(false)
+            } else {
+                None
+            };
             cmd_update(
                 &db,
                 embedding_service.as_ref().unwrap(),
@@ -658,6 +674,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tags,
                 summary,
                 external_artifacts,
+                global,
             )?;
         }
         Commands::Link {
@@ -1128,6 +1145,7 @@ fn cmd_update(
     tags: Option<String>,
     summary: Option<String>,
     external_artifacts: Option<Vec<String>>,
+    global: Option<bool>,
 ) -> Result<(), MemoryError> {
     let mut memory = db
         .get_memory(id)?
@@ -1166,6 +1184,10 @@ fn cmd_update(
         } else {
             memory.external_artifacts = Some(artifacts);
         }
+    }
+
+    if let Some(is_global) = global {
+        memory.global = is_global;
     }
 
     db.update_memory(&memory)?;
@@ -1651,20 +1673,24 @@ fn cmd_promote(db: &Database, id: &str) -> Result<(), MemoryError> {
         .get_memory(id)?
         .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
 
-    // Check if already global
+    // Check if branch is already unset (visible on all branches within this project)
     if memory.branch.is_none() {
-        println!("Memory {} is already global", id);
+        println!(
+            "Memory {} already has no branch restriction (visible on all branches in this project). \
+             Note: this is unrelated to cross-project visibility; use `engram-cli update {} --global` for that.",
+            id, id
+        );
         return Ok(());
     }
 
     let was_branch = memory.branch.clone();
 
-    // Promote to global
+    // Clear the branch restriction
     let promoted = db.promote_memory(id)?;
 
     if promoted {
         println!(
-            "Promoted memory {} from branch '{}' to global",
+            "Promoted memory {} from branch '{}' to all branches within this project (use `update --global` for cross-project visibility)",
             id,
             was_branch.as_deref().unwrap_or("?")
         );
