@@ -31,7 +31,7 @@ Capture session state into Engram via the `mcp__engram__handoff_create` MCP tool
 
 5. **Sensitive data filter.** Before calling the tool, scrub: API tokens, passwords, private URLs, customer data, internal hostnames. If unsure, ask the user.
 
-6. **Call `mcp__engram__handoff_create`** with the payload. Defaults: `pinned: true`, `importance: 0.85`, `auto_link: true`. Branch is auto-detected from git; pass an explicit `branch` only if you want to override. If `continues_from` is set and its topic doesn't match this handoff's `topic`, the tool returns a non-blocking warning — the handoff is still saved.
+6. **Call `mcp__engram__handoff_create`** with the payload. Defaults: `pinned: true`, `importance: 0.85`, `auto_link: true`. Branch is auto-detected from git; pass an explicit `branch` only if you want to override. Worktree tip: since `project_id` is unified across git worktrees of the same repo, discovered work belonging to a different branch/worktree can be captured via `branch: "<other-branch>"` without derailing the current task — the other worktree's session will see it on its next `handoff_resume`. If `continues_from` is set and its topic doesn't match this handoff's `topic`, the tool returns a non-blocking warning — the handoff is still saved.
 
 7. **Report to the user.** Print the new handoff id, the topic (if set), the auto-linked memory count (decisions/patterns/debug memories Engram associated by similarity), and the `continues_from` link if one was set. Ask if any section should be revised; if so, the user can dictate edits and you can call `mcp__engram__memory_update` on the just-created handoff.
 

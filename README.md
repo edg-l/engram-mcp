@@ -332,7 +332,7 @@ engram-cli health
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ENGRAM_DB` | SQLite database path | `~/.local/share/engram/memories.db` |
-| `ENGRAM_PROJECT` | Project scope identifier | Git root directory name |
+| `ENGRAM_PROJECT` | Project scope identifier | Git project root directory name (worktree-aware, see [Worktrees](#worktrees)) |
 | `ENGRAM_DECAY_INTERVAL` | Decay job interval (seconds) | `3600` (1 hour) |
 | `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
 | `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
@@ -340,6 +340,25 @@ engram-cli health
 | `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (23 tools), `core` (14), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
 | `ENGRAM_HOOK_DEDUP_SKIP` | Similarity threshold above which hook captures are silently dropped (clamped to `[0.5, 1.0]`) | `0.95` |
 | `ENGRAM_HOOK_DAILY_CAP` | Max hook-captured memories per project per UTC day; `0` = unlimited | `50` |
+
+## Worktrees
+
+`project_id` is derived from git's shared "common dir" (`git rev-parse --git-common-dir`), not the
+working directory itself, so every `git worktree` checkout of the same repository (e.g.
+`<repo>/.tree/feature-x`) resolves to the same `project_id` as the main checkout. This means a
+session working in one worktree sees memories, decisions, and handoffs captured while working in
+any other worktree (or the main checkout) of the same repo. Set `ENGRAM_PROJECT` explicitly per
+worktree if you want the old per-worktree isolation instead.
+
+A session in one worktree/branch can hand off discovered work belonging to a different
+branch without derailing its own task, e.g. `handoff_create(branch: "other-branch", ...)`; the
+session checked out on `other-branch` (in its own worktree) will see it on its next
+`handoff_resume`, since branch is otherwise auto-detected from the caller's own git state.
+
+**Caveat:** this does not migrate existing data. Worktree checkouts that already accumulated
+memories/handoffs under their old, worktree-local `project_id` keep that data under the old ID —
+it will not appear in the newly unified scope. Use `engram-cli export`/`engram-cli import` to
+manually merge old per-worktree data into the unified project if desired.
 
 ## Retrieval benchmark
 
