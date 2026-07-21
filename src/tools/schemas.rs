@@ -321,6 +321,11 @@ pub struct HandoffCreateInput {
     pub branch: Option<String>,
     /// Structured session sections.
     pub sections: HandoffSections,
+    /// Optional topic/thread name scoping this handoff (e.g. "auth-refactor"). Stored
+    /// as a `topic:<slug>` tag; used by `handoff_resume` to disambiguate parallel work
+    /// on the same branch.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Importance score in [0, 1]. Default 0.85.
     #[serde(default = "default_handoff_importance")]
     pub importance: f64,
@@ -339,6 +344,15 @@ pub struct HandoffResumeInput {
     pub branch: Option<String>,
     /// Query string for scoring sections. Defaults to the latest handoff summary.
     pub query: Option<String>,
+    /// Explicit handoff ID to resume from, bypassing the "latest on branch" lookup.
+    /// Still walks the `continues_from` chain backwards from this handoff.
+    #[serde(default)]
+    pub handoff_id: Option<String>,
+    /// Topic/thread name to scope the resume to (e.g. "auth-refactor"). Filters
+    /// candidate handoffs to those tagged with the matching `topic:<slug>` before
+    /// picking "latest on branch". Ignored when `handoff_id` is given.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// Maximum number of top sections to return. Default 5.
     #[serde(default = "default_max_sections")]
     pub max_sections: usize,
@@ -660,13 +674,17 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Handoff tools ===
         Tool::new(
             "handoff_create",
-            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
+            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.\n\nIMPORTANT — parallel work on the same branch: handoffs are keyed by (project, branch), so two independent sessions on the same branch will otherwise collide (handoff_resume can't tell them apart). If you know you're starting independent/parallel work on a branch that already has handoffs, pass `topic` (e.g. \"auth-refactor\") to scope this handoff to that thread — ask the user for a short topic name, or infer one from the task and confirm it. If `continues_from` is set and its topic doesn't match this handoff's topic, a warning is returned (not blocking).",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
                     "branch": {
                         "type": "string",
                         "description": "Git branch to scope this handoff to. Defaults to the current branch."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional topic/thread name for this handoff (e.g. \"auth-refactor\"). Use this when doing independent/parallel work on a branch that may already have other handoffs, so handoff_resume can tell sessions apart instead of always returning the global latest. Stored as a `topic:<slug>` tag."
                     },
                     "sections": {
                         "type": "object",
@@ -692,7 +710,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "handoff_resume",
-            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.",
+            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.\n\nIMPORTANT — multiple handoffs on the same branch: by default this returns the single most recent handoff on the branch, which can be wrong if two independent sessions worked on the same branch in parallel. If you're not sure this is the right handoff to continue (e.g. the summary doesn't match what you were asked to do), call handoff_search or check for other recent handoffs and surface the ambiguity to the user (e.g. \"I found 2 recent handoffs on this branch: topic A (2h ago) and topic B (10m ago) — which should I resume?\") rather than silently continuing the wrong thread. Use `topic` to scope to a specific thread, or `handoff_id` to resume a specific handoff by ID.",
             make_input_schema(json!({
                 "type": "object",
                 "properties": {
@@ -703,6 +721,14 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "query": {
                         "type": "string",
                         "description": "Query string for scoring sections. Defaults to the latest handoff summary."
+                    },
+                    "handoff_id": {
+                        "type": "string",
+                        "description": "Resume from this specific handoff ID instead of the latest on the branch. Still walks the continues_from chain backwards from it. Takes priority over `topic` and the branch's \"latest\" lookup."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Scope the resume to handoffs tagged with this topic (matches `handoff_create`'s `topic`). Filters candidates to this thread before picking \"latest on branch\". Ignored when `handoff_id` is given."
                     },
                     "max_sections": {
                         "type": "integer",
