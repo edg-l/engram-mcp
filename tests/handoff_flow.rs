@@ -400,3 +400,87 @@ fn import_old_export_without_sidecar_fields() {
         "old-format import must leave sidecar absent (got Some)"
     );
 }
+
+/// Simulates two git worktrees of the same repo now sharing a single, unified `project_id`
+/// (the fix in this change), each with its own `Database` handle pointed at the same
+/// file-backed SQLite DB — mirroring two separate `engram` server processes. A session
+/// working in worktree "A" (checked out on branch `main`) discovers work that belongs to
+/// branch `feature-x`, which is checked out in worktree "B", and captures it via
+/// `handoff_create(branch: "feature-x", ...)` without switching its own context. A session
+/// in worktree "B" (whose own detected branch is `feature-x`) then calls `handoff_resume`
+/// with no branch override (as it would in normal operation) and must see the handoff
+/// worktree A left for it.
+#[test]
+fn cross_worktree_handoff_targeting() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "engram_cross_worktree_test_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let db_path = tmp_dir.join("shared.db");
+
+    let project_id = "unified-project";
+
+    // Worktree A's server process: opens its own Database handle on the shared path.
+    let db_a = Database::open(&db_path).expect("worktree A DB must open");
+    db_a.get_or_create_project(project_id, "Cross-Worktree Test")
+        .expect("project creation must succeed");
+
+    let embedding = EmbeddingService::new().expect("embedding model must be available");
+
+    // Session in worktree A (on branch "main") discovers work for worktree B's branch and
+    // hands it off there explicitly, without derailing its own task.
+    let sections_for_b = make_sections(
+        "Found a bug in the auth flow that belongs on feature-x",
+        vec!["Needs a fix in the token refresh path".to_string()],
+        None,
+    );
+    let result = create_handoff(
+        &db_a,
+        &embedding,
+        project_id,
+        Some("feature-x"),
+        sections_for_b,
+        0.8,
+        true,
+        false,
+    )
+    .expect("worktree A must be able to create a handoff targeting another branch");
+
+    // Worktree B's server process: a second, independent Database handle on the same file,
+    // as would happen if it were a separate `engram` process for worktree B.
+    let db_b = Database::open(&db_path).expect("worktree B DB must open");
+
+    // Worktree B's session resolves its own current branch as "feature-x" and calls
+    // handoff_resume with no explicit branch override, exactly as normal operation would.
+    let resume_result = resume_handoff(
+        &db_b,
+        &embedding,
+        project_id,
+        Some("feature-x"),
+        None,
+        5,
+        false,
+        None,
+    )
+    .expect("resume on worktree B must succeed");
+
+    assert_eq!(
+        resume_result.latest_handoff_id,
+        Some(result.id.clone()),
+        "worktree B must see the handoff worktree A created for its branch"
+    );
+    assert!(
+        !resume_result.top_sections.is_empty(),
+        "worktree B's resume must surface section content from the cross-worktree handoff"
+    );
+    assert!(
+        resume_result
+            .top_sections
+            .iter()
+            .any(|s| s.handoff_id == result.id),
+        "resumed sections must come from the handoff created by worktree A"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
