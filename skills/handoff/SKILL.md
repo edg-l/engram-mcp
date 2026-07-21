@@ -27,13 +27,15 @@ Capture session state into Engram via the `mcp__engram__handoff_create` MCP tool
 
 3. **Detect `continues_from`.** If the `read-handoffs` skill or `mcp__engram__handoff_resume` ran earlier this session and returned a `latest_handoff_id`, pass that id as `continues_from`. Otherwise omit.
 
-4. **Sensitive data filter.** Before calling the tool, scrub: API tokens, passwords, private URLs, customer data, internal hostnames. If unsure, ask the user.
+4. **Consider `topic` for parallel work.** Handoffs are keyed by (project, branch) — `handoff_resume` returns the single latest handoff on a branch by default. If you know this session is independent/parallel work on a branch that may already have other handoffs (e.g. a second task running against the same checkout), pass `topic` (a short slug like `"auth-refactor"`) so a later resume can find *this* thread instead of whichever handoff happens to be newest. Ask the user for a topic name, or infer one from the task and confirm it before calling the tool. If unsure whether this is parallel work, ask rather than guessing.
 
-5. **Call `mcp__engram__handoff_create`** with the payload. Defaults: `pinned: true`, `importance: 0.85`, `auto_link: true`. Branch is auto-detected from git; pass an explicit `branch` only if you want to override.
+5. **Sensitive data filter.** Before calling the tool, scrub: API tokens, passwords, private URLs, customer data, internal hostnames. If unsure, ask the user.
 
-6. **Report to the user.** Print the new handoff id, the auto-linked memory count (decisions/patterns/debug memories Engram associated by similarity), and the `continues_from` link if one was set. Ask if any section should be revised; if so, the user can dictate edits and you can call `mcp__engram__memory_update` on the just-created handoff.
+6. **Call `mcp__engram__handoff_create`** with the payload. Defaults: `pinned: true`, `importance: 0.85`, `auto_link: true`. Branch is auto-detected from git; pass an explicit `branch` only if you want to override. If `continues_from` is set and its topic doesn't match this handoff's `topic`, the tool returns a non-blocking warning — the handoff is still saved.
 
-7. **Escalate single insights worth keeping outside the handoff.** Only do this for content that should surface in `memory_context` queries on unrelated future tasks. Call `mcp__engram__memory_store` separately for:
+7. **Report to the user.** Print the new handoff id, the topic (if set), the auto-linked memory count (decisions/patterns/debug memories Engram associated by similarity), and the `continues_from` link if one was set. Ask if any section should be revised; if so, the user can dictate edits and you can call `mcp__engram__memory_update` on the just-created handoff.
+
+8. **Escalate single insights worth keeping outside the handoff.** Only do this for content that should surface in `memory_context` queries on unrelated future tasks. Call `mcp__engram__memory_store` separately for:
    - `type: decision` — architectural choice with rationale (importance 0.7)
    - `type: pattern` — recurring gotcha / convention discovered (importance 0.7)
    - `type: debug` — root cause of a tricky bug (importance 0.6)
