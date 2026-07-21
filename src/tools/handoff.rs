@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Database, encode_section_embeddings};
 use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
-use crate::memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship};
+use crate::memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship, kebab_title};
 use crate::summarize::{generate_summary, should_auto_summarize};
 
 // ============================================
@@ -72,6 +72,34 @@ pub struct HandoffSearchResult {
 }
 
 // ============================================
+// Topic tagging helpers
+// ============================================
+
+/// Prefix used for topic tags stored on handoff memories, e.g. `topic:auth-refactor`.
+const TOPIC_TAG_PREFIX: &str = "topic:";
+
+/// Slugify a free-form topic string into the `topic:<slug>` tag form.
+///
+/// Returns `None` if `topic` is `None`/empty or slugifies to an empty string
+/// (e.g. all-punctuation input).
+fn topic_tag(topic: Option<&str>) -> Option<String> {
+    let slug = kebab_title(topic?);
+    (!slug.is_empty()).then(|| format!("{TOPIC_TAG_PREFIX}{slug}"))
+}
+
+/// Extract the `topic:<slug>` tag from a memory's tags, if present.
+fn topic_tag_from_tags(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find(|t| t.starts_with(TOPIC_TAG_PREFIX))
+        .map(|s| s.as_str())
+}
+
+/// Returns `true` if `tags` contains the tag for the given slugified topic.
+fn has_topic_tag(tags: &[String], topic_tag_value: &str) -> bool {
+    tags.iter().any(|t| t == topic_tag_value)
+}
+
+// ============================================
 // Handoff free functions
 // ============================================
 
@@ -86,6 +114,7 @@ pub fn create_handoff(
     project_id: &str,
     branch: Option<&str>,
     sections: HandoffSections,
+    topic: Option<&str>,
     importance: f64,
     pinned: bool,
     auto_link: bool,
@@ -112,6 +141,8 @@ pub fn create_handoff(
     } else {
         None
     };
+    let new_topic_tag = topic_tag(topic);
+    let tags: Vec<String> = new_topic_tag.clone().into_iter().collect();
 
     let memory = Memory {
         id: id.clone(),
@@ -119,7 +150,7 @@ pub fn create_handoff(
         memory_type: MemoryType::Handoff,
         content: content.clone(),
         summary,
-        tags: vec![],
+        tags,
         importance: importance.clamp(0.0, 1.0),
         relevance_score: 1.0,
         access_count: 0,
@@ -171,8 +202,22 @@ pub fn create_handoff(
         Vec::new()
     };
 
-    // Step 10: build advisory warnings about section shape.
-    let warnings = collect_section_warnings(&sections);
+    // Step 10: build advisory warnings about section shape, plus a soft warning when
+    // continues_from points at a handoff whose topic tag doesn't match this one's.
+    let mut warnings = collect_section_warnings(&sections);
+    if let Some(cf_id) = sections.continues_from.as_deref()
+        && let Ok(Some(cf_memory)) = db.get_memory(cf_id)
+    {
+        let cf_topic = topic_tag_from_tags(&cf_memory.tags);
+        if cf_topic != new_topic_tag.as_deref() {
+            warnings.push(format!(
+                "continues_from handoff {cf_id} has topic {} but this handoff has topic {} \
+                 — the chain may span unrelated threads.",
+                cf_topic.unwrap_or("(none)"),
+                new_topic_tag.as_deref().unwrap_or("(none)"),
+            ));
+        }
+    }
 
     // Step 11: return result.
     let continues_from = sections.continues_from.clone();
@@ -447,6 +492,8 @@ pub fn resume_handoff_with_vec(
     max_sections: usize,
     include_off_branch: bool,
     max_chars_per_section: Option<usize>,
+    topic: Option<&str>,
+    handoff_id: Option<&str>,
 ) -> Result<HandoffResumeResult, MemoryError> {
     // Step 1: resolve branch; if unresolved, serve off-branch handoffs with explanatory message.
     let (resolved_branch, message, fetch_all) = match branch {
@@ -458,25 +505,51 @@ pub fn resume_handoff_with_vec(
         ),
     };
 
-    // Step 2: fetch latest handoffs.
-    let latest_list = if fetch_all {
-        db.list_recent_handoffs(project_id, 10)?
+    let topic_slug = topic.map(kebab_title).filter(|s| !s.is_empty());
+    let topic_tag_value = topic_slug
+        .as_deref()
+        .map(|s| format!("{TOPIC_TAG_PREFIX}{s}"));
+
+    // Step 2: resolve the chain-start handoff. An explicit handoff_id always wins over
+    // "latest on branch"; topic (when given) filters the latest-on-branch candidate list.
+    let latest_id = if let Some(hid) = handoff_id {
+        let mem = db
+            .get_memory(hid)?
+            .ok_or_else(|| MemoryError::NotFound(hid.to_string()))?;
+        if mem.memory_type != MemoryType::Handoff {
+            return Err(MemoryError::NotFound(hid.to_string()));
+        }
+        mem.id
     } else {
-        db.query_handoffs_by_branch(project_id, resolved_branch.as_deref(), 10)?
-    };
+        // Fetch a larger candidate window when filtering by topic so the filter has
+        // something to work with beyond the unfiltered top-10.
+        let fetch_limit = if topic_tag_value.is_some() { 200 } else { 10 };
+        let latest_list = if fetch_all {
+            db.list_recent_handoffs(project_id, fetch_limit)?
+        } else {
+            db.query_handoffs_by_branch(project_id, resolved_branch.as_deref(), fetch_limit)?
+        };
 
-    let Some(latest) = latest_list.into_iter().next() else {
-        return Ok(HandoffResumeResult {
-            branch: resolved_branch,
-            latest_handoff_id: None,
-            chain: Vec::new(),
-            top_sections: Vec::new(),
-            linked_memories: Vec::new(),
-            message,
-        });
-    };
+        let filtered = match topic_tag_value.as_deref() {
+            Some(tag) => latest_list
+                .into_iter()
+                .filter(|m| has_topic_tag(&m.tags, tag))
+                .collect::<Vec<_>>(),
+            None => latest_list,
+        };
 
-    let latest_id = latest.id.clone();
+        let Some(latest) = filtered.into_iter().next() else {
+            return Ok(HandoffResumeResult {
+                branch: resolved_branch,
+                latest_handoff_id: None,
+                chain: Vec::new(),
+                top_sections: Vec::new(),
+                linked_memories: Vec::new(),
+                message,
+            });
+        };
+        latest.id
+    };
 
     // Step 3: walk continues_from chain backwards from latest (up to depth 5).
     let mut chain_ids: Vec<String> = Vec::new();
@@ -665,10 +738,12 @@ pub fn resume_handoff(
     max_sections: usize,
     include_off_branch: bool,
     max_chars_per_section: Option<usize>,
+    topic: Option<&str>,
+    handoff_id: Option<&str>,
 ) -> Result<HandoffResumeResult, MemoryError> {
     // Resolve the query text, embed it, then delegate to the core implementation.
-    // We need the latest handoff to derive a fallback query text when query=None.
-    // Peek at the DB to get the fallback before calling the inner function.
+    // We need the anchor handoff (explicit handoff_id, else topic/branch latest) to
+    // derive a fallback query text when query=None.
     let (resolved_branch_peek, _, fetch_all_peek) = match branch {
         Some(b) if !b.is_empty() => (Some(b.to_string()), None::<String>, include_off_branch),
         _ => (
@@ -678,19 +753,42 @@ pub fn resume_handoff(
         ),
     };
 
+    let topic_slug = topic.map(kebab_title).filter(|s| !s.is_empty());
+    let topic_tag_value = topic_slug
+        .as_deref()
+        .map(|s| format!("{TOPIC_TAG_PREFIX}{s}"));
+
     // Determine query text for embedding.
     let query_vec = if let Some(q) = query
         && !q.is_empty()
     {
         Some(embedding.embed(q)?)
     } else {
-        // Fallback: use latest handoff summary.
-        let latest_list = if fetch_all_peek {
-            db.list_recent_handoffs(project_id, 1)?
+        // Fallback: use the anchor handoff's summary. Explicit handoff_id wins; otherwise
+        // fall back to the (optionally topic-filtered) latest handoff on the branch.
+        let anchor = if let Some(hid) = handoff_id {
+            db.get_memory(hid)?
+                .filter(|m| m.memory_type == MemoryType::Handoff)
         } else {
-            db.query_handoffs_by_branch(project_id, resolved_branch_peek.as_deref(), 1)?
+            let fetch_limit = if topic_tag_value.is_some() { 200 } else { 1 };
+            let latest_list = if fetch_all_peek {
+                db.list_recent_handoffs(project_id, fetch_limit)?
+            } else {
+                db.query_handoffs_by_branch(
+                    project_id,
+                    resolved_branch_peek.as_deref(),
+                    fetch_limit,
+                )?
+            };
+            match topic_tag_value.as_deref() {
+                Some(tag) => latest_list
+                    .into_iter()
+                    .find(|m| has_topic_tag(&m.tags, tag)),
+                None => latest_list.into_iter().next(),
+            }
         };
-        if let Some(latest) = latest_list.into_iter().next() {
+
+        if let Some(latest) = anchor {
             let fallback_text = match db.get_handoff_sections(&latest.id)? {
                 Some((s, _)) => s.summary,
                 None => latest
@@ -700,7 +798,8 @@ pub fn resume_handoff(
             };
             Some(embedding.embed(&fallback_text)?)
         } else {
-            // No handoffs exist; inner function will return an empty result.
+            // No handoffs exist; inner function will return an empty result (or a NotFound
+            // error, if an explicit handoff_id was given but doesn't exist).
             None
         }
     };
@@ -713,6 +812,8 @@ pub fn resume_handoff(
         max_sections,
         include_off_branch,
         max_chars_per_section,
+        topic,
+        handoff_id,
     )
 }
 
