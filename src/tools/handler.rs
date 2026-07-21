@@ -995,7 +995,7 @@ impl ToolHandler {
                 .memory_type
                 .parse()
                 .map_err(|_| MemoryError::InvalidType(mem_input.memory_type.clone()))?;
-            contents.push(format!("{}: {}", memory_type.as_str(), &mem_input.content));
+            contents.push(format!("{}: {}", memory_type.as_str(), mem_input.content));
         }
 
         // Batch embed all content
