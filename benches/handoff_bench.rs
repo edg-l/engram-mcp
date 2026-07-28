@@ -1,10 +1,11 @@
 mod common;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use engram_mcp::db::{Database, encode_section_embeddings};
 use engram_mcp::memory::{HandoffSections, Memory, MemoryType};
 use engram_mcp::tools::{SearchMode, score_handoff_sections};
 use serde_json::json;
+use std::hint::black_box;
 use tempfile::TempDir;
 
 // ============================================================

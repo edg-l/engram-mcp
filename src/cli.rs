@@ -600,7 +600,24 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
     }
 }
 
+/// Restore the default `SIGPIPE` disposition. Rust ignores `SIGPIPE`, so writing
+/// to a closed pipe (`engram-cli projects | head`) raises `EPIPE` and `println!`
+/// panics. With the default disposition the process terminates quietly instead,
+/// which is what a pipeline expects.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: called at the top of main, before any thread is spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    reset_sigpipe();
+
     let cli = Cli::parse();
 
     let db_path = get_db_path(cli.database);

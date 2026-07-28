@@ -7,14 +7,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The binary built for this test run. `CARGO_BIN_EXE_*` always points at the
+/// current profile's build, so a stale binary from another profile cannot be
+/// picked up.
 fn cli() -> PathBuf {
-    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-    let release = target.join("release").join("engram-cli");
-    if release.exists() {
-        release
-    } else {
-        target.join("debug").join("engram-cli")
-    }
+    PathBuf::from(env!("CARGO_BIN_EXE_engram-cli"))
 }
 
 struct Run {
@@ -96,10 +93,6 @@ fn seed(db: &std::path::Path) -> String {
 
 #[test]
 fn every_supported_command_emits_parseable_json() {
-    if !cli().exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
     let memory_id = seed(&db);
@@ -138,10 +131,6 @@ fn every_supported_command_emits_parseable_json() {
 
 #[test]
 fn json_documents_carry_the_expected_shape() {
-    if !cli().exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
     seed(&db);
@@ -178,10 +167,6 @@ fn json_documents_carry_the_expected_shape() {
 
 #[test]
 fn empty_results_are_still_json() {
-    if !cli().exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
 
@@ -205,10 +190,6 @@ fn empty_results_are_still_json() {
 
 #[test]
 fn json_is_rejected_where_it_is_not_supported() {
-    if !cli().exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
 
@@ -230,4 +211,30 @@ fn json_is_rejected_where_it_is_not_supported() {
             out.stderr
         );
     }
+}
+
+#[test]
+fn piping_into_an_early_exiting_reader_does_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+
+    // Content large enough that the output cannot fit in the pipe buffer, so the
+    // writer is still writing when the reader exits.
+    let big = "The runbook step repeats for every region. ".repeat(3000);
+    let stored = run(&db, &["store", &big, "-t", "fact"]);
+    assert_eq!(stored.code, Some(0), "{}", stored.stderr);
+
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' --json list | head -1", cli().display()))
+        .env("ENGRAM_DB", &db)
+        .env("ENGRAM_PROJECT", "json-test")
+        .output()
+        .expect("failed to spawn pipeline");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
+        "piped output should die quietly on SIGPIPE, got: {stderr}"
+    );
 }

@@ -1,6 +1,7 @@
 mod common;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_embedding(c: &mut Criterion) {
     // Model load is excluded — get_or_init runs once before any iteration.

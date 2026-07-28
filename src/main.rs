@@ -14,11 +14,11 @@ mod tools;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    Annotated, CallToolRequestParams, CallToolResult, Content, GetPromptRequestParams,
-    GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
-    PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResult,
+    Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    Role, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -578,7 +578,7 @@ impl ServerHandler for MemoryServer {
                 content_length,
                 handler.database(),
             );
-            Ok(CallToolResult::success(vec![Content::text(formatted)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(formatted)]))
         }
     }
 
@@ -595,24 +595,19 @@ impl ServerHandler for MemoryServer {
                 .get_all_memories_for_project(&self.project_id)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            let resources: Vec<_> = memories
+            let resources: Vec<Resource> = memories
                 .into_iter()
                 .map(|m| {
-                    Annotated::new(
-                        RawResource {
-                            uri: format!("memory://{}/{}", self.project_id, m.id),
-                            name: m
-                                .summary
-                                .unwrap_or_else(|| m.content.chars().take(50).collect()),
-                            title: Some(format!("{:?}", m.memory_type)),
-                            description: Some(m.content.chars().take(200).collect()),
-                            mime_type: Some("text/plain".to_string()),
-                            size: Some(m.content.len() as u32),
-                            icons: None,
-                            meta: None,
-                        },
-                        None,
-                    )
+                    let description: String = m.content.chars().take(200).collect();
+                    let size = m.content.len() as u64;
+                    let name = m
+                        .summary
+                        .unwrap_or_else(|| m.content.chars().take(50).collect());
+                    Resource::new(format!("memory://{}/{}", self.project_id, m.id), name)
+                        .with_title(format!("{:?}", m.memory_type))
+                        .with_description(description)
+                        .with_mime_type("text/plain")
+                        .with_size(size)
                 })
                 .collect();
 
@@ -628,17 +623,13 @@ impl ServerHandler for MemoryServer {
     {
         async move {
             Ok(ListResourceTemplatesResult::with_all_items(vec![
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: format!("memory://{}/{{memory_id}}", self.project_id),
-                        name: "Memory".to_string(),
-                        title: Some("Read a specific memory".to_string()),
-                        description: Some("Access a memory by its ID".to_string()),
-                        mime_type: Some("text/plain".to_string()),
-                        icons: None,
-                    },
-                    None,
-                ),
+                ResourceTemplate::new(
+                    format!("memory://{}/{{memory_id}}", self.project_id),
+                    "Memory",
+                )
+                .with_title("Read a specific memory")
+                .with_description("Access a memory by its ID")
+                .with_mime_type("text/plain"),
             ]))
         }
     }
@@ -808,7 +799,7 @@ impl ServerHandler for MemoryServer {
                     }
 
                     Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                        PromptMessageRole::User,
+                        Role::User,
                         format!(
                             "Here are relevant memories from the project knowledge base:\n\n{}\n\nUse these memories to inform your response about: {}",
                             memories_text, context
@@ -817,14 +808,14 @@ impl ServerHandler for MemoryServer {
                     .with_description(format!("Relevant memories for: {}", context)))
                 }
                 "handoff" => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
+                    Role::User,
                     include_str!("prompts/handoff.md"),
                 )])
                 .with_description(
                     "Gather session state and call handoff_create to preserve it for the next session",
                 )),
                 "resume" => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
+                    Role::User,
                     include_str!("prompts/resume.md"),
                 )])
                 .with_description(
@@ -888,8 +879,25 @@ fn startup_mode(args: &[String], stdin_is_terminal: bool) -> StartupMode {
     }
 }
 
+/// Restore the default `SIGPIPE` disposition. Rust ignores `SIGPIPE`, so writing
+/// to a closed pipe (`engram-cli projects | head`) raises `EPIPE` and `println!`
+/// panics. With the default disposition the process terminates quietly instead,
+/// which is what a pipeline expects.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: called at the top of main, before any thread is spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    reset_sigpipe();
+
     use std::io::IsTerminal;
     let args: Vec<String> = std::env::args().skip(1).collect();
     match startup_mode(&args, std::io::stdin().is_terminal()) {

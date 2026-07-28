@@ -9,26 +9,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Path to the engram-cli binary produced by cargo build.
+/// Path to the engram-cli binary built for this test run. `CARGO_BIN_EXE_*`
+/// always points at the current profile's build, so a stale binary from another
+/// profile cannot be picked up.
 fn cli_bin() -> PathBuf {
-    // Use the test binary location from CARGO_TARGET_DIR or default target dir.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    // During `cargo test` the binary is built in the same target directory.
-    // Try debug first (faster for tests), then release.
-    let debug_path = PathBuf::from(manifest_dir)
-        .join("target")
-        .join("debug")
-        .join("engram-cli");
-    let release_path = PathBuf::from(manifest_dir)
-        .join("target")
-        .join("release")
-        .join("engram-cli");
-
-    if release_path.exists() {
-        release_path
-    } else {
-        debug_path
-    }
+    PathBuf::from(env!("CARGO_BIN_EXE_engram-cli"))
 }
 
 /// Write a fixture handoff markdown file that `parse_markdown` can read.

@@ -1,6 +1,6 @@
 [package]
 name = "engram_mcp"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 description = "MCP server for AI agent persistent memory with SQLite and local embeddings"
 license = "MIT"
@@ -20,31 +20,36 @@ name = "longmemeval-bench"
 path = "benchmarks/longmemeval/src/main.rs"
 
 [dependencies]
-rmcp = { version = "1.6", features = ["server", "transport-io"] }
+rmcp = { version = "2.2", features = ["server", "transport-io"] }
 tokio = { version = "1.52", features = ["full"] }
-rusqlite = { version = "0.39", features = ["bundled", "functions"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.23", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 fastembed = "5"
-hf-hub = { version = "0.4.1", default-features = false, features = ["ureq"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 thiserror = "2.0"
 dirs = "6.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 moka = { version = "0.12", features = ["sync"] }
 regex = "1"
 anyhow = "1"
-rand = "0.9"
+rand = "0.10"
 # tempfile remains in [dependencies] (not dev-deps) because the longmemeval-bench
 # [[bin]] uses tempfile::TempDir in non-test code (benchmarks/longmemeval/src/).
 tempfile = "3.27"
 
+# Only used to restore the default SIGPIPE disposition so piped output does not
+# panic when the reader exits early.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 assert_cmd = "2"
 
 [[bench]]

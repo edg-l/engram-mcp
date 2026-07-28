@@ -9,14 +9,15 @@ use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-fn bin(name: &str) -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-    let release = manifest_dir.join("release").join(name);
-    if release.exists() {
-        release
-    } else {
-        manifest_dir.join("debug").join(name)
-    }
+/// Binaries built for this test run. `CARGO_BIN_EXE_*` always points at the
+/// current profile's build, so a stale binary from another profile cannot be
+/// picked up.
+fn cli_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_engram-cli"))
+}
+
+fn server_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_engram"))
 }
 
 struct Run {
@@ -65,7 +66,7 @@ fn wait_with_open_stdin(mut child: Child) -> Option<Run> {
 /// Spawn engram-cli with stdin held open as an idle pipe: an interactive prompt
 /// would block here rather than seeing EOF.
 fn run_cli(db: &std::path::Path, args: &[&str]) -> Option<Run> {
-    let child = Command::new(bin("engram-cli"))
+    let child = Command::new(cli_bin())
         .env("ENGRAM_DB", db)
         .env("ENGRAM_PROJECT", "non-interactive-test")
         .env("ENGRAM_BRANCH", "feat/non-interactive")
@@ -80,10 +81,6 @@ fn run_cli(db: &std::path::Path, args: &[&str]) -> Option<Run> {
 
 #[test]
 fn handoff_create_does_not_prompt_when_non_interactive() {
-    if !bin("engram-cli").exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
 
@@ -123,10 +120,6 @@ fn handoff_create_does_not_prompt_when_non_interactive() {
 
 #[test]
 fn handoff_create_skips_prompts_when_stdin_is_not_a_terminal() {
-    if !bin("engram-cli").exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
 
@@ -164,10 +157,6 @@ fn handoff_create_skips_prompts_when_stdin_is_not_a_terminal() {
 
 #[test]
 fn handoff_create_without_summary_fails_fast() {
-    if !bin("engram-cli").exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
 
@@ -185,10 +174,6 @@ fn handoff_create_without_summary_fails_fast() {
 
 #[test]
 fn adr_create_is_non_interactive_with_flags() {
-    if !bin("engram-cli").exists() {
-        eprintln!("engram-cli not built; skipping");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
 
@@ -242,13 +227,8 @@ fn adr_create_is_non_interactive_with_flags() {
 
 #[test]
 fn engram_binary_explains_itself_instead_of_serving() {
-    if !bin("engram").exists() {
-        eprintln!("engram not built; skipping");
-        return;
-    }
-
     for args in [vec!["--help"], vec!["store", "something"]] {
-        let child = Command::new(bin("engram"))
+        let child = Command::new(server_bin())
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -271,13 +251,13 @@ fn engram_binary_explains_itself_instead_of_serving() {
     }
 
     // `--help` is a successful request for help; an unsupported argument is not.
-    let help = Command::new(bin("engram"))
+    let help = Command::new(server_bin())
         .arg("--help")
         .output()
         .expect("spawn");
     assert_eq!(help.status.code(), Some(0));
 
-    let bad = Command::new(bin("engram"))
+    let bad = Command::new(server_bin())
         .arg("store")
         .output()
         .expect("spawn");

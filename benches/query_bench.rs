@@ -2,8 +2,9 @@ mod common;
 
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::json;
+use std::hint::black_box;
 
 fn bench_query(c: &mut Criterion) {
     // Corpus 100: real embeddings so query embedding is in the same vector space.

@@ -1,7 +1,8 @@
 mod common;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use engram_mcp::tools::{compute_hybrid_score, compute_tag_boost};
+use std::hint::black_box;
 
 fn bench_scoring(c: &mut Criterion) {
     let mut group = c.benchmark_group("scoring");
