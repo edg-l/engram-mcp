@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.8.0] - 2026-07-28
+
+### Added
+- **Optional `project` argument on every MCP tool.** Omitted, it resolves to the server's own project (`ENGRAM_PROJECT` or cwd) exactly as before; passed, that single call reads or writes another project's memories. Previously only the finer-grained `branch` was settable, so a server rooted above the repo being worked on silently stored memories under the parent directory. An unknown project ID is rejected with `MemoryError::UnknownProject` listing the known IDs rather than silently returning an empty result; a project counts as known if it has a `projects` row or owns at least one memory.
+- **`memory_projects` MCP tool** and **`engram-cli projects`**: every project in the store with memory, handoff, and ADR counts plus last activity, ordered by recency. This is the discovery path for the `project` argument. `memory_projects` joins the `core` profile (now 15 tools; `full` is now 24).
+- **`engram-cli --json`** for machine-readable output on `query`, `context`, `stats`, `projects`, `list`, `show`, `handoff resume`/`search`/`show`, and `adr list`/`show`. Memory objects use the same serde shape as export and MCP payloads. Empty results still render as JSON with `count: 0`. Commands that cannot render JSON exit 2 with a message instead of ignoring the flag, so a caller never parses prose by accident.
+- **`--non-interactive` on `engram-cli handoff create` and `adr create`.** Prompting now also requires stdin to be a terminal, so CI jobs and agents holding an open stdin no longer block on a section prompt. Missing optional sections stay empty; missing required ones fail immediately naming the flag to pass (`--summary`, `--title`, `--decision`).
+- Store results report where they landed: `memory_store` and `memory_store_batch` include `project`, `handoff_create` includes `project` and `branch`, `adr_create` includes `project`. The compact MCP output reads `Stored mem_… in <project>`.
+- `memory_stats` accepts `project`; `memory://{project}/{id}` resources resolve any project in the store (a URI whose project does not match the memory's owner is an error).
+
+### Changed
+- **`engram` no longer starts a server when given arguments or a terminal.** It speaks MCP over stdio and has no subcommands, so `engram --help`, `engram store …`, or a bare run in a shell previously failed with `ConnectionClosed("initialize request")` — which reads as "there is no CLI". It now prints a usage notice pointing at `engram-cli` (exit 0 for `--help`/`-h`, 2 for an unsupported argument), prints the version for `--version`/`-V`, and serves as before when stdin is a pipe or `--stdio`/`--serve` is passed.
+- Branch handling for a project that is not the server's own: the current git branch describes only the server's checkout, so `branch_mode: "current"` widens to all branches, `branch: "auto"` on `memory_store` resolves to global, and `handoff_create` for another project requires an explicit `branch`.
+- `engram-cli` read commands with an explicit `--project` that does not exist now report the known projects and exit 1 instead of creating an empty project and returning nothing. Write commands still create on demand.
+
+### Fixed
+- **Misleading `missing field` errors on tool calls.** Input structs ignore unknown fields, so a misnamed argument was dropped silently and the failure surfaced as a bare `missing field \`type\`` on a call that looked like it did send `type`. All tool arguments now parse through `parse_args`, which names the tool and lists the fields actually received: `Invalid arguments for memory_store: missing field \`type\`. Fields received: content, kind, tags`. Field order never mattered — arguments arrive as a JSON object — and there is now a regression test asserting that with an 18KB content field in both orders.
+- `memory_store` (and each `memory_store_batch` item) accepts `memory_type` as an alias for `type`, the spelling callers most often reach for.
+- Interactive prompts terminate their line on EOF, so output no longer renders inside a `  > ` prompt.
+
 ## [0.7.0] - 2026-06-28
 
 ### Added
