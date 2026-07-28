@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.1] - 2026-07-28
+
+### Fixed
+- **Piping CLI output into a reader that exits early no longer panics.** `engram-cli projects | head` printed `failed printing to stdout: Broken pipe (os error 32)` and exited 101, because Rust ignores `SIGPIPE` and `println!` panics on `EPIPE`. Both binaries now restore the default `SIGPIPE` disposition, so the writer dies quietly (exit 141) as a pipeline expects. Adds a unix-only `libc` dependency for the one `signal()` call.
+
+### Changed
+- **Dependencies updated.** `rmcp` 1.6 → 2.2, which aligns the model types with the MCP 2025-11-25 spec: the `Annotated<RawResource>` / `RawResourceTemplate` wrappers are now flat `Resource` / `ResourceTemplate`, `Content` is `ContentBlock`, and `PromptMessageRole` is `Role`. No change to engram's own tool, resource, or prompt surface. Also `rusqlite` 0.39 → 0.40, `base64` 0.22 → 0.23, `rand` 0.9 → 0.10, `criterion` 0.5 → 0.8 (benches use `std::hint::black_box`), plus in-range updates for the rest of the tree.
+- `hf-hub` 0.4 → 0.5, matching what `fastembed` already depends on. The tree previously carried two copies of the crate that resolves and caches the ONNX model; it now carries one.
+- Integration tests resolve binaries via `CARGO_BIN_EXE_*` instead of guessing `target/release` before `target/debug`, so a stale binary from another profile can no longer be tested by accident.
+
 ## [0.8.0] - 2026-07-28
 
 ### Added
