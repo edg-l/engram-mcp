@@ -47,6 +47,7 @@ const CORE_TOOLS: &[&str] = &[
     "handoff_create",
     "memory_store_batch",
     "memory_delete_batch",
+    "memory_projects",
     "adr_create",
     "adr_show",
     "adr_list",
@@ -163,7 +164,9 @@ fn default_proposed_status() -> String {
 #[derive(Debug, Deserialize)]
 pub struct MemoryStoreInput {
     pub content: String,
-    #[serde(rename = "type")]
+    /// Memory type. `memory_type` is accepted as an alias: callers reach for it
+    /// often enough that rejecting it reads as the server losing the field.
+    #[serde(rename = "type", alias = "memory_type")]
     pub memory_type: String,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -183,6 +186,9 @@ pub struct MemoryStoreInput {
     /// Optional list of external artifact references (file paths, URLs, ticket IDs).
     #[serde(default)]
     pub external_artifacts: Option<Vec<String>>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +213,9 @@ pub struct MemoryQueryInput {
     /// "all" = all branches, "global" = global only, or "branch-name" = specific branch
     #[serde(default = "default_branch_mode")]
     pub branch_mode: String,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,11 +228,17 @@ pub struct MemoryUpdateInput {
     pub pinned: Option<bool>,
     /// Replace external_artifacts list. Pass empty array to clear; omit to preserve existing.
     pub external_artifacts: Option<Vec<String>>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryDeleteInput {
     pub id: String,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +248,9 @@ pub struct MemoryLinkInput {
     pub relation: String,
     #[serde(default = "default_strength")]
     pub strength: f64,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,22 +260,34 @@ pub struct MemoryGraphInput {
     pub depth: usize,
     #[serde(default)]
     pub relation_types: Vec<String>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryStoreBatchInput {
     pub memories: Vec<MemoryStoreInput>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryDeleteBatchInput {
     pub ids: Vec<String>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryExportInput {
     #[serde(default)]
     pub include_embeddings: bool,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,10 +295,17 @@ pub struct MemoryImportInput {
     pub data: Value,
     #[serde(default = "default_import_mode")]
     pub mode: String,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct MemoryStatsInput {}
+pub struct MemoryStatsInput {
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryContextInput {
@@ -286,6 +323,9 @@ pub struct MemoryContextInput {
     /// Enable hierarchical retrieval via clusters (default: true)
     #[serde(default = "default_hierarchical")]
     pub hierarchical: bool,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,12 +336,18 @@ pub struct MemoryPruneInput {
     /// If true, actually delete. If false (default), just show what would be deleted.
     #[serde(default)]
     pub confirm: bool,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryPromoteInput {
     /// ID of the memory to promote from branch-local to global
     pub id: String,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +358,9 @@ pub struct MemoryDedupInput {
     /// If true, execute merges. If false (default), dry run.
     #[serde(default)]
     pub confirm: bool,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `handoff_create` MCP tool.
@@ -330,6 +379,9 @@ pub struct HandoffCreateInput {
     /// Auto-link this handoff to related decisions/patterns/debug memories. Default true.
     #[serde(default = "default_auto_link")]
     pub auto_link: bool,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `handoff_resume` MCP tool.
@@ -350,6 +402,9 @@ pub struct HandoffResumeInput {
     /// the nearest paragraph/sentence boundary and annotated with a marker so the
     /// caller can recognise the elision and fetch the full text via the handoff ID.
     pub max_chars_per_section: Option<usize>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `handoff_search` MCP tool.
@@ -364,6 +419,9 @@ pub struct HandoffSearchInput {
     /// Filter results to these section names only (e.g. `["blockers", "todos"]`).
     /// Case-insensitive. `None` means all sections.
     pub section_filter: Option<Vec<String>>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `adr_create` MCP tool.
@@ -381,6 +439,9 @@ pub struct AdrCreateInput {
     pub pinned: bool,
     #[serde(default)]
     pub supersedes: Option<u32>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `adr_update_status` MCP tool.
@@ -388,6 +449,9 @@ pub struct AdrCreateInput {
 pub struct AdrUpdateStatusInput {
     pub number: u32,
     pub status: String,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `adr_list` MCP tool.
@@ -395,12 +459,18 @@ pub struct AdrUpdateStatusInput {
 pub struct AdrListInput {
     #[serde(default)]
     pub status: Option<String>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `adr_show` MCP tool.
 #[derive(Debug, Deserialize)]
 pub struct AdrShowInput {
     pub number: u32,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input for the `adr_export` MCP tool.
@@ -412,6 +482,9 @@ pub struct AdrExportInput {
     pub dir: Option<String>,
     #[serde(default = "default_true")]
     pub dry_run: bool,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 // ============================================
@@ -434,13 +507,28 @@ pub fn make_input_schema(schema: Value) -> Arc<Map<String, Value>> {
     }
 }
 
+/// Description of the shared optional `project` argument.
+const PROJECT_ARG_DESCRIPTION: &str = "Project to operate on. Omit to use the server's own project (derived from its working directory). Pass a project ID from memory_projects to read or write another project's memories. Unknown project IDs are rejected.";
+
+/// Build a tool input schema with the shared optional `project` argument added.
+fn project_scoped_schema(schema: Value) -> Arc<Map<String, Value>> {
+    let mut schema = schema;
+    if let Some(properties) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        properties.insert(
+            "project".to_string(),
+            json!({"type": "string", "description": PROJECT_ARG_DESCRIPTION}),
+        );
+    }
+    make_input_schema(schema)
+}
+
 pub fn get_tool_definitions() -> Vec<Tool> {
     vec![
         // === Core tools (used frequently by agents) ===
         Tool::new(
             "memory_store",
             "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Duplicates are auto-detected and merged. Use `pinned: true` for permanent knowledge that must never decay, and `global: true` for knowledge that applies across all projects.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "What to remember. Be specific and self-contained -- this will be retrieved by semantic search later."},
@@ -465,7 +553,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_query",
             "Search for specific memories using a question or keywords. Use this when you need to find something you previously stored -- a specific fact, decision, or detail. Returns scored results with semantic + keyword matching. For broad context gathering, prefer memory_context instead.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language question or keywords. E.g. 'what database do we use' or 'authentication decision'."},
@@ -484,7 +572,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_context",
             "Retrieve memories relevant to your current task or conversation. Use this at the start of a task to load background knowledge, or when you need context about what the project does, how it works, or what decisions were made. Unlike memory_query, this is optimized for broad relevance rather than specific lookups.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "context": {"type": "string", "description": "Describe what you're working on or thinking about. E.g. 'adding a new API endpoint for user profiles' or 'debugging the payment service timeout'."},
@@ -500,7 +588,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_update",
             "Correct or update an existing memory. Use when information has changed (e.g. a version was upgraded, a decision was revised). Only provide fields you want to change. Supports `pinned` to protect a memory from decay/pruning.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to update (from a previous query result)."},
@@ -521,7 +609,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_delete",
             "Remove a memory that is no longer relevant or was stored in error.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to delete."}
@@ -532,13 +620,18 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_stats",
             "Get a summary of stored memories: total count, relationship count, average relevance, and cluster count. Use to understand the current state of the memory store.",
+            project_scoped_schema(json!({"type": "object", "properties": {}})),
+        ),
+        Tool::new(
+            "memory_projects",
+            "List every project in the memory store with its memory, handoff, and ADR counts. Use this to discover the project ID to pass as the `project` argument on other tools when you need another project's memories.",
             make_input_schema(json!({"type": "object", "properties": {}})),
         ),
         // === Relationship tools (use when tracking how knowledge connects) ===
         Tool::new(
             "memory_link",
             "Create a typed relationship between two memories. Use when one memory supersedes another (newer decision replaces older), or when you want to track that two memories are related or one is derived from another.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "source_id": {"type": "string", "description": "ID of the source memory."},
@@ -552,7 +645,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_graph",
             "Explore how a memory connects to others. Traverses the relationship graph outward from a memory, showing linked memories up to a configurable depth. Use when you need to understand the context around a specific decision or fact.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to start traversal from."},
@@ -566,7 +659,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_store_batch",
             "Store multiple memories at once (up to 100). More efficient than individual stores for bulk operations like ingesting documentation or session notes.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "memories": {
@@ -596,7 +689,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_delete_batch",
             "Delete multiple memories by ID in one operation.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {"ids": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs to delete."}},
                 "required": ["ids"]
@@ -605,7 +698,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_export",
             "Export all project memories to JSON for backup or transfer to another project.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "include_embeddings": {"type": "boolean", "description": "Include embedding vectors in export (larger file, but avoids re-embedding on import)."}
@@ -615,7 +708,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_import",
             "Import memories from a JSON export. Use 'merge' mode to add without overwriting, 'replace' to wipe and reload.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "data": {"type": "object", "description": "The JSON export data (from memory_export)."},
@@ -627,7 +720,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_prune",
             "Clean up memories that have decayed below a relevance threshold. Memories decay over time if not accessed. Dry run by default -- shows what would be removed without deleting.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Remove memories with relevance below this (default 0.2)."},
@@ -638,7 +731,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_promote",
             "Make a branch-scoped memory visible globally. Use when a branch-specific finding should be preserved across all branches.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to promote from branch-local to global."}
@@ -649,7 +742,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "memory_dedup",
             "Scan for and merge duplicate memories. Finds memory pairs with high semantic similarity (same type, similarity above threshold) and merges them, preserving tags and importance from both. Dry run by default.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "threshold": {"type": "number", "minimum": 0.5, "maximum": 1.0, "description": "Similarity threshold for duplicates (default 0.90). Lower = more aggressive dedup."},
@@ -661,7 +754,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "handoff_create",
             "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "branch": {
@@ -693,7 +786,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "handoff_resume",
             "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "branch": {
@@ -725,7 +818,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "handoff_search",
             "Search session handoffs by section content. Filter by branch and/or section name.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "query": {
@@ -753,7 +846,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "adr_create",
             "Create an Architecture Decision Record (ADR) in Nygard style. ADRs are project-global (no branch scope), pinned by default, exempt from decay, and bypass dedup. Use `supersedes` to mark an existing ADR as superseded when this decision replaces it.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "title": {
@@ -799,7 +892,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "adr_update_status",
             "Advance an ADR through its lifecycle (proposed → accepted → deprecated/superseded, etc.). Use adr_create with supersedes to mark an ADR superseded via a new decision. Direct 'superseded' transitions via this tool are rejected — use adr_create with the supersedes field instead.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "number": {
@@ -819,7 +912,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "adr_list",
             "List ADRs for the current project, ordered by ADR number. ADRs are project-global.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "status": {
@@ -833,7 +926,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "adr_show",
             "Retrieve full details of a single ADR by number.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "number": {
@@ -848,7 +941,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool::new(
             "adr_export",
             "Export one or all ADRs to Markdown files on disk. `dry_run` (default true) lists what would be written without creating files. Set `dry_run: false` to write — existing files are overwritten silently. `dir` sets the output directory (default: docs/adr relative to the server's cwd). `number` exports a single ADR; omit to export all.",
-            make_input_schema(json!({
+            project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "number": {

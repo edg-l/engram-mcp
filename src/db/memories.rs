@@ -4,7 +4,7 @@ use std::str::FromStr;
 use rusqlite::params;
 
 use crate::error::MemoryError;
-use crate::memory::{Memory, MemoryType, Project, ProjectStats};
+use crate::memory::{Memory, MemoryType, Project, ProjectStats, ProjectSummary};
 
 use super::Database;
 use super::util::parse_memory_type_col;
@@ -54,6 +54,59 @@ impl Database {
         };
         self.create_project(&project)?;
         Ok(project)
+    }
+
+    /// Whether a project is known to the store, either as a `projects` row or as
+    /// the owner of at least one memory.
+    pub fn project_exists(&self, id: &str) -> Result<bool, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)
+                 OR EXISTS(SELECT 1 FROM memories WHERE project_id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// List every project in the store with its memory, handoff, and ADR counts.
+    /// Projects that only have memories and no `projects` row are included.
+    pub fn list_projects(&self) -> Result<Vec<ProjectSummary>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT p.id,
+                    COALESCE(m.total, 0),
+                    COALESCE(m.handoffs, 0),
+                    COALESCE(m.adrs, 0),
+                    m.latest
+             FROM (SELECT id FROM projects UNION SELECT project_id FROM memories) p
+             LEFT JOIN (
+                 SELECT project_id,
+                        COUNT(*) AS total,
+                        SUM(memory_type = 'handoff') AS handoffs,
+                        SUM(memory_type = 'adr') AS adrs,
+                        MAX(updated_at) AS latest
+                 FROM memories
+                 GROUP BY project_id
+             ) m ON m.project_id = p.id
+             ORDER BY m.latest DESC NULLS LAST, p.id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(ProjectSummary {
+                id: row.get(0)?,
+                memory_count: row.get::<_, i64>(1)? as usize,
+                handoff_count: row.get::<_, i64>(2)? as usize,
+                adr_count: row.get::<_, i64>(3)? as usize,
+                latest_activity_at: row.get(4)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // Memory operations

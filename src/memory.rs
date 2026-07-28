@@ -691,6 +691,18 @@ pub struct ProjectStats {
     pub adr_count: usize,
 }
 
+/// One row of the project listing: enough to pick a project to scope a call to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // Used by MCP server and CLI
+pub struct ProjectSummary {
+    pub id: String,
+    pub memory_count: usize,
+    pub handoff_count: usize,
+    pub adr_count: usize,
+    /// Unix timestamp of the most recently updated memory, or `None` if the project is empty.
+    pub latest_activity_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryCluster {
     pub id: String,

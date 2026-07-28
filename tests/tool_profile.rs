@@ -15,9 +15,9 @@ fn minimal_profile_has_three_tools() {
 }
 
 #[test]
-fn core_profile_has_fourteen_tools() {
+fn core_profile_has_fifteen_tools() {
     let tools = get_tool_definitions_for(ToolProfile::Core);
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
     let names: std::collections::HashSet<String> =
         tools.iter().map(|t| t.name.to_string()).collect();
     let expected: std::collections::HashSet<String> = [
@@ -32,6 +32,7 @@ fn core_profile_has_fourteen_tools() {
         "handoff_create",
         "memory_store_batch",
         "memory_delete_batch",
+        "memory_projects",
         "adr_create",
         "adr_show",
         "adr_list",
@@ -45,7 +46,7 @@ fn core_profile_has_fourteen_tools() {
 #[test]
 fn full_profile_matches_default() {
     let full = get_tool_definitions_for(ToolProfile::Full);
-    assert_eq!(full.len(), 23);
+    assert_eq!(full.len(), 24);
     let full_names: std::collections::HashSet<String> =
         full.iter().map(|t| t.name.to_string()).collect();
     let all = get_tool_definitions();

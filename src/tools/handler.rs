@@ -25,8 +25,8 @@ use super::schemas::{
     HandoffCreateInput, HandoffResumeInput, HandoffSearchInput, MemoryContextInput,
     MemoryDedupInput, MemoryDeleteBatchInput, MemoryDeleteInput, MemoryExportInput,
     MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryPromoteInput, MemoryPruneInput,
-    MemoryQueryInput, MemoryStoreBatchInput, MemoryStoreInput, MemoryUpdateInput, ToolProfile,
-    dedup_threshold, get_tool_definitions_for,
+    MemoryQueryInput, MemoryStatsInput, MemoryStoreBatchInput, MemoryStoreInput, MemoryUpdateInput,
+    ToolProfile, dedup_threshold, get_tool_definitions_for,
 };
 use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
@@ -92,6 +92,9 @@ pub struct MergeInfo {
 pub struct MemoryStoreResult {
     pub id: String,
     pub message: String,
+    /// Project the memory was stored under. Always reported so a caller can see
+    /// which project a store actually landed in.
+    pub project: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +137,39 @@ pub fn parse_search_mode(env_val: Option<&str>) -> SearchMode {
             tracing::warn!("ENGRAM_SEARCH_MODE: {e}; falling back to hybrid");
             SearchMode::Hybrid
         }),
+    }
+}
+
+/// Deserialize tool arguments, reporting the field names that were actually
+/// received on failure. Unknown fields are ignored by the input structs, so a
+/// misnamed field otherwise surfaces as a bare "missing field" that looks like
+/// the server dropped a field the caller did send.
+fn parse_args<T: serde::de::DeserializeOwned>(
+    tool: &str,
+    arguments: Value,
+) -> Result<T, MemoryError> {
+    let received = match arguments.as_object() {
+        Some(map) if !map.is_empty() => map.keys().cloned().collect::<Vec<_>>().join(", "),
+        Some(_) => "(none)".to_string(),
+        None => format!("(not an object: {})", type_name_of(&arguments)),
+    };
+
+    serde_json::from_value(arguments).map_err(|e| MemoryError::InvalidArguments {
+        tool: tool.to_string(),
+        message: e.to_string(),
+        received,
+    })
+}
+
+/// JSON type name, for argument payloads that are not objects at all.
+fn type_name_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -190,6 +226,51 @@ impl ToolHandler {
         &self.project_id
     }
 
+    /// Resolve the project a tool call operates on: the call's `project` argument
+    /// when present, otherwise the server's own project. An unknown project is
+    /// rejected so a mistyped ID cannot silently read or write the wrong store.
+    fn resolve_project(&self, requested: Option<&str>) -> Result<String, MemoryError> {
+        let Some(requested) = requested.map(str::trim).filter(|p| !p.is_empty()) else {
+            return Ok(self.project_id.clone());
+        };
+        if requested == self.project_id || self.db.project_exists(requested)? {
+            return Ok(requested.to_string());
+        }
+        let known: Vec<String> = self.db.list_projects()?.into_iter().map(|p| p.id).collect();
+        Err(MemoryError::UnknownProject {
+            requested: requested.to_string(),
+            known: if known.is_empty() {
+                "(none)".to_string()
+            } else {
+                known.join(", ")
+            },
+        })
+    }
+
+    /// Branch filter for a project that may not be the server's own. The current
+    /// git branch describes the server's checkout only, so `"current"` widens to
+    /// all branches when reading another project.
+    fn branch_filter_for<'a>(
+        &'a self,
+        project: &str,
+        branch_mode: &'a str,
+    ) -> Option<Option<&'a str>> {
+        if branch_mode == "current" && project != self.project_id {
+            return None;
+        }
+        self.branch_mode_to_filter(branch_mode)
+    }
+
+    /// The current git branch, but only for the server's own project — it is
+    /// meaningless as a default when writing to or reading another project.
+    fn current_branch_for(&self, project: &str) -> Option<&str> {
+        if project == self.project_id {
+            self.current_branch.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Convert branch_mode string to the Option<Option<&str>> format for DB queries.
     /// - "current" -> global + current branch (falls back to "all" if no branch detected)
     /// - "global" -> global only (branch IS NULL)
@@ -209,9 +290,9 @@ impl ToolHandler {
         }
     }
 
-    /// Invalidate search result cache (call after memory modifications).
-    fn invalidate_search_cache(&self) {
-        self.search_cache.invalidate_project(&self.project_id);
+    /// Invalidate search result cache for a project (call after memory modifications).
+    fn invalidate_search_cache(&self, project: &str) {
+        self.search_cache.invalidate_project(project);
     }
 
     pub fn handle_tool(&self, name: &str, arguments: Value) -> Result<Value, MemoryError> {
@@ -232,6 +313,7 @@ impl ToolHandler {
             "memory_export" => self.memory_export(arguments),
             "memory_import" => self.memory_import(arguments),
             "memory_stats" => self.memory_stats(arguments),
+            "memory_projects" => self.memory_projects(),
             "memory_context" => self.memory_context(arguments),
             "memory_prune" => self.memory_prune(arguments),
             "memory_promote" => self.memory_promote(arguments),
@@ -251,7 +333,8 @@ impl ToolHandler {
     fn memory_store(&self, arguments: Value) -> Result<Value, MemoryError> {
         use super::store::{StoreOutcome, store_with_dedup};
 
-        let input: MemoryStoreInput = serde_json::from_value(arguments)?;
+        let input: MemoryStoreInput = parse_args("memory_store", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let memory_type: MemoryType = input
             .memory_type
@@ -275,14 +358,14 @@ impl ToolHandler {
         } else {
             match input.branch.as_deref() {
                 None | Some("") => None, // Global
-                Some("auto") => self.current_branch.clone(),
+                Some("auto") => self.current_branch_for(&project).map(str::to_string),
                 Some(explicit) => Some(explicit.to_string()),
             }
         };
 
         let memory = Memory {
             id: id.clone(),
-            project_id: self.project_id.clone(),
+            project_id: project.clone(),
             memory_type,
             content: input.content.clone(),
             summary,
@@ -305,7 +388,7 @@ impl ToolHandler {
 
         // Fetch memories now so we can build a content preview if a dedup merge occurs.
         // (store_with_dedup will re-fetch internally for dedup; that's acceptable here.)
-        let pre_store_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
+        let pre_store_memories_list = self.db.get_all_memories_for_project(&project)?;
         let pre_store_memories: std::collections::HashMap<String, Memory> = pre_store_memories_list
             .into_iter()
             .map(|m| (m.id.clone(), m))
@@ -318,7 +401,7 @@ impl ToolHandler {
             store_with_dedup(
                 &self.db,
                 Some(&self.embedding),
-                &self.project_id,
+                &project,
                 memory,
                 Some(&embedding),
                 dedup_thr,
@@ -373,6 +456,7 @@ impl ToolHandler {
 
         // Assign to cluster
         let _cluster_id = self.assign_to_cluster(
+            &project,
             &final_id,
             &embedding,
             &input.content,
@@ -380,7 +464,7 @@ impl ToolHandler {
         )?;
 
         // Invalidate search cache since we added new data
-        self.invalidate_search_cache();
+        self.invalidate_search_cache(&project);
 
         let message = if merge_info.is_some() {
             "Memory stored and merged with duplicate".to_string()
@@ -391,13 +475,15 @@ impl ToolHandler {
         Ok(json!(MemoryStoreResult {
             id: final_id,
             message,
+            project,
             branch,
             merge_info,
         }))
     }
 
     fn memory_query(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let mut input: MemoryQueryInput = serde_json::from_value(arguments)?;
+        let mut input: MemoryQueryInput = parse_args("memory_query", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
         input.limit = input.limit.min(100); // Server-side cap to prevent overflow
 
         // Parse type filters
@@ -406,9 +492,9 @@ impl ToolHandler {
 
         // Optimization: if query is empty, skip search and use filter-only path
         if input.query.trim().is_empty() {
-            let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
+            let branch_filter = self.branch_filter_for(&project, &input.branch_mode);
             let memories = self.db.query_memories_with_branch(
-                &self.project_id,
+                &project,
                 if type_filters.is_empty() {
                     None
                 } else {
@@ -446,50 +532,48 @@ impl ToolHandler {
             }));
         }
 
-        let branch_filter = self.branch_mode_to_filter(&input.branch_mode);
+        let branch_filter = self.branch_filter_for(&project, &input.branch_mode);
 
         // --- Embedding path (skipped for pure BM25 mode) ---
-        let semantic_scores: std::collections::HashMap<String, f32> = if self.search_mode
-            != SearchMode::Bm25
-        {
-            let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
-                cached
+        let semantic_scores: std::collections::HashMap<String, f32> =
+            if self.search_mode != SearchMode::Bm25 {
+                let query_embedding = if let Some(cached) = self.query_cache.get(&input.query) {
+                    cached
+                } else {
+                    let embedding = self.embedding.embed(&input.query)?;
+                    self.query_cache
+                        .insert(input.query.clone(), embedding.clone());
+                    embedding
+                };
+
+                if let Some(cached_results) = self.search_cache.get(&project, &query_embedding) {
+                    cached_results.into_iter().collect()
+                } else {
+                    let embeddings = self
+                        .db
+                        .get_all_embeddings_for_project_and_global(&project)?;
+
+                    let scored: Vec<(String, f32)> = embeddings
+                        .iter()
+                        .map(|(id, vec)| {
+                            let similarity = cosine_similarity(&query_embedding, vec);
+                            (id.clone(), similarity)
+                        })
+                        .collect();
+
+                    self.search_cache
+                        .insert(&project, &query_embedding, scored.clone());
+                    scored.into_iter().collect()
+                }
             } else {
-                let embedding = self.embedding.embed(&input.query)?;
-                self.query_cache
-                    .insert(input.query.clone(), embedding.clone());
-                embedding
+                std::collections::HashMap::new()
             };
-
-            if let Some(cached_results) = self.search_cache.get(&self.project_id, &query_embedding)
-            {
-                cached_results.into_iter().collect()
-            } else {
-                let embeddings = self
-                    .db
-                    .get_all_embeddings_for_project_and_global(&self.project_id)?;
-
-                let scored: Vec<(String, f32)> = embeddings
-                    .iter()
-                    .map(|(id, vec)| {
-                        let similarity = cosine_similarity(&query_embedding, vec);
-                        (id.clone(), similarity)
-                    })
-                    .collect();
-
-                self.search_cache
-                    .insert(&self.project_id, &query_embedding, scored.clone());
-                scored.into_iter().collect()
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
 
         // --- BM25 path (skipped for pure Vector mode) ---
         // Returns ordered Vec<(id, raw_score)> from FTS5; we keep the ordering for RRF.
         let bm25_results: Vec<(String, f64)> = if self.search_mode != SearchMode::Vector {
             self.db.keyword_search_with_branch(
-                &self.project_id,
+                &project,
                 &input.query,
                 input.limit * 5, // over-fetch so we have enough after per-memory filters
                 branch_filter,
@@ -682,7 +766,8 @@ impl ToolHandler {
     }
 
     fn memory_update(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryUpdateInput = serde_json::from_value(arguments)?;
+        let input: MemoryUpdateInput = parse_args("memory_update", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let mut memory = self
             .db
@@ -788,20 +873,21 @@ impl ToolHandler {
         }
 
         // Invalidate search cache since we updated data
-        self.invalidate_search_cache();
+        self.invalidate_search_cache(&project);
 
         Ok(json!({"success": true, "message": "Memory updated successfully"}))
     }
 
     fn memory_delete(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryDeleteInput = serde_json::from_value(arguments)?;
+        let input: MemoryDeleteInput = parse_args("memory_delete", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Remove from cluster before deleting
         if let Ok(Some(cluster_id)) = self.db.remove_from_cluster(&input.id) {
             // Recalculate centroid if cluster still has members
             let member_ids = self.db.get_cluster_member_ids(&cluster_id)?;
             if member_ids.is_empty() {
-                let _ = self.db.delete_empty_clusters(&self.project_id);
+                let _ = self.db.delete_empty_clusters(&project);
             } else {
                 let new_centroid = self.compute_cluster_centroid(&member_ids)?;
                 let summary = self.generate_cluster_summary(&member_ids)?;
@@ -817,7 +903,7 @@ impl ToolHandler {
 
         if deleted {
             // Invalidate search cache since we deleted data
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
             Ok(json!({"success": true, "message": "Memory deleted successfully"}))
         } else {
             Ok(json!({"success": false, "message": "Memory not found"}))
@@ -825,7 +911,8 @@ impl ToolHandler {
     }
 
     fn memory_link(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryLinkInput = serde_json::from_value(arguments)?;
+        let input: MemoryLinkInput = parse_args("memory_link", arguments)?;
+        self.resolve_project(input.project.as_deref())?;
 
         let relation_type: RelationType = input
             .relation
@@ -855,7 +942,8 @@ impl ToolHandler {
     }
 
     fn memory_graph(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryGraphInput = serde_json::from_value(arguments)?;
+        let input: MemoryGraphInput = parse_args("memory_graph", arguments)?;
+        self.resolve_project(input.project.as_deref())?;
 
         let root = self
             .db
@@ -977,7 +1065,8 @@ impl ToolHandler {
     }
 
     fn memory_store_batch(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryStoreBatchInput = serde_json::from_value(arguments)?;
+        let input: MemoryStoreBatchInput = parse_args("memory_store_batch", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         if input.memories.len() > 100 {
             return Ok(json!({"success": false, "error": "Maximum 100 memories per batch"}));
@@ -995,7 +1084,7 @@ impl ToolHandler {
                 .memory_type
                 .parse()
                 .map_err(|_| MemoryError::InvalidType(mem_input.memory_type.clone()))?;
-            contents.push(format!("{}: {}", memory_type.as_str(), &mem_input.content));
+            contents.push(format!("{}: {}", memory_type.as_str(), mem_input.content));
         }
 
         // Batch embed all content
@@ -1024,14 +1113,14 @@ impl ToolHandler {
             } else {
                 match mem_input.branch.as_deref() {
                     None | Some("") => None, // Global
-                    Some("auto") => self.current_branch.clone(),
+                    Some("auto") => self.current_branch_for(&project).map(str::to_string),
                     Some(explicit) => Some(explicit.to_string()),
                 }
             };
 
             let memory = Memory {
                 id: id.clone(),
-                project_id: self.project_id.clone(),
+                project_id: project.clone(),
                 memory_type,
                 content: mem_input.content,
                 summary,
@@ -1064,25 +1153,32 @@ impl ToolHandler {
 
         // Assign each new memory to a cluster
         for (i, mem) in memories.iter().enumerate() {
-            let _ =
-                self.assign_to_cluster(&mem.id, &all_embeddings[i], &mem.content, mem.importance);
+            let _ = self.assign_to_cluster(
+                &project,
+                &mem.id,
+                &all_embeddings[i],
+                &mem.content,
+                mem.importance,
+            );
         }
 
         // Invalidate search cache since we added new data
         if stored > 0 {
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
         }
 
         Ok(json!({
             "success": true,
             "count": stored,
+            "project": project,
             "ids": ids,
             "message": format!("{} memories stored successfully", stored)
         }))
     }
 
     fn memory_delete_batch(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryDeleteBatchInput = serde_json::from_value(arguments)?;
+        let input: MemoryDeleteBatchInput = parse_args("memory_delete_batch", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Remove from clusters before deleting
         let mut affected_clusters: HashSet<String> = HashSet::new();
@@ -1098,7 +1194,7 @@ impl ToolHandler {
         for cluster_id in &affected_clusters {
             let member_ids = self.db.get_cluster_member_ids(cluster_id)?;
             if member_ids.is_empty() {
-                let _ = self.db.delete_empty_clusters(&self.project_id);
+                let _ = self.db.delete_empty_clusters(&project);
             } else {
                 let new_centroid = self.compute_cluster_centroid(&member_ids)?;
                 let summary = self.generate_cluster_summary(&member_ids)?;
@@ -1112,7 +1208,7 @@ impl ToolHandler {
 
         if deleted > 0 {
             // Invalidate search cache since we deleted data
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
         }
 
         Ok(json!({
@@ -1123,15 +1219,14 @@ impl ToolHandler {
     }
 
     fn memory_export(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryExportInput = serde_json::from_value(arguments)?;
+        let input: MemoryExportInput = parse_args("memory_export", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
-        let memories = self.db.get_all_memories_for_project(&self.project_id)?;
-        let relationships = self
-            .db
-            .get_all_relationships_for_project(&self.project_id)?;
+        let memories = self.db.get_all_memories_for_project(&project)?;
+        let relationships = self.db.get_all_relationships_for_project(&project)?;
 
         let embeddings = if input.include_embeddings {
-            Some(self.db.get_all_embeddings_for_project(&self.project_id)?)
+            Some(self.db.get_all_embeddings_for_project(&project)?)
         } else {
             None
         };
@@ -1169,7 +1264,7 @@ impl ToolHandler {
         }
 
         let export_data = export::create_export(
-            &self.project_id,
+            &project,
             memories,
             relationships,
             embeddings,
@@ -1182,7 +1277,8 @@ impl ToolHandler {
     }
 
     fn memory_import(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryImportInput = serde_json::from_value(arguments)?;
+        let input: MemoryImportInput = parse_args("memory_import", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let export_data: ExportData = serde_json::from_value(input.data)?;
 
@@ -1209,7 +1305,7 @@ impl ToolHandler {
 
         // In replace mode, clear existing data first
         if mode == ImportMode::Replace {
-            self.db.delete_project_data(&self.project_id)?;
+            self.db.delete_project_data(&project)?;
         }
 
         let now = chrono::Utc::now().timestamp();
@@ -1230,8 +1326,8 @@ impl ToolHandler {
             let mem_created_at = memory.created_at;
             let mem_updated_at = memory.updated_at;
 
-            // Update project_id to current project
-            memory.project_id = self.project_id.clone();
+            // Update project_id to the target project
+            memory.project_id = project.clone();
             memory.updated_at = now;
 
             // Check if memory already exists (in merge mode)
@@ -1245,7 +1341,7 @@ impl ToolHandler {
             // (memory row + embedding + sidecar) to keep them consistent.
             if memory.memory_type == MemoryType::Adr
                 && let Some(num) = adr_number
-                && self.db.get_adr_by_number(&self.project_id, num)?.is_some()
+                && self.db.get_adr_by_number(&project, num)?.is_some()
             {
                 stats.memories_skipped += 1;
                 tracing::warn!(
@@ -1343,7 +1439,7 @@ impl ToolHandler {
                     Ok(status) => {
                         if let Err(e) = self.db.insert_adr_sidecar(
                             &memory.id,
-                            &self.project_id,
+                            &project,
                             num,
                             status,
                             &adr_sec,
@@ -1386,7 +1482,7 @@ impl ToolHandler {
 
         // Invalidate search cache since we imported data
         if stats.memories_imported > 0 {
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
         }
 
         Ok(json!({
@@ -1402,12 +1498,15 @@ impl ToolHandler {
         }))
     }
 
-    fn memory_stats(&self, _arguments: Value) -> Result<Value, MemoryError> {
-        let stats: ProjectStats = self.db.get_project_stats(&self.project_id)?;
-        let clusters = self.db.get_clusters_for_project(&self.project_id)?;
+    fn memory_stats(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryStatsInput = parse_args("memory_stats", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
+
+        let stats: ProjectStats = self.db.get_project_stats(&project)?;
+        let clusters = self.db.get_clusters_for_project(&project)?;
 
         Ok(json!({
-            "project_id": self.project_id,
+            "project_id": project,
             "memory_count": stats.memory_count,
             "relationship_count": stats.relationship_count,
             "avg_relevance": stats.avg_relevance,
@@ -1419,8 +1518,33 @@ impl ToolHandler {
         }))
     }
 
+    fn memory_projects(&self) -> Result<Value, MemoryError> {
+        let projects = self.db.list_projects()?;
+
+        let items: Vec<Value> = projects
+            .iter()
+            .map(|p| {
+                json!({
+                    "project_id": p.id,
+                    "memory_count": p.memory_count,
+                    "handoff_count": p.handoff_count,
+                    "adr_count": p.adr_count,
+                    "latest_activity_at": p.latest_activity_at,
+                    "current": p.id == self.project_id,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "current_project": self.project_id,
+            "count": items.len(),
+            "projects": items,
+        }))
+    }
+
     fn memory_context(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryContextInput = serde_json::from_value(arguments)?;
+        let input: MemoryContextInput = parse_args("memory_context", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Parse type filters
         let type_filters: Vec<MemoryType> =
@@ -1444,9 +1568,9 @@ impl ToolHandler {
 
         // Check if hierarchical retrieval is viable (avoid DB queries when not requested)
         let should_use_hierarchical = if input.hierarchical {
-            let clusters_result = self.db.get_clusters_for_project(&self.project_id)?;
+            let clusters_result = self.db.get_clusters_for_project(&project)?;
             if !clusters_result.is_empty() {
-                let stats = self.db.get_project_stats(&self.project_id)?;
+                let stats = self.db.get_project_stats(&project)?;
                 if stats.memory_count >= 10 {
                     Some(clusters_result)
                 } else {
@@ -1485,7 +1609,7 @@ impl ToolHandler {
 
             let all_embeddings = self
                 .db
-                .get_prefiltered_embeddings(&self.project_id, max_candidates)?;
+                .get_prefiltered_embeddings(&project, max_candidates)?;
             let embedding_map: std::collections::HashMap<String, Vec<f32>> =
                 all_embeddings.into_iter().collect();
 
@@ -1516,7 +1640,7 @@ impl ToolHandler {
                     SearchMode::Bm25 | SearchMode::Hybrid
                 ) {
                     let bm25_res = self.db.keyword_search_within_ids(
-                        &self.project_id,
+                        &project,
                         &input.context,
                         &member_ids,
                         member_ids.len().max(1),
@@ -1639,7 +1763,7 @@ impl ToolHandler {
                     }
                     if let Some(memory) = members_map.get(&id) {
                         // Apply branch filter (default: current branch mode)
-                        let branch_filter = self.branch_mode_to_filter("current");
+                        let branch_filter = self.branch_filter_for(&project, "current");
                         match branch_filter {
                             None => {}
                             Some(None) if memory.branch.is_some() => continue,
@@ -1722,7 +1846,7 @@ impl ToolHandler {
             //   Hybrid  — gate on memory.relevance_score (decay value).
             let embeddings = self
                 .db
-                .get_prefiltered_embeddings(&self.project_id, max_candidates)?;
+                .get_prefiltered_embeddings(&project, max_candidates)?;
 
             // Compute raw cosine similarities for all pre-filtered candidates.
             let all_raw: Vec<(String, f32)> = embeddings
@@ -1736,7 +1860,7 @@ impl ToolHandler {
             let bm25_results: Vec<(String, f32)> =
                 if matches!(self.search_mode, SearchMode::Bm25 | SearchMode::Hybrid) {
                     self.db.keyword_search_within_ids(
-                        &self.project_id,
+                        &project,
                         &input.context,
                         &all_candidate_ids,
                         all_candidate_ids.len().max(1),
@@ -1834,7 +1958,7 @@ impl ToolHandler {
             for (id, similarity, _hybrid) in scored.into_iter().take(input.limit * 2) {
                 if let Some(memory) = candidate_map.get(&id) {
                     // Apply branch filter
-                    let branch_filter = self.branch_mode_to_filter("current");
+                    let branch_filter = self.branch_filter_for(&project, "current");
                     match branch_filter {
                         None => {}
                         Some(None) if memory.branch.is_some() => continue,
@@ -1898,10 +2022,11 @@ impl ToolHandler {
     }
 
     fn memory_prune(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryPruneInput = serde_json::from_value(arguments)?;
+        let input: MemoryPruneInput = parse_args("memory_prune", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Get all memories and filter by relevance threshold, excluding pinned memories
-        let all_memories = self.db.get_all_memories_for_project(&self.project_id)?;
+        let all_memories = self.db.get_all_memories_for_project(&project)?;
         let candidates: Vec<&Memory> = all_memories
             .iter()
             .filter(|m| m.relevance_score < input.threshold && !m.pinned)
@@ -1945,7 +2070,7 @@ impl ToolHandler {
             let deleted = self.db.delete_memories_batch(&ids)?;
 
             // Invalidate cache since we deleted data
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
 
             Ok(json!({
                 "success": true,
@@ -1974,7 +2099,8 @@ impl ToolHandler {
     }
 
     fn memory_promote(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryPromoteInput = serde_json::from_value(arguments)?;
+        let input: MemoryPromoteInput = parse_args("memory_promote", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Get the memory first to verify it exists and get its current state
         let memory = self
@@ -1999,7 +2125,7 @@ impl ToolHandler {
 
         if promoted {
             // Invalidate search cache since we changed data
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
 
             Ok(json!({
                 "success": true,
@@ -2017,14 +2143,15 @@ impl ToolHandler {
     }
 
     fn memory_dedup(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: MemoryDedupInput = serde_json::from_value(arguments)?;
+        let input: MemoryDedupInput = parse_args("memory_dedup", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
         let threshold = input.threshold.clamp(0.5, 1.0);
 
         // Get all embeddings and memories for the project
-        let all_embeddings = self.db.get_all_embeddings_for_project(&self.project_id)?;
+        let all_embeddings = self.db.get_all_embeddings_for_project(&project)?;
 
         // Pre-fetch all memories upfront to avoid O(n) individual get_memory calls
-        let all_memories_list = self.db.get_all_memories_for_project(&self.project_id)?;
+        let all_memories_list = self.db.get_all_memories_for_project(&project)?;
         let all_memories: std::collections::HashMap<String, Memory> = all_memories_list
             .into_iter()
             .map(|m| (m.id.clone(), m))
@@ -2141,7 +2268,7 @@ impl ToolHandler {
                 }
             }
 
-            self.invalidate_search_cache();
+            self.invalidate_search_cache(&project);
 
             Ok(json!({
                 "success": true,
@@ -2168,15 +2295,26 @@ impl ToolHandler {
     }
 
     fn handoff_create(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: HandoffCreateInput = serde_json::from_value(arguments)?;
+        let input: HandoffCreateInput = parse_args("handoff_create", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Resolve branch: explicit input branch, then current branch from ToolHandler.
-        let resolved_branch = input.branch.as_deref().or(self.current_branch.as_deref());
+        // The server's branch describes its own checkout, so writing a handoff to
+        // another project requires the caller to name that project's branch.
+        let resolved_branch = input
+            .branch
+            .as_deref()
+            .or_else(|| self.current_branch_for(&project));
+        if resolved_branch.is_none() && project != self.project_id {
+            return Err(MemoryError::InvalidType(format!(
+                "handoff for project '{project}' requires an explicit branch"
+            )));
+        }
 
         let result = create_handoff(
             &self.db,
             &self.embedding,
-            &self.project_id,
+            &project,
             resolved_branch,
             input.sections,
             input.importance,
@@ -2185,21 +2323,25 @@ impl ToolHandler {
         )?;
 
         // Invalidate search cache since we added new data.
-        self.invalidate_search_cache();
+        self.invalidate_search_cache(&project);
 
         Ok(json!(result))
     }
 
     fn handoff_resume(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: HandoffResumeInput = serde_json::from_value(arguments)?;
+        let input: HandoffResumeInput = parse_args("handoff_resume", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         // Resolve branch: explicit input branch, then current branch from ToolHandler.
-        let resolved_branch = input.branch.as_deref().or(self.current_branch.as_deref());
+        let resolved_branch = input
+            .branch
+            .as_deref()
+            .or_else(|| self.current_branch_for(&project));
 
         let result = resume_handoff(
             &self.db,
             &self.embedding,
-            &self.project_id,
+            &project,
             resolved_branch,
             input.query.as_deref(),
             input.max_sections,
@@ -2211,7 +2353,8 @@ impl ToolHandler {
     }
 
     fn handoff_search(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: HandoffSearchInput = serde_json::from_value(arguments)?;
+        let input: HandoffSearchInput = parse_args("handoff_search", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let limit = input.limit.unwrap_or(10);
         let branch = input.branch.as_deref();
@@ -2220,7 +2363,7 @@ impl ToolHandler {
         let result = search_handoffs(
             &self.db,
             &self.embedding,
-            &self.project_id,
+            &project,
             &input.query,
             branch,
             limit,
@@ -2231,7 +2374,8 @@ impl ToolHandler {
     }
 
     fn adr_create(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: AdrCreateInput = serde_json::from_value(arguments)?;
+        let input: AdrCreateInput = parse_args("adr_create", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let status = input
             .status
@@ -2248,7 +2392,7 @@ impl ToolHandler {
         let result = create_adr(
             &self.db,
             &self.embedding,
-            &self.project_id,
+            &project,
             sections,
             status,
             input.importance,
@@ -2256,7 +2400,7 @@ impl ToolHandler {
             input.supersedes,
         )?;
 
-        self.invalidate_search_cache();
+        self.invalidate_search_cache(&project);
 
         Ok(json!(result))
     }
@@ -2264,11 +2408,12 @@ impl ToolHandler {
     fn adr_update_status(&self, arguments: Value) -> Result<Value, MemoryError> {
         use std::str::FromStr;
 
-        let input: AdrUpdateStatusInput = serde_json::from_value(arguments)?;
+        let input: AdrUpdateStatusInput = parse_args("adr_update_status", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let old_id = self
             .db
-            .get_adr_by_number(&self.project_id, input.number)?
+            .get_adr_by_number(&project, input.number)?
             .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", input.number)))?;
 
         let target_status = AdrStatus::from_str(&input.status)
@@ -2304,7 +2449,8 @@ impl ToolHandler {
     fn adr_list(&self, arguments: Value) -> Result<Value, MemoryError> {
         use std::str::FromStr;
 
-        let input: AdrListInput = serde_json::from_value(arguments)?;
+        let input: AdrListInput = parse_args("adr_list", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let status_filter = input
             .status
@@ -2313,7 +2459,7 @@ impl ToolHandler {
             .transpose()
             .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
 
-        let rows = self.db.list_adrs(&self.project_id, status_filter)?;
+        let rows = self.db.list_adrs(&project, status_filter)?;
 
         let items: Vec<Value> = rows
             .into_iter()
@@ -2331,11 +2477,12 @@ impl ToolHandler {
     }
 
     fn adr_show(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: AdrShowInput = serde_json::from_value(arguments)?;
+        let input: AdrShowInput = parse_args("adr_show", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let id = self
             .db
-            .get_adr_by_number(&self.project_id, input.number)?
+            .get_adr_by_number(&project, input.number)?
             .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", input.number)))?;
 
         let (number, status, sections) = self
@@ -2357,16 +2504,11 @@ impl ToolHandler {
     }
 
     fn adr_export(&self, arguments: Value) -> Result<Value, MemoryError> {
-        let input: AdrExportInput = serde_json::from_value(arguments)?;
+        let input: AdrExportInput = parse_args("adr_export", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let dir = adr_export_target_dir(input.dir.as_deref());
-        let paths = export_adr_to_disk(
-            &self.db,
-            &self.project_id,
-            &dir,
-            input.number,
-            input.dry_run,
-        )?;
+        let paths = export_adr_to_disk(&self.db, &project, &dir, input.number, input.dry_run)?;
 
         let files: Vec<String> = paths
             .into_iter()
@@ -2423,6 +2565,7 @@ impl ToolHandler {
     /// Assign a memory to the best matching cluster, or create a new one.
     fn assign_to_cluster(
         &self,
+        project: &str,
         memory_id: &str,
         embedding: &[f32],
         content: &str,
@@ -2430,7 +2573,7 @@ impl ToolHandler {
     ) -> Result<Option<String>, MemoryError> {
         use crate::memory::MemoryCluster;
 
-        let clusters = self.db.get_clusters_for_project(&self.project_id)?;
+        let clusters = self.db.get_clusters_for_project(project)?;
 
         // Find best matching cluster by centroid similarity
         const CLUSTER_THRESHOLD: f32 = 0.75;
@@ -2471,7 +2614,7 @@ impl ToolHandler {
 
             let cluster = MemoryCluster {
                 id: cluster_id.clone(),
-                project_id: self.project_id.clone(),
+                project_id: project.to_string(),
                 summary,
                 member_count: 1,
                 centroid: Some(embedding.to_vec()),

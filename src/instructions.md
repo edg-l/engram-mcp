@@ -29,6 +29,10 @@ Use `memory_query` when you need to recall a specific piece of knowledge -- "wha
 - **Use `pinned: true`** for permanent knowledge that should never decay or be pruned -- critical constraints, foundational decisions, or standing user preferences.
 - **Use `global: true`** for knowledge that applies across all projects -- user preferences, environment facts, or universal conventions.
 
+# Working across projects
+
+Every tool defaults to the project the server was launched in. To read or write another project's memories, pass its ID as the `project` argument (e.g. `memory_context` with `project: "/home/me/dev/other-repo"`). Call `memory_projects` to list the available project IDs with their memory, handoff, and ADR counts; an unknown ID is rejected with the known ones listed. Since branch names are per-repository, `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
+
 # Memory maintenance
 
 - Memories automatically decay in relevance if not accessed -- important memories persist, trivial ones fade.

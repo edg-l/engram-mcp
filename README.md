@@ -54,6 +54,8 @@ cargo install engram_mcp
 
 Installs `engram` (MCP server) and `engram-cli` (command-line tool).
 
+`engram` speaks MCP over stdio and takes no arguments — run it only from an MCP client. Everything interactive lives in `engram-cli`; running `engram` in a terminal prints a pointer to it.
+
 From source:
 
 ```bash
@@ -214,6 +216,7 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 | `memory_export` | Export project memories to JSON |
 | `memory_import` | Import from JSON (merge or replace modes) |
 | `memory_stats` | Project statistics (counts, types, pinned, global, clusters) |
+| `memory_projects` | List every project in the store with memory, handoff, and ADR counts |
 | `memory_prune` | Remove low-relevance memories (dry run by default) |
 | `memory_dedup` | Find and merge duplicate memories (dry run by default) |
 | `memory_promote` | Promote a branch-local memory to global scope |
@@ -222,6 +225,21 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 | `adr_list` | List the project's ADRs, optionally filtered by status |
 | `adr_show` | Show a single ADR by number |
 | `adr_export` | Export ADRs to Nygard-style Markdown files (dry run by default) |
+
+### Targeting another project
+
+Every tool above defaults to the project the server was launched in. Pass a `project` argument to scope a single call elsewhere:
+
+```json
+{
+  "context": "how does the payments service handle retries",
+  "project": "/home/me/dev/payments"
+}
+```
+
+Use `memory_projects` to discover project IDs. An unknown ID is rejected with the known IDs listed, so a typo cannot silently return an empty result. Two branch-related caveats, since branch names belong to a repository: `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
+
+The `engram-cli` equivalent is the global `-p/--project` flag, and `engram-cli projects` lists the same information.
 
 ### Storing memories
 
@@ -261,6 +279,8 @@ Branch modes: `current` (global + current branch), `global` (global only), `all`
 ```bash
 # Handoffs
 engram-cli handoff create                        # interactive section prompts
+engram-cli handoff create --non-interactive \
+  --summary "Cut the 2.0 branch" --todos "Tag the release"   # never prompts
 engram-cli handoff create --from-file session.md # ingest pre-written markdown
 engram-cli handoff resume --branch feat/x        # load context from recent handoffs
 engram-cli handoff search "auth refactor" --section blockers,todos
@@ -294,6 +314,15 @@ engram-cli link mem_abc123 mem_def456 -r relates_to
 engram-cli export -o backup.json
 engram-cli import backup.json
 
+# Projects
+engram-cli projects                              # list all projects in the store
+engram-cli -p /home/me/dev/other query "auth"    # scope any command to a project
+
+# Machine-readable output (for scripts and agents)
+engram-cli --json stats
+engram-cli --json query "how does auth work" | jq '.memories[].memory.id'
+engram-cli --json handoff resume | jq '.top_sections[0].section_text'
+
 # Maintenance
 engram-cli stats
 engram-cli decay
@@ -307,6 +336,23 @@ engram-cli insights
 engram-cli health
 ```
 
+### JSON output
+
+`--json` makes a read command emit one JSON document on stdout instead of human-readable text, so nothing has to be screen-scraped. Supported on `query`, `context`, `stats`, `projects`, `list`, `show`, `handoff resume`/`search`/`show`, and `adr list`/`show`. Empty results are still JSON (`count: 0`), and commands that cannot render JSON reject the flag with exit code 2 rather than silently printing prose.
+
+| Command | Shape |
+|---------|-------|
+| `query`, `context` | `{project, query\|context, count, memories: [{memory, score…}]}` |
+| `list` | `{project, count, memories: [memory]}` |
+| `show` | `{memory, relationships: {outgoing, incoming}}` |
+| `stats` | project counts plus `project` and `cluster_count` |
+| `projects` | `{current_project, count, projects: [{id, memory_count, …, current}]}` |
+| `handoff resume` | `{branch, latest_handoff_id, chain, top_sections, linked_memories, message}` |
+| `handoff search` | `{query, count, matches: [{handoff_id, section_name, score, section_text}]}` |
+| `handoff show` | `{memory, sections}` |
+| `adr list` | `{project, count, adrs: [{number, status, title, id}]}` |
+| `adr show` | `{id, number, status, title, context, decision, consequences}` |
+
 ## Configuration
 
 | Variable | Description | Default |
@@ -317,7 +363,7 @@ engram-cli health
 | `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
 | `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
 | `ENGRAM_ADR_DIR` | Target directory for `adr_export` Markdown files | `docs/adr` |
-| `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (23 tools), `core` (14), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
+| `ENGRAM_MCP_TOOL_PROFILE` | Advertised MCP tool surface: `full` (24 tools), `core` (15), or `minimal` (3: `memory_context`, `memory_store`, `handoff_resume`). Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process | `full` |
 | `ENGRAM_HOOK_DEDUP_SKIP` | Similarity threshold above which hook captures are silently dropped (clamped to `[0.5, 1.0]`) | `0.95` |
 | `ENGRAM_HOOK_DAILY_CAP` | Max hook-captured memories per project per UTC day; `0` = unlimited | `50` |
 

@@ -311,6 +311,7 @@ pub fn compact_tool_result(tool_name: &str, result: &Value, content_length: usiz
         "memory_promote" => compact_promote(result),
         "memory_dedup" => compact_dedup(result),
         "memory_stats" => compact_stats(result),
+        "memory_projects" => compact_projects(result),
         "memory_update" | "memory_delete" | "memory_delete_batch" => compact_simple(result),
         _ => compact_fallback(result),
     }
@@ -335,6 +336,7 @@ pub fn compact_tool_result_with_db(
         "memory_promote" => compact_promote(result),
         "memory_dedup" => compact_dedup(result),
         "memory_stats" => compact_stats(result),
+        "memory_projects" => compact_projects(result),
         "memory_update" | "memory_delete" | "memory_delete_batch" => compact_simple(result),
         _ => compact_fallback(result),
     }
@@ -343,6 +345,10 @@ pub fn compact_tool_result_with_db(
 fn compact_store(result: &Value) -> String {
     let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
     let mut out = format!("Stored {}", id);
+
+    if let Some(project) = result.get("project").and_then(|v| v.as_str()) {
+        out.push_str(&format!(" in {}", project));
+    }
 
     if let Some(branch) = result.get("branch").and_then(|v| v.as_str()) {
         out.push_str(&format!(" (branch: {})", branch));
@@ -556,6 +562,9 @@ fn compact_batch_store(result: &Value) -> String {
     let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     let ids = result.get("ids").and_then(|v| v.as_array());
     let mut out = format!("Stored {} memories", count);
+    if let Some(project) = result.get("project").and_then(|v| v.as_str()) {
+        out.push_str(&format!(" in {}", project));
+    }
     if let Some(ids) = ids {
         let id_strs: Vec<&str> = ids.iter().filter_map(|v| v.as_str()).collect();
         if !id_strs.is_empty() {
@@ -659,6 +668,55 @@ fn compact_stats(result: &Value) -> String {
     )
 }
 
+fn compact_projects(result: &Value) -> String {
+    let current = result
+        .get("current_project")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let projects = result
+        .get("projects")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    if projects.is_empty() {
+        return format!(
+            "Current project: {}\nNo projects in the memory store.",
+            current
+        );
+    }
+
+    let mut out = format!("Current project: {}\n", current);
+    for project in projects {
+        let id = project
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let memories = project
+            .get("memory_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let handoffs = project
+            .get("handoff_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let adrs = project
+            .get("adr_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let marker = if project.get("current").and_then(|v| v.as_bool()) == Some(true) {
+            " (current)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "- {}{}: {} memories, {} handoffs, {} ADRs\n",
+            id, marker, memories, handoffs, adrs
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 fn compact_simple(result: &Value) -> String {
     let success = result
         .get("success")
@@ -685,6 +743,43 @@ fn format_score(score: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_compact_projects() {
+        let result = json!({
+            "current_project": "home",
+            "count": 2,
+            "projects": [
+                {
+                    "project_id": "home",
+                    "memory_count": 12,
+                    "handoff_count": 2,
+                    "adr_count": 1,
+                    "latest_activity_at": 1_700_000_000,
+                    "current": true,
+                },
+                {
+                    "project_id": "other",
+                    "memory_count": 3,
+                    "handoff_count": 0,
+                    "adr_count": 0,
+                    "latest_activity_at": null,
+                    "current": false,
+                },
+            ],
+        });
+
+        let out = compact_projects(&result);
+        assert!(out.contains("Current project: home"));
+        assert!(out.contains("- home (current): 12 memories, 2 handoffs, 1 ADRs"));
+        assert!(out.contains("- other: 3 memories, 0 handoffs, 0 ADRs"));
+    }
+
+    #[test]
+    fn test_compact_projects_empty() {
+        let out = compact_projects(&json!({"current_project": "home", "count": 0, "projects": []}));
+        assert!(out.contains("No projects in the memory store."));
+    }
 
     #[test]
     fn test_compact_query_result() {

@@ -23,6 +23,19 @@ pub enum MemoryError {
     #[error("Unknown tool: {0}")]
     UnknownTool(String),
 
+    #[error("Unknown project '{requested}'. Known projects: {known}")]
+    UnknownProject { requested: String, known: String },
+
+    /// Tool arguments that failed to deserialize. Lists the field names that were
+    /// actually received, so a misnamed or misplaced field is visible from the
+    /// error alone rather than looking like the server lost a field that was sent.
+    #[error("Invalid arguments for {tool}: {message}. Fields received: {received}")]
+    InvalidArguments {
+        tool: String,
+        message: String,
+        received: String,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

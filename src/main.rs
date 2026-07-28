@@ -46,6 +46,8 @@ fn mcp_error(e: MemoryError) -> McpError {
         | MemoryError::InvalidType(_)
         | MemoryError::InvalidRelation(_)
         | MemoryError::UnknownTool(_)
+        | MemoryError::UnknownProject { .. }
+        | MemoryError::InvalidArguments { .. }
         | MemoryError::NotFound(_) => McpError::invalid_params(e.to_string(), None),
         MemoryError::Database(_) | MemoryError::Embedding(_) | MemoryError::Io(_) => {
             McpError::internal_error(e.to_string(), None)
@@ -647,10 +649,13 @@ impl ServerHandler for MemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move {
-            // Parse URI: memory://{project_id}/{memory_id}
+            // Parse URI: memory://{project_id}/{memory_id}. Any project in the
+            // store is readable, not just the server's own.
             let uri = &request.uri;
-            let memory_id = uri
-                .strip_prefix(&format!("memory://{}/", self.project_id))
+            let (uri_project, memory_id) = uri
+                .strip_prefix("memory://")
+                .and_then(|rest| rest.rsplit_once('/'))
+                .filter(|(project, id)| !project.is_empty() && !id.is_empty())
                 .ok_or_else(|| McpError::invalid_params("Invalid memory URI", None))?;
 
             let db = Database::open(&self.db_path)
@@ -660,6 +665,18 @@ impl ServerHandler for MemoryServer {
                 .get_memory(memory_id)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?
                 .ok_or_else(|| McpError::invalid_params("Memory not found", None))?;
+
+            // The URI's project must match the memory's owner, so a wrong project
+            // in the URI is an error rather than a silent read of another project.
+            if memory.project_id != uri_project {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Memory {} belongs to project '{}', not '{}'",
+                        memory_id, memory.project_id, uri_project
+                    ),
+                    None,
+                ));
+            }
 
             // Record access for reinforcement
             let _ = db.record_access(memory_id);
@@ -822,8 +839,71 @@ impl ServerHandler for MemoryServer {
     }
 }
 
+/// Usage note for people who ran `engram` expecting a CLI. The binary speaks the
+/// MCP protocol over stdio and has no subcommands; `engram-cli` is the CLI.
+const STDIO_ONLY_NOTICE: &str = concat!(
+    "engram ",
+    env!("CARGO_PKG_VERSION"),
+    " — MCP server (JSON-RPC over stdio). It takes no arguments and is meant to be\n",
+    "launched by an MCP client, not run by hand.\n",
+    "\n",
+    "For the command line, use `engram-cli` (`engram-cli --help`), e.g.:\n",
+    "  engram-cli query \"how does auth work\"\n",
+    "  engram-cli store \"The API uses rate limiting\" -t fact\n",
+    "  engram-cli handoff resume\n",
+    "  engram-cli projects\n",
+    "\n",
+    "Configuration is via environment variables: ENGRAM_DB, ENGRAM_PROJECT,\n",
+    "ENGRAM_MCP_TOOL_PROFILE (see the README).\n",
+);
+
+/// What to do at startup, decided from argv and whether stdin is a terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupMode {
+    /// Speak MCP over stdio.
+    Serve,
+    /// Print the usage notice and exit with this code.
+    Notice(i32),
+    /// Print the version and exit.
+    Version,
+}
+
+/// Classify startup. `engram` takes no arguments, so anything argument-shaped is
+/// a caller expecting the CLI; a terminal on stdin means no MCP client is
+/// attached, which would otherwise fail with `ConnectionClosed("initialize
+/// request")`. `--stdio`/`--serve` force server mode for clients that pass a flag.
+fn startup_mode(args: &[String], stdin_is_terminal: bool) -> StartupMode {
+    match args.first().map(String::as_str) {
+        None => {
+            if stdin_is_terminal {
+                StartupMode::Notice(0)
+            } else {
+                StartupMode::Serve
+            }
+        }
+        Some("--stdio") | Some("--serve") if args.len() == 1 => StartupMode::Serve,
+        Some("--version") | Some("-V") => StartupMode::Version,
+        Some("--help") | Some("-h") => StartupMode::Notice(0),
+        Some(_) => StartupMode::Notice(2),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match startup_mode(&args, std::io::stdin().is_terminal()) {
+        StartupMode::Serve => {}
+        StartupMode::Version => {
+            println!("engram {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        StartupMode::Notice(code) => {
+            print!("{STDIO_ONLY_NOTICE}");
+            std::process::exit(code);
+        }
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("engram=info".parse()?))
@@ -885,4 +965,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     service.waiting().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupMode, startup_mode};
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_with_a_pipe_serves() {
+        assert_eq!(startup_mode(&args(&[]), false), StartupMode::Serve);
+    }
+
+    #[test]
+    fn no_args_on_a_terminal_prints_the_notice() {
+        assert_eq!(startup_mode(&args(&[]), true), StartupMode::Notice(0));
+    }
+
+    #[test]
+    fn explicit_stdio_flag_serves_even_on_a_terminal() {
+        assert_eq!(startup_mode(&args(&["--stdio"]), true), StartupMode::Serve);
+        assert_eq!(startup_mode(&args(&["--serve"]), true), StartupMode::Serve);
+    }
+
+    #[test]
+    fn help_and_version_are_handled() {
+        assert_eq!(
+            startup_mode(&args(&["--help"]), false),
+            StartupMode::Notice(0)
+        );
+        assert_eq!(startup_mode(&args(&["-h"]), false), StartupMode::Notice(0));
+        assert_eq!(
+            startup_mode(&args(&["--version"]), false),
+            StartupMode::Version
+        );
+        assert_eq!(startup_mode(&args(&["-V"]), false), StartupMode::Version);
+    }
+
+    #[test]
+    fn cli_looking_subcommands_print_the_notice_and_fail() {
+        assert_eq!(
+            startup_mode(&args(&["store", "x"]), false),
+            StartupMode::Notice(2)
+        );
+        assert_eq!(
+            startup_mode(&args(&["handoff"]), false),
+            StartupMode::Notice(2)
+        );
+        // Extra arguments after --stdio are not a supported invocation either.
+        assert_eq!(
+            startup_mode(&args(&["--stdio", "x"]), false),
+            StartupMode::Notice(2)
+        );
+    }
 }

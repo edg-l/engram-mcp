@@ -35,6 +35,12 @@ struct Cli {
     #[arg(short, long)]
     project: Option<String>,
 
+    /// Emit machine-readable JSON instead of human-readable text. Supported by the
+    /// read commands: query, context, stats, projects, list, show,
+    /// handoff resume/search/show, adr list/show.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -164,6 +170,8 @@ enum Commands {
     },
     /// Show project statistics
     Stats,
+    /// List all projects in the memory store
+    Projects,
     /// Run decay algorithm manually
     Decay,
     /// Prune low-relevance memories
@@ -295,6 +303,9 @@ enum HandoffCmd {
         /// Read sections from a markdown file instead of interactive prompts
         #[arg(long)]
         from_file: Option<std::path::PathBuf>,
+        /// Never prompt for missing sections; leave them empty
+        #[arg(long)]
+        non_interactive: bool,
     },
     /// Resume a session by loading context from recent handoffs
     Resume {
@@ -378,6 +389,9 @@ enum AdrCmd {
         /// Read sections from a Markdown file instead of interactive prompts
         #[arg(long)]
         from_file: Option<PathBuf>,
+        /// Never prompt for missing sections; require them as flags
+        #[arg(long)]
+        non_interactive: bool,
     },
     /// Update the lifecycle status of an ADR
     UpdateStatus {
@@ -408,6 +422,33 @@ enum AdrCmd {
         #[arg(long)]
         write: bool,
     },
+}
+
+/// Commands that render JSON when `--json` is set. Anything else rejects the flag
+/// rather than silently printing prose a caller expected to parse.
+fn supports_json(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Query { .. }
+        | Commands::Context { .. }
+        | Commands::Stats
+        | Commands::Projects
+        | Commands::List { .. }
+        | Commands::Show { .. } => true,
+        Commands::Handoff { cmd } => matches!(
+            cmd,
+            HandoffCmd::Resume { .. } | HandoffCmd::Search { .. } | HandoffCmd::Show { .. }
+        ),
+        Commands::Adr { cmd } => matches!(cmd, AdrCmd::List { .. } | AdrCmd::Show { .. }),
+        _ => false,
+    }
+}
+
+/// Print a JSON document on stdout, pretty-printed so a human can read it too.
+fn print_json(value: &serde_json::Value) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => println!("{text}"),
+        Err(e) => eprintln!("failed to render JSON: {e}"),
+    }
 }
 
 fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -515,6 +556,30 @@ fn get_current_branch() -> Option<String> {
     None
 }
 
+/// Whether a command only reads memories, so an explicit `--project` that does
+/// not exist yet is a mistake rather than a new project to create.
+fn requires_existing_project(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Query { .. }
+        | Commands::List { .. }
+        | Commands::Show { .. }
+        | Commands::Export { .. }
+        | Commands::Stats
+        | Commands::Context { .. }
+        | Commands::Insights
+        | Commands::Health => true,
+        Commands::Handoff { cmd } => matches!(
+            cmd,
+            HandoffCmd::Resume { .. } | HandoffCmd::Search { .. } | HandoffCmd::Show { .. }
+        ),
+        Commands::Adr { cmd } => matches!(
+            cmd,
+            AdrCmd::List { .. } | AdrCmd::Show { .. } | AdrCmd::Export { .. }
+        ),
+        _ => false,
+    }
+}
+
 /// Check if command needs embedding service (lazy initialization).
 fn needs_embedding_service(cmd: &Commands) -> bool {
     match cmd {
@@ -539,6 +604,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let db_path = get_db_path(cli.database);
+    let project_was_explicit = cli.project.is_some();
     let project_id = get_project_id(cli.project);
 
     // Ensure database directory exists
@@ -546,7 +612,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
+    if cli.json && !supports_json(&cli.command) {
+        eprintln!(
+            "--json is not supported for this command. Supported: query, context, stats, \
+             projects, list, show, handoff resume/search/show, adr list/show."
+        );
+        std::process::exit(2);
+    }
+
     let db = Database::open(&db_path)?;
+
+    // An explicit --project that reads from a project which does not exist is
+    // reported instead of silently returning nothing.
+    if project_was_explicit
+        && requires_existing_project(&cli.command)
+        && !db.project_exists(&project_id)?
+    {
+        let known: Vec<String> = db.list_projects()?.into_iter().map(|p| p.id).collect();
+        let error = MemoryError::UnknownProject {
+            requested: project_id,
+            known: if known.is_empty() {
+                "(none)".to_string()
+            } else {
+                known.join(", ")
+            },
+        };
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     db.get_or_create_project(&project_id, &project_id)?;
 
     // Initialize embedding service once, only if needed (saves ~500ms for commands that don't need it)
@@ -577,6 +671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &types,
                 &branch_mode,
                 current_branch.as_deref(),
+                cli.json,
             )?;
         }
         Commands::List {
@@ -590,10 +685,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 r#type.as_deref(),
                 limit,
                 branch.as_deref(),
+                cli.json,
             )?;
         }
         Commands::Show { id } => {
-            cmd_show(&db, &id)?;
+            cmd_show(&db, &id, cli.json)?;
         }
         Commands::Store {
             content,
@@ -681,7 +777,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         Commands::Stats => {
-            cmd_stats(&db, &project_id)?;
+            cmd_stats(&db, &project_id, cli.json)?;
+        }
+        Commands::Projects => {
+            cmd_projects(&db, &project_id, cli.json)?;
         }
         Commands::Decay => {
             cmd_decay(&db, &project_id)?;
@@ -730,6 +829,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_score,
                 &types,
                 current_branch.as_deref(),
+                cli.json,
             )?;
         }
         Commands::Wipe { confirm } => {
@@ -760,10 +860,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 embedding_service.as_ref(),
                 current_branch.as_deref(),
                 handoff_cmd,
+                cli.json,
             )?;
         }
         Commands::Adr { cmd: adr_cmd } => {
-            cmd_adr(&db, &project_id, embedding_service.as_ref(), adr_cmd)?;
+            cmd_adr(
+                &db,
+                &project_id,
+                embedding_service.as_ref(),
+                adr_cmd,
+                cli.json,
+            )?;
         }
         Commands::HookEvent {
             event,
@@ -798,6 +905,7 @@ fn cmd_query(
     types: &[String],
     branch_mode: &str,
     current_branch: Option<&str>,
+    json: bool,
 ) -> Result<(), MemoryError> {
     use std::collections::{HashMap, HashSet};
 
@@ -892,40 +1000,65 @@ fn cmd_query(
     // Sort by combined score descending
     scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut count = 0;
+    // (memory, combined score, semantic score, keyword score)
+    let mut hits: Vec<(Memory, f64, f64, f64)> = Vec::new();
     for (id, score, semantic_score, keyword_score) in scored_results.into_iter().take(limit) {
         if let Some(memory) = db.get_memory(&id)? {
-            println!("─────────────────────────────────────────");
-            println!("ID: {}", memory.id);
-            let branch_str = memory
-                .branch
-                .as_ref()
-                .map(|b| format!(" | Branch: {}", b))
-                .unwrap_or_default();
-            println!(
-                "Type: {:?} | Score: {:.3} | Importance: {:.2}{}",
-                memory.memory_type, score, memory.importance, branch_str
-            );
-            println!(
-                "Semantic: {:.3} | Keyword: {:.3}",
-                semantic_score, keyword_score
-            );
-            if let Some(summary) = &memory.summary {
-                println!("Summary: {}", summary);
-            }
-            println!("Content: {}", memory.content);
-            if !memory.tags.is_empty() {
-                println!("Tags: {}", memory.tags.join(", "));
-            }
-            count += 1;
+            hits.push((memory, score, semantic_score, keyword_score));
         }
     }
 
-    if count == 0 {
+    if json {
+        let memories: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|(memory, score, semantic_score, keyword_score)| {
+                serde_json::json!({
+                    "memory": memory,
+                    "score": score,
+                    "semantic_score": semantic_score,
+                    "keyword_score": keyword_score,
+                })
+            })
+            .collect();
+        print_json(&serde_json::json!({
+            "project": project_id,
+            "query": query,
+            "count": memories.len(),
+            "memories": memories,
+        }));
+        return Ok(());
+    }
+
+    for (memory, score, semantic_score, keyword_score) in &hits {
+        println!("─────────────────────────────────────────");
+        println!("ID: {}", memory.id);
+        let branch_str = memory
+            .branch
+            .as_ref()
+            .map(|b| format!(" | Branch: {}", b))
+            .unwrap_or_default();
+        println!(
+            "Type: {:?} | Score: {:.3} | Importance: {:.2}{}",
+            memory.memory_type, score, memory.importance, branch_str
+        );
+        println!(
+            "Semantic: {:.3} | Keyword: {:.3}",
+            semantic_score, keyword_score
+        );
+        if let Some(summary) = &memory.summary {
+            println!("Summary: {}", summary);
+        }
+        println!("Content: {}", memory.content);
+        if !memory.tags.is_empty() {
+            println!("Tags: {}", memory.tags.join(", "));
+        }
+    }
+
+    if hits.is_empty() {
         println!("No matching memories found.");
     } else {
         println!("─────────────────────────────────────────");
-        println!("Found {} memories", count);
+        println!("Found {} memories", hits.len());
     }
 
     Ok(())
@@ -937,6 +1070,7 @@ fn cmd_list(
     type_filter: Option<&str>,
     limit: usize,
     branch_filter: Option<&str>,
+    json: bool,
 ) -> Result<(), MemoryError> {
     let type_filters: Option<Vec<MemoryType>> =
         type_filter.and_then(|t| t.parse().ok()).map(|t| vec![t]);
@@ -952,6 +1086,15 @@ fn cmd_list(
         limit,
         branch_query,
     )?;
+
+    if json {
+        print_json(&serde_json::json!({
+            "project": project_id,
+            "count": memories.len(),
+            "memories": memories,
+        }));
+        return Ok(());
+    }
 
     if memories.is_empty() {
         println!("No memories found.");
@@ -978,10 +1121,21 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_show(db: &Database, id: &str) -> Result<(), MemoryError> {
+fn cmd_show(db: &Database, id: &str, json: bool) -> Result<(), MemoryError> {
     let memory = db
         .get_memory(id)?
         .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+
+    if json {
+        let outgoing = db.get_relationships_from(id)?;
+        let incoming = db.get_relationships_to(id)?;
+        print_json(&serde_json::json!({
+            "memory": memory,
+            "relationships": {"outgoing": outgoing, "incoming": incoming},
+        }));
+        db.record_access(id)?;
+        return Ok(());
+    }
 
     println!("ID: {}", memory.id);
     println!("Project: {}", memory.project_id);
@@ -1447,8 +1601,76 @@ fn cmd_import(
     Ok(())
 }
 
-fn cmd_stats(db: &Database, project_id: &str) -> Result<(), MemoryError> {
+fn cmd_projects(db: &Database, current_project: &str, json: bool) -> Result<(), MemoryError> {
+    let projects = db.list_projects()?;
+
+    if json {
+        let items: Vec<serde_json::Value> = projects
+            .iter()
+            .map(|project| {
+                let mut value = serde_json::to_value(project).unwrap_or_default();
+                if let Some(map) = value.as_object_mut() {
+                    map.insert(
+                        "current".to_string(),
+                        serde_json::json!(project.id == current_project),
+                    );
+                }
+                value
+            })
+            .collect();
+        print_json(&serde_json::json!({
+            "current_project": current_project,
+            "count": items.len(),
+            "projects": items,
+        }));
+        return Ok(());
+    }
+
+    if projects.is_empty() {
+        println!("No projects in the memory store.");
+        return Ok(());
+    }
+
+    println!("Projects ({}):\n", projects.len());
+    for project in &projects {
+        let marker = if project.id == current_project {
+            " *"
+        } else {
+            ""
+        };
+        println!("{}{}", project.id, marker);
+        println!(
+            "  {} memories, {} handoffs, {} ADRs{}",
+            project.memory_count,
+            project.handoff_count,
+            project.adr_count,
+            project
+                .latest_activity_at
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|dt| format!(", last activity {}", dt.format("%Y-%m-%d")))
+                .unwrap_or_default()
+        );
+    }
+    println!("\n* = current project");
+
+    Ok(())
+}
+
+fn cmd_stats(db: &Database, project_id: &str, json: bool) -> Result<(), MemoryError> {
     let stats = db.get_project_stats(project_id)?;
+
+    if json {
+        let mut value = serde_json::to_value(&stats)?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert("project".to_string(), serde_json::json!(project_id));
+            map.insert(
+                "cluster_count".to_string(),
+                serde_json::json!(db.get_clusters_for_project(project_id)?.len()),
+            );
+        }
+        print_json(&value);
+        return Ok(());
+    }
 
     println!("Project: {}", project_id);
     println!("Memories: {}", stats.memory_count);
@@ -1801,6 +2023,7 @@ fn cmd_context(
     min_score: f64,
     types: &[String],
     current_branch: Option<&str>,
+    json: bool,
 ) -> Result<(), MemoryError> {
     let context_embedding = embedding_service.embed(context)?;
     let embeddings = db.get_all_embeddings_for_project_and_global(project_id)?;
@@ -1828,9 +2051,9 @@ fn cmd_context(
         .collect();
     let memories_map = db.get_memories_batch(&candidate_ids)?;
 
-    let mut count = 0usize;
+    let mut selected: Vec<(&Memory, f32)> = Vec::new();
     for (id, similarity) in &scored {
-        if count >= limit {
+        if selected.len() >= limit {
             break;
         }
         let Some(memory) = memories_map.get(id) else {
@@ -1847,30 +2070,46 @@ fn cmd_context(
             continue;
         }
 
-        if count > 0 {
-            println!();
-        }
-        println!(
-            "[{}] ({}, importance: {:.1}, similarity: {:.2})",
-            memory.memory_type.as_str(),
-            memory.id,
-            memory.importance,
-            similarity,
-        );
-        if let Some(ref summary) = memory.summary {
-            println!("{}", summary);
-        } else {
-            println!("{}", memory.content);
-        }
+        selected.push((memory, *similarity));
+    }
 
-        count += 1;
+    if json {
+        let memories: Vec<serde_json::Value> = selected
+            .iter()
+            .map(|(memory, similarity)| {
+                serde_json::json!({"memory": memory, "similarity": similarity})
+            })
+            .collect();
+        print_json(&serde_json::json!({
+            "project": project_id,
+            "context": context,
+            "count": memories.len(),
+            "memories": memories,
+        }));
+    } else {
+        for (index, (memory, similarity)) in selected.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            println!(
+                "[{}] ({}, importance: {:.1}, similarity: {:.2})",
+                memory.memory_type.as_str(),
+                memory.id,
+                memory.importance,
+                similarity,
+            );
+            if let Some(ref summary) = memory.summary {
+                println!("{}", summary);
+            } else {
+                println!("{}", memory.content);
+            }
+        }
     }
 
     // Record access
-    let accessed_ids: Vec<String> = scored
+    let accessed_ids: Vec<String> = selected
         .iter()
-        .take(count)
-        .map(|(id, _)| id.clone())
+        .map(|(memory, _)| memory.id.clone())
         .collect();
     if !accessed_ids.is_empty() {
         let _ = db.record_access_batch(&accessed_ids);
@@ -1885,6 +2124,13 @@ fn format_timestamp(ts: i64) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Whether stdin can carry an interactive answer. `--non-interactive` and a
+/// non-terminal stdin (CI job, agent with a closed pipe) both mean "do not ask".
+fn is_interactive(non_interactive: bool) -> bool {
+    use std::io::IsTerminal;
+    !non_interactive && std::io::stdin().is_terminal()
+}
+
 /// Prompt the user for a line of text on stdin. Returns empty string on EOF or blank.
 fn prompt_line(label: &str) -> String {
     use std::io::{self, BufRead, Write};
@@ -1892,7 +2138,11 @@ fn prompt_line(label: &str) -> String {
     io::stdout().flush().ok();
     let stdin = io::stdin();
     let mut line = String::new();
-    stdin.lock().read_line(&mut line).ok();
+    // EOF leaves the prompt unterminated; close the line so following output
+    // does not render inside it.
+    if matches!(stdin.lock().read_line(&mut line), Ok(0) | Err(_)) {
+        println!();
+    }
     line.trim().to_string()
 }
 
@@ -1906,11 +2156,13 @@ fn prompt_list(label: &str) -> Vec<String> {
         print!("  > ");
         io::stdout().flush().ok();
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).is_err() {
+        if matches!(stdin.lock().read_line(&mut line), Ok(0) | Err(_)) {
+            println!();
             break;
         }
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
+            println!();
             break;
         }
         items.push(trimmed);
@@ -1919,12 +2171,14 @@ fn prompt_list(label: &str) -> Vec<String> {
 }
 
 /// Dispatch handoff subcommands.
+#[allow(clippy::too_many_arguments)]
 fn cmd_handoff(
     db: &Database,
     project_id: &str,
     embedding_service: Option<&EmbeddingService>,
     current_branch: Option<&str>,
     cmd: HandoffCmd,
+    json: bool,
 ) -> Result<(), MemoryError> {
     match cmd {
         HandoffCmd::Create {
@@ -1941,10 +2195,13 @@ fn cmd_handoff(
             no_pin,
             no_auto_link,
             from_file,
+            non_interactive,
         } => {
             let embedding = embedding_service.ok_or_else(|| {
                 MemoryError::InvalidType("embedding service required".to_string())
             })?;
+
+            let interactive = is_interactive(non_interactive);
 
             let sections = if let Some(path) = from_file {
                 let content = std::fs::read_to_string(&path)?;
@@ -1954,54 +2211,63 @@ fn cmd_handoff(
                 }
                 s
             } else {
-                // Use flags if provided; otherwise prompt interactively for missing required fields.
-                let summary_text = if let Some(s) = summary {
-                    s
-                } else {
-                    let s = prompt_line("Summary");
-                    if s.is_empty() {
+                // Use flags if provided; prompt for the rest only when stdin can answer.
+                let summary_text = match summary {
+                    Some(s) => s,
+                    None if interactive => {
+                        let s = prompt_line("Summary");
+                        if s.is_empty() {
+                            return Err(MemoryError::InvalidType(
+                                "handoff: summary is required".to_string(),
+                            ));
+                        }
+                        s
+                    }
+                    None => {
                         return Err(MemoryError::InvalidType(
-                            "handoff: summary is required".to_string(),
+                            "handoff: summary is required (pass --summary or --from-file)"
+                                .to_string(),
                         ));
                     }
-                    s
                 };
 
-                let decisions_list = if !decisions.is_empty() {
+                let decisions_list = if !decisions.is_empty() || !interactive {
                     decisions
                 } else {
                     prompt_list("Decisions")
                 };
 
-                let todos_list = if !todos.is_empty() {
+                let todos_list = if !todos.is_empty() || !interactive {
                     todos
                 } else {
                     prompt_list("Todos")
                 };
 
-                let blockers_list = if !blockers.is_empty() {
+                let blockers_list = if !blockers.is_empty() || !interactive {
                     blockers
                 } else {
                     prompt_list("Blockers")
                 };
 
-                let mental_model_text = if let Some(m) = mental_model {
-                    m
-                } else {
-                    prompt_line("Mental model")
+                let mental_model_text = match mental_model {
+                    Some(m) => m,
+                    None if interactive => prompt_line("Mental model"),
+                    None => String::new(),
                 };
 
-                let next_steps_list = if !next_steps.is_empty() {
+                let next_steps_list = if !next_steps.is_empty() || !interactive {
                     next_steps
                 } else {
                     prompt_list("Next steps")
                 };
 
-                let notes_text = if let Some(n) = notes {
-                    Some(n)
-                } else {
-                    let n = prompt_line("Notes (optional, blank to skip)");
-                    if n.is_empty() { None } else { Some(n) }
+                let notes_text = match notes {
+                    Some(n) => Some(n),
+                    None if interactive => {
+                        let n = prompt_line("Notes (optional, blank to skip)");
+                        if n.is_empty() { None } else { Some(n) }
+                    }
+                    None => None,
                 };
 
                 HandoffSections {
@@ -2031,6 +2297,7 @@ fn cmd_handoff(
             )?;
 
             println!("Handoff created: {}", result.id);
+            println!("Project: {} | Branch: {}", result.project, result.branch);
             if let Some(ref cf) = result.continues_from {
                 println!("Continues from: {}", cf);
             }
@@ -2075,6 +2342,11 @@ fn cmd_handoff(
                 include_off_branch,
                 max_chars_per_section,
             )?;
+
+            if json {
+                print_json(&serde_json::to_value(&result)?);
+                return Ok(());
+            }
 
             if let Some(ref msg) = result.message {
                 println!("Note: {}", msg);
@@ -2148,6 +2420,15 @@ fn cmd_handoff(
                 section_filter.as_deref(),
             )?;
 
+            if json {
+                print_json(&serde_json::json!({
+                    "query": query,
+                    "count": result.matches.len(),
+                    "matches": result.matches,
+                }));
+                return Ok(());
+            }
+
             if result.matches.is_empty() {
                 println!("No matching handoff sections found.");
                 return Ok(());
@@ -2168,6 +2449,12 @@ fn cmd_handoff(
             let memory = db
                 .get_memory(&id)?
                 .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
+
+            if json {
+                let sections = db.get_handoff_sections(&id)?.map(|(sections, _)| sections);
+                print_json(&serde_json::json!({"memory": memory, "sections": sections}));
+                return Ok(());
+            }
 
             if memory.memory_type != MemoryType::Handoff {
                 println!(
@@ -2202,6 +2489,7 @@ fn cmd_adr(
     project_id: &str,
     embedding_service: Option<&EmbeddingService>,
     cmd: AdrCmd,
+    json: bool,
 ) -> Result<(), MemoryError> {
     use std::str::FromStr;
 
@@ -2216,49 +2504,65 @@ fn cmd_adr(
             importance,
             no_pin,
             from_file,
+            non_interactive,
         } => {
             let embedding = embedding_service.ok_or_else(|| {
                 MemoryError::InvalidType("embedding service required".to_string())
             })?;
 
+            let interactive = is_interactive(non_interactive);
+
             let sections = if let Some(path) = from_file {
                 let content = std::fs::read_to_string(&path)?;
                 AdrSections::parse_markdown(&content)?
             } else {
-                let title_text = if let Some(t) = title {
-                    t
-                } else {
-                    let t = prompt_line("Title");
-                    if t.is_empty() {
+                let title_text = match title {
+                    Some(t) => t,
+                    None if interactive => {
+                        let t = prompt_line("Title");
+                        if t.is_empty() {
+                            return Err(MemoryError::InvalidType(
+                                "adr: title is required".to_string(),
+                            ));
+                        }
+                        t
+                    }
+                    None => {
                         return Err(MemoryError::InvalidType(
-                            "adr: title is required".to_string(),
+                            "adr: title is required (pass --title or --from-file)".to_string(),
                         ));
                     }
-                    t
                 };
 
-                let context_text = if let Some(c) = context {
-                    c
-                } else {
-                    prompt_line("Context")
+                let context_text = match context {
+                    Some(c) => c,
+                    None if interactive => prompt_line("Context"),
+                    None => String::new(),
                 };
 
-                let decision_text = if let Some(d) = decision {
-                    d
-                } else {
-                    let d = prompt_line("Decision");
-                    if d.is_empty() {
+                let decision_text = match decision {
+                    Some(d) => d,
+                    None if interactive => {
+                        let d = prompt_line("Decision");
+                        if d.is_empty() {
+                            return Err(MemoryError::InvalidType(
+                                "adr: decision is required".to_string(),
+                            ));
+                        }
+                        d
+                    }
+                    None => {
                         return Err(MemoryError::InvalidType(
-                            "adr: decision is required".to_string(),
+                            "adr: decision is required (pass --decision or --from-file)"
+                                .to_string(),
                         ));
                     }
-                    d
                 };
 
-                let consequences_text = if let Some(c) = consequences {
-                    c
-                } else {
-                    prompt_line("Consequences")
+                let consequences_text = match consequences {
+                    Some(c) => c,
+                    None if interactive => prompt_line("Consequences"),
+                    None => String::new(),
                 };
 
                 AdrSections {
@@ -2283,6 +2587,7 @@ fn cmd_adr(
                 supersedes,
             )?;
 
+            println!("Project: {}", result.project);
             println!(
                 "ADR-{:04} created (status: {})",
                 result.adr_number, result.status
@@ -2330,6 +2635,26 @@ fn cmd_adr(
 
             let rows = db.list_adrs(project_id, status_filter)?;
 
+            if json {
+                let items: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|(number, adr_status, title, id)| {
+                        serde_json::json!({
+                            "number": number,
+                            "status": adr_status.as_str(),
+                            "title": title,
+                            "id": id,
+                        })
+                    })
+                    .collect();
+                print_json(&serde_json::json!({
+                    "project": project_id,
+                    "count": items.len(),
+                    "adrs": items,
+                }));
+                return Ok(());
+            }
+
             if rows.is_empty() {
                 println!("No ADRs found.");
                 return Ok(());
@@ -2352,6 +2677,19 @@ fn cmd_adr(
                 .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", id)))?;
 
             let _ = db.record_access(&id);
+
+            if json {
+                print_json(&serde_json::json!({
+                    "id": id,
+                    "number": num,
+                    "status": adr_status.as_str(),
+                    "title": sections.title,
+                    "context": sections.context,
+                    "decision": sections.decision,
+                    "consequences": sections.consequences,
+                }));
+                return Ok(());
+            }
 
             println!("ADR-{:04}: {}", num, sections.title);
             println!("Status: {}", adr_status);

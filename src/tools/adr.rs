@@ -14,6 +14,8 @@ use crate::memory::{AdrSections, AdrStatus, MemoryType};
 pub struct AdrCreateResult {
     /// ID of the newly created ADR memory.
     pub id: String,
+    /// Project the ADR was stored under.
+    pub project: String,
     /// Sequential ADR number within this project.
     pub adr_number: u32,
     /// Status at creation time.
@@ -116,6 +118,7 @@ pub fn create_adr(
 
     Ok(AdrCreateResult {
         id,
+        project: project_id.to_string(),
         adr_number: number,
         status,
         superseded_id,

@@ -17,6 +17,10 @@ use crate::summarize::{generate_summary, should_auto_summarize};
 pub struct HandoffCreateResult {
     /// ID of the newly created handoff memory.
     pub id: String,
+    /// Project the handoff was stored under.
+    pub project: String,
+    /// Branch the handoff was scoped to.
+    pub branch: String,
     /// IDs of memories that were auto-linked to this handoff.
     pub linked_memory_ids: Vec<String>,
     /// The `continues_from` field from the sections (sidecar-only, not a graph edge).
@@ -126,7 +130,7 @@ pub fn create_handoff(
         created_at: now,
         updated_at: now,
         last_accessed_at: now,
-        branch: Some(resolved_branch),
+        branch: Some(resolved_branch.clone()),
         merged_from: None,
         external_artifacts: None,
         pinned,
@@ -178,6 +182,8 @@ pub fn create_handoff(
     let continues_from = sections.continues_from.clone();
     Ok(HandoffCreateResult {
         id,
+        project: project_id.to_string(),
+        branch: resolved_branch,
         linked_memory_ids,
         continues_from,
         warnings,
