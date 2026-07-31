@@ -692,21 +692,25 @@ fn test_prune_low_relevance_memories() {
         }),
     );
 
-    // Dry run prune at high threshold (should find the low-importance debug memory)
-    let r = call(
-        &h,
-        "memory_prune",
-        json!({
-            "threshold": 0.99
-        }),
-    );
+    // A freshly stored memory's relevance is its importance factor (0.5 + importance/2),
+    // not a flat 1.0: relevance is recomputed when a store lands, so it reflects
+    // importance immediately rather than only after a decay pass.
+    //   debug memory, importance 0.1 -> 0.55
+    //   fact memory,  importance 0.8 -> 0.90
+    let r = call(&h, "memory_prune", json!({ "threshold": 0.2 }));
     assert!(r["dry_run"].as_bool().unwrap());
-    // Both memories have relevance_score 1.0 (fresh), so none should be candidates
-    // at default threshold. Use a very high threshold to test the mechanism.
-    let candidates = r["candidates"].as_u64().unwrap();
     assert_eq!(
-        candidates, 0,
-        "Fresh memories should all have relevance 1.0"
+        r["candidates"].as_u64().unwrap(),
+        0,
+        "nothing has decayed yet, so nothing should be a prune candidate"
+    );
+
+    // Above both importance factors, everything qualifies -- the mechanism works.
+    let r = call(&h, "memory_prune", json!({ "threshold": 0.99 }));
+    assert_eq!(
+        r["candidates"].as_u64().unwrap(),
+        2,
+        "a threshold above every score should match every unpinned memory"
     );
 
     // Verify nothing was deleted

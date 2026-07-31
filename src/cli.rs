@@ -1564,6 +1564,12 @@ fn cmd_store(
         db.create_relationship(&rel)?;
     }
 
+    // New knowledge advanced the project's clock, so every other memory in it is one
+    // store-day more displaced. Matches what the MCP store path does.
+    if let Some(project) = db.get_project(project_id)? {
+        db.update_relevance_scores(project_id, project.decay_rate)?;
+    }
+
     if let Some(ref b) = branch {
         println!("Memory stored: {} (branch: {})", id, b);
     } else {

@@ -38,6 +38,9 @@ use super::scoring::{
 };
 use crate::adr_export::{adr_export_target_dir, export_adr_to_disk};
 
+/// Decay rate used when a project row carries none.
+const DEFAULT_DECAY_RATE: f64 = 0.01;
+
 // ============================================
 // Per-process profile + once-warning
 // ============================================
@@ -529,6 +532,9 @@ impl ToolHandler {
 
         // Invalidate search cache since we added new data
         self.invalidate_search_cache(&project);
+        // New knowledge landed, so the project's clock advanced and every other memory
+        // in it is now one store-day more displaced.
+        self.refresh_relevance(&project);
 
         let message = if merge_info.is_some() {
             "Memory stored and merged with duplicate".to_string()
@@ -816,6 +822,28 @@ impl ToolHandler {
             count: results.len(),
             memories: results,
         }))
+    }
+
+    /// Recompute relevance for a project after new knowledge lands in it.
+    ///
+    /// Relevance is a function of store-days (`db::activity`), so it changes at exactly
+    /// one moment: when a store advances the project's clock. The background job cannot
+    /// be relied on for this — it sleeps a full interval before its first pass, so a
+    /// server that lives less than an hour never runs it, and scores would sit stale
+    /// until some session happened to run long.
+    ///
+    /// Best-effort: the memory is already committed by the time this runs, and a failed
+    /// scoring refresh must not report a successful store as failed. The background pass
+    /// corrects anything missed.
+    fn refresh_relevance(&self, project: &str) {
+        let decay_rate = self
+            .db
+            .get_project(project)
+            .ok()
+            .flatten()
+            .map(|p| p.decay_rate)
+            .unwrap_or(DEFAULT_DECAY_RATE);
+        let _ = self.db.update_relevance_scores(project, decay_rate);
     }
 
     /// Materialize a ranked id list into results, applying curation status.
@@ -1368,6 +1396,7 @@ impl ToolHandler {
         // Invalidate search cache since we added new data
         if stored > 0 {
             self.invalidate_search_cache(&project);
+            self.refresh_relevance(&project);
         }
 
         Ok(json!({
