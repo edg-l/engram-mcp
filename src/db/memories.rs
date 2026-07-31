@@ -727,24 +727,34 @@ impl Database {
         decay_rate: f64,
     ) -> Result<usize, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().timestamp();
 
         // The formula, including both clamps, lives in `crate::decay::relevance_from_parts`;
         // RELEVANCE() is that function registered as a SQLite scalar.
-        let rows_affected = conn.execute(
+        //
+        // The elapsed term is store-days, not wall-clock days: the count of days on which
+        // this project received a store after the memory was last accessed. See
+        // `db::activity`. The subquery is correlated but bounded by the project's own
+        // memory count, and `idx_memories_project` covers the lookup.
+        let sql = format!(
             r#"
             UPDATE memories
             SET relevance_score = RELEVANCE(
-                (?2 - last_accessed_at) / 86400.0,
+                (SELECT COUNT(DISTINCT m2.created_at / {day})
+                 FROM memories m2
+                 WHERE m2.project_id = memories.project_id
+                   AND m2.created_at / {day} > memories.last_accessed_at / {day}
+                   AND {clock}),
                 importance,
                 access_count,
                 ?1
             )
-            WHERE project_id = ?3
+            WHERE project_id = ?2
             AND pinned = 0
             "#,
-            params![decay_rate, now, project_id],
-        )?;
+            day = super::SECONDS_PER_DAY,
+            clock = super::CLOCK_ADVANCING_STORE.replace("tags", "m2.tags"),
+        );
+        let rows_affected = conn.execute(&sql, params![decay_rate, project_id])?;
 
         Ok(rows_affected)
     }

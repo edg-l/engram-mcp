@@ -147,17 +147,34 @@ fn make_matcher_block(event: &str, timeout: u32) -> Value {
 }
 
 /// Return `true` if the given matcher-block Value was written by `engram-cli`.
+/// Whether a hook block invokes engram.
+///
+/// Matches on the `_source` marker the installer writes *or* on the command actually
+/// being an `engram-cli hook-event` invocation. Marker-only matching made `status`
+/// report a false negative and `uninstall` a silent no-op for any block written by hand
+/// or by an older version — the worst possible failure for a command whose entire job is
+/// to tell you what is installed.
 fn block_is_ours(block: &Value) -> bool {
-    if let Some(hooks_arr) = block.get("hooks").and_then(|v| v.as_array()) {
-        hooks_arr.iter().any(|h| {
-            h.get(SOURCE_KEY)
-                .and_then(|v| v.as_str())
-                .map(|s| s == SOURCE_VALUE)
-                .unwrap_or(false)
-        })
-    } else {
-        false
-    }
+    let Some(hooks_arr) = block.get("hooks").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    hooks_arr.iter().any(|h| {
+        let marked = h
+            .get(SOURCE_KEY)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == SOURCE_VALUE);
+        let invokes_engram = h
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(command_invokes_engram);
+        marked || invokes_engram
+    })
+}
+
+/// Whether a hook command line runs `engram-cli hook-event`, however it is spelled
+/// (bare name, absolute path, or wrapped in a shell invocation).
+fn command_invokes_engram(command: &str) -> bool {
+    command.contains("engram-cli") && command.contains("hook-event")
 }
 
 // ── Public functions ──────────────────────────────────────────────────────
@@ -324,4 +341,45 @@ pub fn status() -> Result<StatusReport, MemoryError> {
         managed,
         shadowed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block written by hand (or by a version predating the `_source` marker) still
+    /// invokes engram, so status must see it and uninstall must be able to remove it.
+    #[test]
+    fn unmarked_engram_blocks_are_recognised() {
+        let block = serde_json::json!({
+            "matcher": "",
+            "hooks": [{"type": "command", "command": "engram-cli hook-event SessionEnd", "timeout": 5}]
+        });
+        assert!(
+            block_is_ours(&block),
+            "an unmarked engram hook must still be detected"
+        );
+    }
+
+    #[test]
+    fn absolute_path_invocations_are_recognised() {
+        let block = serde_json::json!({
+            "hooks": [{"type": "command",
+                       "command": "/home/user/.cargo/bin/engram-cli hook-event SubagentStop"}]
+        });
+        assert!(block_is_ours(&block));
+    }
+
+    #[test]
+    fn unrelated_blocks_are_left_alone() {
+        let block = serde_json::json!({
+            "hooks": [{"type": "command", "command": "prettier --write ."}]
+        });
+        assert!(!block_is_ours(&block));
+        // A command merely mentioning engram is not a hook-event invocation.
+        let block = serde_json::json!({
+            "hooks": [{"type": "command", "command": "engram-cli stats"}]
+        });
+        assert!(!block_is_ours(&block));
+    }
 }

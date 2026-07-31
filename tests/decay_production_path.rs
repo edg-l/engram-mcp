@@ -26,12 +26,11 @@ fn decay_runs_on_file_backed_database() {
     };
     db.create_project(&project).expect("create_project");
 
-    // Insert a non-pinned memory whose last_accessed_at is 7 days ago.
-    // Expected post-decay relevance:
-    //   time_decay        = exp(-0.01 * 7) ~= 0.9324
+    // A memory last accessed 7 calendar days ago, in a project that has received no
+    // stores since. Decay runs on store-days (see `db::activity`), so nothing has
+    // displaced it and only the importance factor applies:
+    //   time_decay        = exp(-0.01 * 0) = 1.0
     //   importance_factor = 0.5 + (0.5 * 0.5) = 0.75
-    //   usage_boost       = ln(1) * 0.1 = 0
-    //   relevance         ~= 0.9324 * 0.75 ~= 0.6993
     let seven_days_ago = chrono::Utc::now().timestamp() - 7 * 86400;
     let mem = Memory {
         id: "mem_decay_regression".to_string(),
@@ -54,7 +53,9 @@ fn decay_runs_on_file_backed_database() {
     };
     db.store_memory(&mem).expect("store_memory");
 
-    // Run decay through the public production API.
+    // Run decay through the public production API. This must not fail with
+    // "no such function: EXP" — the bundled SQLite has no math functions, so the
+    // production constructor has to register them just as the in-memory one does.
     let updated = db
         .update_relevance_scores(&project_id, project.decay_rate)
         .expect("update_relevance_scores must not fail with 'no such function: EXP'");
@@ -67,15 +68,117 @@ fn decay_runs_on_file_backed_database() {
         .get_memory("mem_decay_regression")
         .expect("get_memory")
         .expect("memory must exist after decay");
+    assert!(
+        (after.relevance_score - 0.75).abs() < 0.001,
+        "a memory in a project with no later stores must not decay on calendar time; \
+         got {}",
+        after.relevance_score
+    );
 
+    // Now displace it: seven days on which the project received a store, all still in
+    // the past relative to nothing in particular — the calendar is irrelevant, the
+    // store-days are what count.
+    //   time_decay        = exp(-0.01 * 7) ~= 0.9324
+    //   relevance         ~= 0.9324 * 0.75 ~= 0.6993
+    for day in 1..=7 {
+        let at = seven_days_ago + day * 86400;
+        db.store_memory(&Memory {
+            id: format!("mem_displacer_{day}"),
+            created_at: at,
+            updated_at: at,
+            last_accessed_at: at,
+            content: format!("Newer knowledge landing on day {day}"),
+            ..mem.clone()
+        })
+        .expect("store displacing memory");
+    }
+
+    db.update_relevance_scores(&project_id, project.decay_rate)
+        .expect("update_relevance_scores");
+
+    let after = db
+        .get_memory("mem_decay_regression")
+        .expect("get_memory")
+        .expect("memory must exist after decay");
     assert!(
         after.relevance_score < 1.0,
-        "non-pinned memory must decay below 1.0; got relevance_score = {} (decay query likely never ran)",
+        "displaced memory must decay below 1.0; got {}",
         after.relevance_score
     );
     assert!(
         (after.relevance_score - 0.6993).abs() < 0.01,
-        "expected relevance ~0.6993 after 7-day decay of importance=0.5 memory; got {}",
+        "expected relevance ~0.6993 after 7 store-days of displacement; got {}",
+        after.relevance_score
+    );
+}
+
+/// Hook-captured stores are automatic, so they must not age deliberately curated
+/// knowledge: a session where passive capture was the only thing that happened has not
+/// made anything staler.
+#[test]
+fn hook_captures_do_not_advance_the_clock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("decay_hooks.db");
+    let db = Database::open(&db_path).expect("Database::open");
+
+    let project_id = "decay-hooks".to_string();
+    let project = Project {
+        id: project_id.clone(),
+        name: project_id.clone(),
+        root_path: None,
+        decay_rate: 0.01,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    db.create_project(&project).expect("create_project");
+
+    let base = chrono::Utc::now().timestamp() - 30 * 86400;
+    let curated = Memory {
+        id: "mem_curated".to_string(),
+        project_id: project_id.clone(),
+        memory_type: MemoryType::Decision,
+        content: "A decision worth keeping".to_string(),
+        summary: None,
+        tags: vec![],
+        importance: 0.5,
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: base,
+        updated_at: base,
+        last_accessed_at: base,
+        branch: None,
+        merged_from: None,
+        external_artifacts: None,
+        pinned: false,
+        global: false,
+    };
+    db.store_memory(&curated).expect("store curated");
+
+    // Twenty days of nothing but automatic capture.
+    for day in 1..=20 {
+        let at = base + day * 86400;
+        db.store_memory(&Memory {
+            id: format!("mem_hook_{day}"),
+            created_at: at,
+            updated_at: at,
+            last_accessed_at: at,
+            memory_type: MemoryType::Fact,
+            tags: vec!["hook".to_string(), "session_summary".to_string()],
+            content: format!("Auto-captured session summary {day}"),
+            ..curated.clone()
+        })
+        .expect("store hook capture");
+    }
+
+    db.update_relevance_scores(&project_id, project.decay_rate)
+        .expect("update_relevance_scores");
+
+    let after = db
+        .get_memory("mem_curated")
+        .expect("get_memory")
+        .expect("memory must exist");
+    assert!(
+        (after.relevance_score - 0.75).abs() < 0.001,
+        "hook captures must not advance the decay clock; got {}",
         after.relevance_score
     );
 }

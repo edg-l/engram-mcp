@@ -6,6 +6,7 @@ use crate::error::MemoryError;
 
 mod util;
 
+mod activity;
 mod adrs;
 mod batch;
 mod clusters;
@@ -17,6 +18,10 @@ mod relationships;
 mod status;
 mod trash;
 
+// Each binary compiles these modules separately, so an export used by only one of them
+// reads as unused in the other.
+#[allow(unused_imports)]
+pub use activity::{CLOCK_ADVANCING_STORE, SECONDS_PER_DAY, StoreDayIndex};
 pub use handoffs::encode_section_embeddings;
 pub use status::SupersessionMap;
 // Each binary compiles these modules separately, so a re-export used by only one of them

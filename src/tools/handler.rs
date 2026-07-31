@@ -1773,6 +1773,10 @@ impl ToolHandler {
         let curation = self.curation_view(&project, &HashMap::new(), false)?;
         let mut emitted: HashSet<String> = HashSet::new();
 
+        // The activity clock ranking runs on; see `db::activity`. Loaded once, like the
+        // curation status above.
+        let store_days = self.db.get_store_day_index(&project)?;
+
         // Pre-filter candidate cap (configurable via ENGRAM_MAX_CANDIDATES, default 500)
         let max_candidates: usize = std::env::var("ENGRAM_MAX_CANDIDATES")
             .ok()
@@ -1958,15 +1962,14 @@ impl ToolHandler {
                                 };
                                 // Vector: additive form (recency/importance contribute even at low sim).
                                 // Bm25/Hybrid: multiplicative form so base=0 memories score exactly 0.
+                                let elapsed = store_days.active_days_since(m.last_accessed_at);
                                 let final_score = match self.search_mode {
                                     SearchMode::Vector => {
-                                        compute_hybrid_score(base, m.last_accessed_at, m.importance)
+                                        compute_hybrid_score(base, elapsed, m.importance)
                                     }
-                                    SearchMode::Bm25 | SearchMode::Hybrid => compute_context_score(
-                                        base,
-                                        m.last_accessed_at,
-                                        m.importance,
-                                    ),
+                                    SearchMode::Bm25 | SearchMode::Hybrid => {
+                                        compute_context_score(base, elapsed, m.importance)
+                                    }
                                 };
                                 (id.clone(), similarity, final_score)
                             })
@@ -2173,12 +2176,11 @@ impl ToolHandler {
                         }
                         SearchMode::Hybrid => *rrf_map.get(id.as_str()).unwrap_or(&0.0) as f32,
                     };
+                    let elapsed = store_days.active_days_since(m.last_accessed_at);
                     let final_score = match self.search_mode {
-                        SearchMode::Vector => {
-                            compute_hybrid_score(base, m.last_accessed_at, m.importance)
-                        }
+                        SearchMode::Vector => compute_hybrid_score(base, elapsed, m.importance),
                         SearchMode::Bm25 | SearchMode::Hybrid => {
-                            compute_context_score(base, m.last_accessed_at, m.importance)
+                            compute_context_score(base, elapsed, m.importance)
                         }
                     };
                     (id.clone(), similarity, final_score)

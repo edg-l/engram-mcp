@@ -113,16 +113,21 @@ pub fn compute_tag_boost(query_words: &[String], tags: &[String]) -> f64 {
     (matches as f64 * 0.05).min(0.15)
 }
 
+/// Recency factor shared by the retrieval scorers.
+///
+/// `recency = exp(-0.02 * elapsed)`, where `elapsed` is store-days rather than calendar
+/// days (see `db::activity`). Ranking has to use the same axis as decay: measuring
+/// recency on the wall clock here would re-import the behaviour decay was moved off,
+/// namely a dormant project's memories sinking while nothing about them changed.
+fn recency_factor(elapsed_store_days: f64) -> f32 {
+    (-0.02 * elapsed_store_days.max(0.0)).exp() as f32
+}
+
 /// Compute a hybrid relevance score combining semantic similarity, recency, and importance.
 ///
 /// `score = 0.6 * semantic + 0.2 * recency + 0.2 * importance`
-///
-/// where `recency = exp(-0.02 * days_since_access)`.
-pub fn compute_hybrid_score(similarity: f32, last_accessed_at: i64, importance: f64) -> f32 {
-    let now = chrono::Utc::now().timestamp();
-    let days_since_access = ((now - last_accessed_at).max(0) as f64) / 86_400.0;
-    let recency = (-0.02 * days_since_access).exp() as f32;
-    0.6 * similarity + 0.2 * recency + 0.2 * importance as f32
+pub fn compute_hybrid_score(similarity: f32, elapsed_store_days: f64, importance: f64) -> f32 {
+    0.6 * similarity + 0.2 * recency_factor(elapsed_store_days) + 0.2 * importance as f32
 }
 
 /// Compute a multiplicative recency/importance boost for BM25 and Hybrid context scoring.
@@ -136,11 +141,8 @@ pub fn compute_hybrid_score(similarity: f32, last_accessed_at: i64, importance: 
 /// For Vector mode, `compute_hybrid_score` (additive form) is used instead, preserving
 /// the existing behavior where recency and importance contribute even when cosine similarity
 /// is low.
-pub fn compute_context_score(base: f32, last_accessed_at: i64, importance: f64) -> f32 {
-    let now = chrono::Utc::now().timestamp();
-    let days_since_access = ((now - last_accessed_at).max(0) as f64) / 86_400.0;
-    let recency = (-0.02 * days_since_access).exp() as f32;
-    base * (0.6 + 0.2 * recency + 0.2 * importance as f32)
+pub fn compute_context_score(base: f32, elapsed_store_days: f64, importance: f64) -> f32 {
+    base * (0.6 + 0.2 * recency_factor(elapsed_store_days) + 0.2 * importance as f32)
 }
 
 #[cfg(test)]

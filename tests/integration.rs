@@ -304,22 +304,19 @@ fn test_memory_access_tracking() {
 }
 
 /// Verify that `compute_hybrid_score` ranks a recent+important memory above
-/// a semantically closer but old+unimportant memory.
+/// a semantically closer but displaced+unimportant memory.
 ///
-/// Scenario from the spec:
-///   Memory A: similarity 0.7, accessed 1 day ago, importance 0.8
-///   Memory B: similarity 0.75, accessed 90 days ago, importance 0.3
+/// The elapsed term is store-days, not calendar days: how much new knowledge has landed
+/// in the project since the memory was last touched.
+///   Memory A: similarity 0.7, displaced by 1 store-day, importance 0.8
+///   Memory B: similarity 0.75, displaced by 90 store-days, importance 0.3
 ///   Expected: score_A > score_B
 #[test]
 fn test_hybrid_scoring_recent_important_beats_old_similar() {
     use engram_mcp::tools::compute_hybrid_score;
 
-    let now = chrono::Utc::now().timestamp();
-    let one_day_ago = now - 86_400;
-    let ninety_days_ago = now - 90 * 86_400;
-
-    let score_a = compute_hybrid_score(0.7, one_day_ago, 0.8);
-    let score_b = compute_hybrid_score(0.75, ninety_days_ago, 0.3);
+    let score_a = compute_hybrid_score(0.7, 1.0, 0.8);
+    let score_b = compute_hybrid_score(0.75, 90.0, 0.3);
 
     assert!(
         score_a > score_b,
@@ -331,18 +328,15 @@ fn test_hybrid_scoring_recent_important_beats_old_similar() {
 /// Verify that very high semantic similarity still dominates over recency/importance.
 ///
 /// Scenario from the spec:
-///   Memory A: similarity 0.95, accessed 60 days ago, importance 0.5
-///   Memory B: similarity 0.5, accessed today, importance 0.9
+///   Memory A: similarity 0.95, displaced by 60 store-days, importance 0.5
+///   Memory B: similarity 0.5, undisplaced, importance 0.9
 ///   Expected: score_A > score_B
 #[test]
 fn test_hybrid_scoring_very_high_similarity_dominates() {
     use engram_mcp::tools::compute_hybrid_score;
 
-    let now = chrono::Utc::now().timestamp();
-    let sixty_days_ago = now - 60 * 86_400;
-
-    let score_a = compute_hybrid_score(0.95, sixty_days_ago, 0.5);
-    let score_b = compute_hybrid_score(0.5, now, 0.9);
+    let score_a = compute_hybrid_score(0.95, 60.0, 0.5);
+    let score_b = compute_hybrid_score(0.5, 0.0, 0.9);
 
     assert!(
         score_a > score_b,

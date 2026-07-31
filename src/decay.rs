@@ -23,34 +23,39 @@ const USAGE_BOOST_MAX: f64 = 0.1;
 /// saturates it; further retrieval adds nothing.
 const USAGE_SATURATION_COUNT: f64 = 50.0;
 
-/// Time constant for the usage boost's own decay, in inverse days.
+/// Time constant for the usage boost's own fade, per store-day.
 ///
-/// Matches the recency term used by `compute_hybrid_score` / `compute_context_score`
-/// (`exp(-0.02 * days)`, a ~35-day half-life) so a memory's ranking fades at the same
-/// rate whichever retrieval path scores it. Without this the boost is permanent and
-/// "retrieved often a year ago" outranks "stored last week" forever.
+/// Matches the recency term used by `compute_hybrid_score` / `compute_context_score` so a
+/// memory's ranking fades at the same rate whichever retrieval path scores it. Without
+/// this the boost is permanent and "retrieved often, long ago" outranks "stored
+/// recently" forever.
 const USAGE_RECENCY_RATE: f64 = 0.02;
 
 /// Relevance score from the raw column values, clamped to
 /// `[RELEVANCE_FLOOR, RELEVANCE_CEILING]`.
 ///
 /// ```text
-/// time_decay       = exp(-decay_rate * days)
+/// time_decay       = exp(-decay_rate * elapsed)
 /// importance_factor= 0.5 + importance * 0.5
-/// usage_boost      = USAGE_BOOST_MAX * min(1, ln(1+n) / ln(1+SATURATION)) * exp(-0.02 * days)
+/// usage_boost      = USAGE_BOOST_MAX * min(1, ln(1+n) / ln(1+SATURATION)) * exp(-0.02 * elapsed)
 /// score            = clamp(time_decay * importance_factor + usage_boost)
 /// ```
+///
+/// `elapsed` is **store-days, not calendar days**: the number of days on which the
+/// memory's project received a store after this memory was last accessed (see
+/// `db::activity`). A memory only goes stale when newer knowledge about the same project
+/// arrives to displace it, so a dormant project's memories keep the relevance they had.
 ///
 /// This is the single definition of the decay algorithm: the background job runs it by
 /// calling the `RELEVANCE()` SQLite scalar function, which is registered against this
 /// function on every connection (see `db::register_math_scalar_functions`).
 pub fn relevance_from_parts(
-    days_since_access: f64,
+    elapsed_store_days: f64,
     importance: f64,
     access_count: i64,
     decay_rate: f64,
 ) -> f64 {
-    let days = days_since_access.max(0.0);
+    let days = elapsed_store_days.max(0.0);
 
     // Base decay: exponential in time since last access.
     let time_decay = (-decay_rate * days).exp();
