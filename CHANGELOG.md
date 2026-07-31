@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.10.1] - 2026-07-31
+
+### Fixed
+- **`handoff_create` rejected the payload its own schema described.** The tool advertised `sections.required = ["summary"]`, but `HandoffSections` carried no serde defaults, so anything omitting `decisions`, `todos`, `blockers`, `mental_model` or `next_steps` failed with `missing field blockers`. A caller reading the published schema had no way to construct a legal call, and the documented behaviour of leaving empty sections out was impossible. Those five sections now default, leaving `summary` as the only requirement — which is what the schema always claimed.
+- **`memory_restore` marked neither `id` nor `trash_id` as required** while the handler requires one of them, so the published contract said an empty argument object was legal. Expressed as an `anyOf` so the constraint is part of the schema rather than only of the error message.
+
+### Added
+- **A contract test tying every tool schema to its deserializer** (`tests/schema_contract.rs`). Nothing connects a hand-written JSON schema to the Rust struct beside it, so the two drift silently and the failure lands on callers. The test walks every advertised tool, builds the minimal payload that tool's own schema declares legal, and asserts the server accepts it; a deserializer demanding more than the published `required` list fails with the offending payload printed. It caught the `memory_restore` case on its first run.
+
 ## [0.10.0] - 2026-07-31
 
 ### Changed
