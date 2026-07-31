@@ -13,6 +13,18 @@ use crate::memory::{Memory, RelationType, Relationship};
 use super::Database;
 use super::util::{MEMORY_COLUMNS, map_memory_row};
 
+/// Default number of days a trashed memory stays recoverable.
+pub const TRASH_RETENTION_DAYS: i64 = 30;
+
+/// Trash retention window in days, from `ENGRAM_TRASH_RETENTION_DAYS`; `0` keeps
+/// snapshots forever.
+pub fn trash_retention_days() -> i64 {
+    std::env::var("ENGRAM_TRASH_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TRASH_RETENTION_DAYS)
+}
+
 /// Operation that trashed a memory. Recorded verbatim so a restore can explain itself.
 pub const OP_DELETE: &str = "delete";
 pub const OP_MERGE: &str = "merge";

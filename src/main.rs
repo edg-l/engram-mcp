@@ -128,17 +128,6 @@ fn get_current_branch() -> Option<String> {
 /// Default decay interval: 1 hour
 const DECAY_INTERVAL_SECS: u64 = 3600;
 
-/// Default number of days a trashed memory stays recoverable.
-const TRASH_RETENTION_DAYS: i64 = 30;
-
-/// Trash retention window in days; `0` keeps snapshots forever.
-fn trash_retention_days() -> i64 {
-    std::env::var("ENGRAM_TRASH_RETENTION_DAYS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(TRASH_RETENTION_DAYS)
-}
-
 /// Run the background decay job that periodically updates relevance scores
 async fn run_decay_job(db_path: PathBuf, project_id: String) {
     let interval = Duration::from_secs(
@@ -187,7 +176,7 @@ async fn run_decay_job(db_path: PathBuf, project_id: String) {
                     }
                 }
 
-                match db.sweep_trash(trash_retention_days()) {
+                match db.sweep_trash(db::trash_retention_days()) {
                     Ok(removed) => {
                         if removed > 0 {
                             tracing::debug!("Swept {} expired trash entries", removed);

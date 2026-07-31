@@ -22,7 +22,10 @@ pub use status::SupersessionMap;
 // Each binary compiles these modules separately, so a re-export used by only one of them
 // reads as unused in the other.
 #[allow(unused_imports)]
-pub use trash::{OP_DELETE, OP_MERGE, OP_PRUNE, OP_UPDATE, OP_WIPE, RestoreOutcome, TrashEntry};
+pub use trash::{
+    OP_DELETE, OP_MERGE, OP_PRUNE, OP_UPDATE, OP_WIPE, RestoreOutcome, TrashEntry,
+    trash_retention_days,
+};
 
 #[cfg(test)]
 mod tests;

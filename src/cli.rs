@@ -2210,6 +2210,12 @@ fn cmd_health(db: &Database, project_id: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// Run the same maintenance pass as the server's background decay tick.
+///
+/// The server only ticks after a full interval of uptime, so a short-lived process never
+/// runs any of this. Doing the whole pass here rather than the decay step alone is what
+/// makes an external timer a complete substitute -- otherwise trash retention would be
+/// reachable only from a server that happened to stay up for an hour.
 fn cmd_decay(db: &Database, project_id: &str) -> Result<(), MemoryError> {
     let project = db
         .get_project(project_id)?
@@ -2217,6 +2223,23 @@ fn cmd_decay(db: &Database, project_id: &str) -> Result<(), MemoryError> {
 
     let updated = db.update_relevance_scores(project_id, project.decay_rate)?;
     println!("Updated relevance scores for {} memories", updated);
+
+    let pruned = db.auto_prune_stale_memories(project_id)?;
+    if !pruned.is_empty() {
+        println!(
+            "Auto-pruned {} stale memories (recoverable from the trash)",
+            pruned.len()
+        );
+    }
+
+    let retention = db::trash_retention_days();
+    let swept = db.sweep_trash(retention)?;
+    if swept > 0 {
+        println!(
+            "Swept {} trash entries older than {} days",
+            swept, retention
+        );
+    }
 
     Ok(())
 }
