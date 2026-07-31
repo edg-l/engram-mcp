@@ -22,6 +22,7 @@ use memory::{
     AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, RelationType, Relationship,
 };
 use summarize::{generate_summary, should_auto_summarize};
+use tools::curation::{CurationView, MatchedVia, Resolution, supersession_candidates};
 
 #[derive(Parser)]
 #[command(name = "engram-cli")]
@@ -63,6 +64,10 @@ enum Commands {
         /// Branch mode: "current" (global + current branch), "all", "global", or specific branch name
         #[arg(short, long, default_value = "current")]
         branch_mode: String,
+        /// Return superseded and dead memories as they are, with no redirect or
+        /// suppression. For auditing the store.
+        #[arg(long)]
+        include_superseded: bool,
     },
     /// List all memories
     List {
@@ -75,6 +80,12 @@ enum Commands {
         /// Filter by branch (default: show all)
         #[arg(short, long)]
         branch: Option<String>,
+        /// Which memories to show: live (default), superseded, dead, all
+        #[arg(long, default_value = "live")]
+        status: String,
+        /// Sort order: relevance (default), created, updated, accessed
+        #[arg(long, default_value = "relevance")]
+        order: String,
     },
     /// Show a specific memory
     Show {
@@ -109,6 +120,10 @@ enum Commands {
         /// External artifact references (file paths, URLs, ticket IDs). Repeatable.
         #[arg(long = "artifact", value_name = "PATH")]
         artifacts: Vec<String>,
+        /// Memory ID this one replaces. Repeatable. Superseded memories stop being
+        /// returned by search; queries that matched them return this memory instead.
+        #[arg(long = "supersedes", value_name = "ID")]
+        supersedes: Vec<String>,
     },
     /// Delete a memory
     Delete {
@@ -137,6 +152,31 @@ enum Commands {
         /// Clear all external artifacts (sets list to empty).
         #[arg(long)]
         clear_artifacts: bool,
+        /// Mark dead: the subject no longer exists and there is no replacement.
+        /// Excluded from retrieval entirely. Prefer `store --supersedes` when a
+        /// replacement exists, so searches get redirected instead of nothing.
+        #[arg(long)]
+        dead: bool,
+        /// Undo `--dead`.
+        #[arg(long, conflicts_with = "dead")]
+        alive: bool,
+        /// Why it is dead.
+        #[arg(long, requires = "dead")]
+        dead_reason: Option<String>,
+    },
+    /// List recoverable snapshots of destroyed memories
+    Trash {
+        /// Maximum entries to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Restore a memory from the trash
+    Restore {
+        /// Memory ID to restore (uses its most recent snapshot)
+        id: Option<String>,
+        /// Exact snapshot to restore, from `engram-cli trash`
+        #[arg(long)]
+        trash_id: Option<i64>,
     },
     /// Link two memories
     Link {
@@ -433,6 +473,7 @@ fn supports_json(cmd: &Commands) -> bool {
         | Commands::Stats
         | Commands::Projects
         | Commands::List { .. }
+        | Commands::Trash { .. }
         | Commands::Show { .. } => true,
         Commands::Handoff { cmd } => matches!(
             cmd,
@@ -441,6 +482,21 @@ fn supports_json(cmd: &Commands) -> bool {
         Commands::Adr { cmd } => matches!(cmd, AdrCmd::List { .. } | AdrCmd::Show { .. }),
         _ => false,
     }
+}
+
+/// Curation status for a retrieval command, seeded with previews of the memories it
+/// might suppress so a redirect can say what it replaced.
+///
+/// `raw` returns an empty view: superseded and dead memories then come back untouched.
+fn curation_view(db: &Database, project_id: &str, raw: bool) -> Result<CurationView, MemoryError> {
+    if raw {
+        return Ok(CurationView::empty());
+    }
+    let mut view = CurationView::load(db, project_id)?;
+    for memory in db.get_all_memories_for_project(project_id)? {
+        view.note_preview(&memory.id, &memory.content);
+    }
+    Ok(view)
 }
 
 /// Print a JSON document on stdout, pretty-printed so a human can read it too.
@@ -562,6 +618,7 @@ fn requires_existing_project(cmd: &Commands) -> bool {
     match cmd {
         Commands::Query { .. }
         | Commands::List { .. }
+        | Commands::Trash { .. }
         | Commands::Show { .. }
         | Commands::Export { .. }
         | Commands::Stats
@@ -677,6 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_relevance,
             types,
             branch_mode,
+            include_superseded,
         } => {
             cmd_query(
                 &db,
@@ -688,6 +746,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &types,
                 &branch_mode,
                 current_branch.as_deref(),
+                include_superseded,
                 cli.json,
             )?;
         }
@@ -695,6 +754,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r#type,
             limit,
             branch,
+            status,
+            order,
         } => {
             cmd_list(
                 &db,
@@ -702,6 +763,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 r#type.as_deref(),
                 limit,
                 branch.as_deref(),
+                &status,
+                &order,
                 cli.json,
             )?;
         }
@@ -718,6 +781,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pinned,
             global,
             artifacts,
+            supersedes,
         } => {
             cmd_store(
                 &db,
@@ -737,10 +801,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     Some(artifacts)
                 },
+                &supersedes,
             )?;
         }
         Commands::Delete { id } => {
             cmd_delete(&db, &id)?;
+        }
+        Commands::Trash { limit } => {
+            cmd_trash(&db, &project_id, limit, cli.json)?;
+        }
+        Commands::Restore { id, trash_id } => {
+            cmd_restore(&db, id.as_deref(), trash_id)?;
         }
         Commands::Update {
             id,
@@ -750,6 +821,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary,
             artifacts,
             clear_artifacts,
+            dead,
+            alive,
+            dead_reason,
         } => {
             // external_artifacts semantics for CLI:
             //   --clear-artifacts       -> Some([]) (clear)
@@ -762,6 +836,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            let dead_flag = if dead {
+                Some(true)
+            } else if alive {
+                Some(false)
+            } else {
+                None
+            };
             cmd_update(
                 &db,
                 embedding_service.as_ref().unwrap(),
@@ -771,6 +852,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tags,
                 summary,
                 external_artifacts,
+                dead_flag,
+                dead_reason.as_deref(),
             )?;
         }
         Commands::Link {
@@ -922,6 +1005,7 @@ fn cmd_query(
     types: &[String],
     branch_mode: &str,
     current_branch: Option<&str>,
+    include_superseded: bool,
     json: bool,
 ) -> Result<(), MemoryError> {
     use std::collections::{HashMap, HashSet};
@@ -1017,25 +1101,50 @@ fn cmd_query(
     // Sort by combined score descending
     scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // (memory, combined score, semantic score, keyword score)
-    let mut hits: Vec<(Memory, f64, f64, f64)> = Vec::new();
-    for (id, score, semantic_score, keyword_score) in scored_results.into_iter().take(limit) {
-        if let Some(memory) = db.get_memory(&id)? {
-            hits.push((memory, score, semantic_score, keyword_score));
+    // Same curation pass the MCP `memory_query` applies: superseded matches are replaced
+    // by their successor at the superseded memory's rank, dead ones are dropped.
+    let curation = curation_view(db, project_id, include_superseded)?;
+
+    // (memory, combined score, semantic score, keyword score, matched_via)
+    let mut hits: Vec<(Memory, f64, f64, f64, Option<MatchedVia>)> = Vec::new();
+    let mut emitted: HashMap<String, usize> = HashMap::new();
+    for (id, score, semantic_score, keyword_score) in scored_results {
+        if hits.len() >= limit {
+            break;
+        }
+        let (effective_id, matched_via) = match curation.resolve(&id) {
+            Resolution::Keep => (id, None),
+            Resolution::Drop => continue,
+            Resolution::Redirect { successor_id, via } => (successor_id, Some(via)),
+        };
+        if let Some(&index) = emitted.get(&effective_id) {
+            if let Some(via) = matched_via
+                && hits[index].4.is_none()
+            {
+                hits[index].4 = Some(via);
+            }
+            continue;
+        }
+        if let Some(memory) = db.get_memory(&effective_id)? {
+            emitted.insert(effective_id, hits.len());
+            hits.push((memory, score, semantic_score, keyword_score, matched_via));
         }
     }
 
     if json {
         let memories: Vec<serde_json::Value> = hits
             .iter()
-            .map(|(memory, score, semantic_score, keyword_score)| {
-                serde_json::json!({
-                    "memory": memory,
-                    "score": score,
-                    "semantic_score": semantic_score,
-                    "keyword_score": keyword_score,
-                })
-            })
+            .map(
+                |(memory, score, semantic_score, keyword_score, matched_via)| {
+                    serde_json::json!({
+                        "memory": memory,
+                        "score": score,
+                        "semantic_score": semantic_score,
+                        "keyword_score": keyword_score,
+                        "matched_via": matched_via,
+                    })
+                },
+            )
             .collect();
         print_json(&serde_json::json!({
             "project": project_id,
@@ -1046,7 +1155,7 @@ fn cmd_query(
         return Ok(());
     }
 
-    for (memory, score, semantic_score, keyword_score) in &hits {
+    for (memory, score, semantic_score, keyword_score, matched_via) in &hits {
         println!("─────────────────────────────────────────");
         println!("ID: {}", memory.id);
         let branch_str = memory
@@ -1062,6 +1171,12 @@ fn cmd_query(
             "Semantic: {:.3} | Keyword: {:.3}",
             semantic_score, keyword_score
         );
+        if let Some(via) = matched_via {
+            println!(
+                "Replaces: {} — \"{}\"",
+                via.superseded_id, via.superseded_preview
+            );
+        }
         if let Some(summary) = &memory.summary {
             println!("Summary: {}", summary);
         }
@@ -1081,12 +1196,15 @@ fn cmd_query(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_list(
     db: &Database,
     project_id: &str,
     type_filter: Option<&str>,
     limit: usize,
     branch_filter: Option<&str>,
+    status: &str,
+    order: &str,
     json: bool,
 ) -> Result<(), MemoryError> {
     let type_filters: Option<Vec<MemoryType>> =
@@ -1095,18 +1213,51 @@ fn cmd_list(
     // Convert branch filter for query
     let branch_query = branch_filter.map(Some);
 
-    let memories = db.query_memories_with_branch(
+    // Fetch before the status filter narrows the set, so a page of "live" memories is
+    // still a full page when some of the matches turn out to be superseded.
+    let dead = db.get_dead_ids(project_id)?;
+    let supersession = db.get_supersession_map(project_id)?;
+
+    let mut memories = db.query_memories_with_branch(
         project_id,
         type_filters.as_deref(),
         None,
         None,
-        limit,
+        usize::MAX,
         branch_query,
     )?;
+
+    memories.retain(|m| {
+        let is_dead = dead.contains(&m.id);
+        let is_superseded = supersession.is_superseded(&m.id);
+        match status {
+            "dead" => is_dead,
+            "superseded" => is_superseded,
+            "all" => true,
+            _ => !is_dead && !is_superseded,
+        }
+    });
+
+    match order {
+        "created" => memories.sort_by_key(|m| std::cmp::Reverse(m.created_at)),
+        "updated" => memories.sort_by_key(|m| std::cmp::Reverse(m.updated_at)),
+        "accessed" => memories.sort_by_key(|m| std::cmp::Reverse(m.last_accessed_at)),
+        _ => memories.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+    }
+
+    let total = memories.len();
+    memories.truncate(limit);
 
     if json {
         print_json(&serde_json::json!({
             "project": project_id,
+            "status": status,
+            "order": order,
+            "total": total,
             "count": memories.len(),
             "memories": memories,
         }));
@@ -1128,12 +1279,112 @@ fn cmd_list(
             .as_ref()
             .map(|b| format!(" [{}]", b))
             .unwrap_or_default();
+        let status_info = if dead.contains(&memory.id) {
+            " [dead]".to_string()
+        } else if let Some(successor) = supersession.terminal_successor(&memory.id) {
+            format!(" [superseded by {successor}]")
+        } else {
+            String::new()
+        };
         println!(
-            "{} [{:?}]{} {:.2} - {}",
-            memory.id, memory.memory_type, branch_info, memory.relevance_score, summary
+            "{} [{:?}]{}{} {:.2} - {}",
+            memory.id,
+            memory.memory_type,
+            branch_info,
+            status_info,
+            memory.relevance_score,
+            summary
         );
     }
-    println!("\nTotal: {} memories", memories.len());
+    if total > memories.len() {
+        println!("\nShowing {} of {} memories", memories.len(), total);
+    } else {
+        println!("\nTotal: {} memories", total);
+    }
+
+    Ok(())
+}
+
+fn cmd_trash(db: &Database, project_id: &str, limit: usize, json: bool) -> Result<(), MemoryError> {
+    let entries = db.list_trash(project_id, limit)?;
+    let total = db.count_trash(project_id)?;
+
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "trash_id": e.trash_id,
+                    "memory_id": e.memory.id,
+                    "op": e.op,
+                    "trashed_at": e.trashed_at,
+                    "memory": e.memory,
+                    "relationships": e.relationships.len(),
+                })
+            })
+            .collect();
+        print_json(&serde_json::json!({
+            "project": project_id,
+            "total": total,
+            "count": rows.len(),
+            "entries": rows,
+        }));
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+
+    for entry in &entries {
+        let preview: String = entry.memory.content.chars().take(70).collect();
+        println!(
+            "{:>6}  {:<7} {} [{:?}] - {}",
+            entry.trash_id, entry.op, entry.memory.id, entry.memory.memory_type, preview
+        );
+    }
+    println!(
+        "\n{} of {} entries. Restore with `engram-cli restore <memory-id>` or `--trash-id <n>`.",
+        entries.len(),
+        total
+    );
+
+    Ok(())
+}
+
+fn cmd_restore(db: &Database, id: Option<&str>, trash_id: Option<i64>) -> Result<(), MemoryError> {
+    let entry = match (trash_id, id) {
+        (Some(trash_id), _) => db.get_trash_entry(trash_id)?,
+        (None, Some(id)) => db.latest_trash_for_memory(id)?,
+        (None, None) => {
+            eprintln!("Pass a memory ID, or --trash-id from `engram-cli trash`.");
+            std::process::exit(2);
+        }
+    };
+
+    let Some(entry) = entry else {
+        eprintln!("Nothing in the trash matches that.");
+        std::process::exit(1);
+    };
+
+    let outcome = db.restore_trash_entry(entry.trash_id)?;
+    println!(
+        "Restored {} (removed by {}).",
+        outcome.memory.id, outcome.op
+    );
+    if outcome.overwrote_existing {
+        println!("A live memory with that ID was replaced; it is now in the trash itself.");
+    }
+    if outcome.edges_restored > 0 {
+        println!("Reconnected {} relationship(s).", outcome.edges_restored);
+    }
+    if outcome.edges_dropped > 0 {
+        println!(
+            "{} relationship(s) could not be restored: the memory at the other end is gone.",
+            outcome.edges_dropped
+        );
+    }
 
     Ok(())
 }
@@ -1215,10 +1466,17 @@ fn cmd_store(
     pinned: bool,
     global: bool,
     external_artifacts: Option<Vec<String>>,
+    supersedes: &[String],
 ) -> Result<(), MemoryError> {
     let memory_type: MemoryType = type_str
         .parse()
         .map_err(|_| MemoryError::InvalidType(type_str.to_string()))?;
+
+    // Fail before storing anything if a superseded id is wrong.
+    for old_id in supersedes {
+        db.get_memory(old_id)?
+            .ok_or_else(|| MemoryError::NotFound(old_id.clone()))?;
+    }
 
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let now = chrono::Utc::now().timestamp();
@@ -1265,24 +1523,113 @@ fn cmd_store(
         global,
     };
 
-    db.store_memory(&memory)?;
-
-    // Generate and store embedding
     let embedding = embedding_service.embed_memory(memory_type, content)?;
-    db.store_embedding(&id, &embedding, embedding_service.model_version())?;
+
+    // Same path as the MCP `memory_store`, so a memory stored from the CLI gets the same
+    // dedup, provenance, and recoverability as one stored by an agent. Memories this one
+    // supersedes are exempt: they are distinct by assertion.
+    let exempt: std::collections::HashSet<String> = supersedes.iter().cloned().collect();
+    let outcome = tools::store::store_with_dedup_exempting(
+        db,
+        Some(embedding_service),
+        project_id,
+        memory,
+        Some(&embedding),
+        tools::schemas::dedup_threshold(),
+        None,
+        &exempt,
+    )?;
+
+    let (id, merged_with) = match outcome {
+        tools::store::StoreOutcome::Stored(id) => (id, None),
+        tools::store::StoreOutcome::Merged {
+            id,
+            merged_with,
+            similarity,
+        } => (id, Some((merged_with, similarity))),
+        tools::store::StoreOutcome::SkippedSimilar { .. } => {
+            unreachable!("skip_above is None, so nothing can be skipped")
+        }
+    };
+
+    for old_id in supersedes {
+        let rel = Relationship {
+            id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
+            source_id: id.clone(),
+            target_id: old_id.clone(),
+            relation_type: RelationType::Supersedes,
+            strength: 1.0,
+            created_at: now,
+        };
+        db.create_relationship(&rel)?;
+    }
 
     if let Some(ref b) = branch {
         println!("Memory stored: {} (branch: {})", id, b);
     } else {
         println!("Memory stored: {} (global)", id);
     }
+    if let Some((merged_with, similarity)) = &merged_with {
+        println!(
+            "Merged with near-duplicate {merged_with} (similarity {similarity:.2}); its full \
+             content is kept in this memory's provenance and in the trash."
+        );
+    }
+    for old_id in supersedes {
+        println!("Supersedes {old_id}; searches that matched it now return this memory.");
+    }
+
+    // Nothing else tells you that a memory from months ago is about the same subject:
+    // it never surfaced, so it never became a candidate for anything.
+    if supersedes.is_empty() {
+        let mut exclusions: Vec<&str> = vec![id.as_str()];
+        if let Some((merged_with, _)) = &merged_with {
+            exclusions.push(merged_with.as_str());
+        }
+        let candidates =
+            supersession_candidates(db, project_id, &embedding, memory_type, &exclusions)?;
+        if !candidates.is_empty() {
+            println!("\nExisting memories on what looks like the same subject:");
+            for candidate in &candidates {
+                println!(
+                    "  {} ({:.2}) {}",
+                    candidate.id, candidate.similarity, candidate.preview
+                );
+            }
+            println!(
+                "If this replaces one of them, store again with --supersedes <id> instead of \
+                 keeping both."
+            );
+        }
+    }
 
     Ok(())
 }
 
 fn cmd_delete(db: &Database, id: &str) -> Result<(), MemoryError> {
+    // Read it out first: the result of a delete is the only place the caller still sees
+    // what the memory said, and one memory can carry several unrelated claims.
+    let doomed = db.get_memory(id)?;
+
     if db.delete_memory(id)? {
         println!("Deleted memory: {}", id);
+        if let Some(memory) = doomed {
+            println!("\n--- deleted content ---\n{}", memory.content);
+            if let Some(sources) = &memory.merged_from
+                && !sources.is_empty()
+            {
+                println!(
+                    "\nThis memory had absorbed {} other memor{} by dedup:",
+                    sources.len(),
+                    if sources.len() == 1 { "y" } else { "ies" }
+                );
+                for source in sources {
+                    println!("\n  [{}]\n{}", source.id, source.content_or_preview());
+                }
+            }
+            println!("\n--- end ---");
+        }
+        println!("Recoverable with `engram-cli restore {id}` until the trash is swept.");
     } else {
         println!("Memory not found: {}", id);
     }
@@ -1299,10 +1646,19 @@ fn cmd_update(
     tags: Option<String>,
     summary: Option<String>,
     external_artifacts: Option<Vec<String>>,
+    dead: Option<bool>,
+    dead_reason: Option<&str>,
 ) -> Result<(), MemoryError> {
     let mut memory = db
         .get_memory(id)?
         .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+
+    // Content is replaced, not patched, so print what is about to be overwritten.
+    let previous_content = memory.content.clone();
+    let content_replaced = content.as_ref().is_some_and(|new| *new != memory.content);
+    if content_replaced {
+        db.trash_memory(id, db::OP_UPDATE)?;
+    }
 
     memory.updated_at = chrono::Utc::now().timestamp();
 
@@ -1340,7 +1696,21 @@ fn cmd_update(
     }
 
     db.update_memory(&memory)?;
+
+    if let Some(dead) = dead {
+        db.set_dead(id, dead, dead_reason)?;
+    }
+
     println!("Updated memory: {}", id);
+    if content_replaced {
+        println!("\n--- replaced content ---\n{previous_content}\n--- end ---");
+        println!("Recoverable with `engram-cli restore {id}` until the trash is swept.");
+    }
+    match dead {
+        Some(true) => println!("Marked dead: excluded from all retrieval."),
+        Some(false) => println!("Marked live: visible to retrieval again."),
+        None => {}
+    }
 
     Ok(())
 }
@@ -1676,6 +2046,9 @@ fn cmd_projects(db: &Database, current_project: &str, json: bool) -> Result<(), 
 fn cmd_stats(db: &Database, project_id: &str, json: bool) -> Result<(), MemoryError> {
     let stats = db.get_project_stats(project_id)?;
 
+    let dead_count = db.count_dead(project_id)?;
+    let trash_count = db.count_trash(project_id)?;
+
     if json {
         let mut value = serde_json::to_value(&stats)?;
         if let Some(map) = value.as_object_mut() {
@@ -1684,6 +2057,8 @@ fn cmd_stats(db: &Database, project_id: &str, json: bool) -> Result<(), MemoryEr
                 "cluster_count".to_string(),
                 serde_json::json!(db.get_clusters_for_project(project_id)?.len()),
             );
+            map.insert("dead_count".to_string(), serde_json::json!(dead_count));
+            map.insert("trash_count".to_string(), serde_json::json!(trash_count));
         }
         print_json(&value);
         return Ok(());
@@ -1694,6 +2069,12 @@ fn cmd_stats(db: &Database, project_id: &str, json: bool) -> Result<(), MemoryEr
     println!("Relationships: {}", stats.relationship_count);
     println!("Avg relevance: {:.3}", stats.avg_relevance);
     println!("Handoffs: {}", stats.handoff_count);
+    if dead_count > 0 {
+        println!("Dead (excluded from retrieval): {}", dead_count);
+    }
+    if trash_count > 0 {
+        println!("Recoverable in trash: {}", trash_count);
+    }
     if let Some(ts) = stats.latest_handoff_at {
         use chrono::{TimeZone, Utc};
         let dt = Utc.timestamp_opt(ts, 0).single();
@@ -1875,8 +2256,9 @@ fn cmd_prune(
 
     if confirm {
         let ids: Vec<String> = low_relevance.iter().map(|m| m.id.clone()).collect();
-        let deleted = db.delete_memories_batch(&ids)?;
+        let deleted = db.delete_memories_batch_with_op(&ids, db::OP_PRUNE)?;
         println!("Deleted {} memories", deleted);
+        println!("Recoverable with `engram-cli restore <id>` until the trash is swept.");
     } else {
         println!("\nRun with --confirm to delete these memories.");
     }
@@ -2010,11 +2392,7 @@ fn cmd_dedup(
 
             let keeper_id = with_time[0].0.clone();
             for (old_id, _, _) in &with_time[1..] {
-                let old_preview: String = db
-                    .get_memory(old_id)?
-                    .map(|m| m.content.chars().take(100).collect())
-                    .unwrap_or_default();
-                db.merge_memories(&keeper_id, old_id, &old_preview)?;
+                db.merge_memories(&keeper_id, old_id)?;
                 merged_count += 1;
             }
         }
@@ -2068,7 +2446,12 @@ fn cmd_context(
         .collect();
     let memories_map = db.get_memories_batch(&candidate_ids)?;
 
-    let mut selected: Vec<(&Memory, f32)> = Vec::new();
+    // Curation, matching the MCP `memory_context`: context is what an agent treats as
+    // established background, so a superseded conclusion must not reach it unqualified.
+    let curation = curation_view(db, project_id, false)?;
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut selected: Vec<(Memory, f32, Option<MatchedVia>)> = Vec::new();
     for (id, similarity) in &scored {
         if selected.len() >= limit {
             break;
@@ -2087,14 +2470,35 @@ fn cmd_context(
             continue;
         }
 
-        selected.push((memory, *similarity));
+        let (memory, matched_via) = match curation.resolve(&memory.id) {
+            Resolution::Drop => continue,
+            Resolution::Keep => (memory.clone(), None),
+            Resolution::Redirect { successor_id, via } => {
+                let Some(successor) = db.get_memory(&successor_id)? else {
+                    continue;
+                };
+                if !type_filters.is_empty() && !type_filters.contains(&successor.memory_type) {
+                    continue;
+                }
+                (successor, Some(via))
+            }
+        };
+        if !emitted.insert(memory.id.clone()) {
+            continue;
+        }
+
+        selected.push((memory, *similarity, matched_via));
     }
 
     if json {
         let memories: Vec<serde_json::Value> = selected
             .iter()
-            .map(|(memory, similarity)| {
-                serde_json::json!({"memory": memory, "similarity": similarity})
+            .map(|(memory, similarity, matched_via)| {
+                serde_json::json!({
+                    "memory": memory,
+                    "similarity": similarity,
+                    "matched_via": matched_via,
+                })
             })
             .collect();
         print_json(&serde_json::json!({
@@ -2104,7 +2508,7 @@ fn cmd_context(
             "memories": memories,
         }));
     } else {
-        for (index, (memory, similarity)) in selected.iter().enumerate() {
+        for (index, (memory, similarity, matched_via)) in selected.iter().enumerate() {
             if index > 0 {
                 println!();
             }
@@ -2115,6 +2519,9 @@ fn cmd_context(
                 memory.importance,
                 similarity,
             );
+            if let Some(via) = matched_via {
+                println!("(replaces {})", via.superseded_id);
+            }
             if let Some(ref summary) = memory.summary {
                 println!("{}", summary);
             } else {
@@ -2126,7 +2533,7 @@ fn cmd_context(
     // Record access
     let accessed_ids: Vec<String> = selected
         .iter()
-        .map(|(memory, _)| memory.id.clone())
+        .map(|(memory, _, _)| memory.id.clone())
         .collect();
     if !accessed_ids.is_empty() {
         let _ = db.record_access_batch(&accessed_ids);

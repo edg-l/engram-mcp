@@ -58,15 +58,32 @@ impl Database {
 
     /// Delete multiple memories by ID in a single transaction
     pub fn delete_memories_batch(&self, ids: &[String]) -> Result<usize, MemoryError> {
+        self.delete_memories_batch_with_op(ids, crate::db::OP_DELETE)
+    }
+
+    /// Delete several memories, recording which operation destroyed them.
+    ///
+    /// Each memory is snapshotted to the trash in the same transaction as its delete.
+    pub fn delete_memories_batch_with_op(
+        &self,
+        ids: &[String],
+        op: &str,
+    ) -> Result<usize, MemoryError> {
         if ids.is_empty() {
             return Ok(0);
         }
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
 
         let mut total_deleted = 0;
         for id in ids {
+            super::trash::trash_memory_in(&tx, id, op, now)?;
+            tx.execute(
+                "DELETE FROM handoff_sections WHERE memory_id = ?1",
+                params![id],
+            )?;
             let rows = tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
             total_deleted += rows;
         }

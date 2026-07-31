@@ -6,6 +6,7 @@
 #![allow(unused_imports)]
 
 mod adr;
+pub mod curation;
 mod handler;
 mod handoff;
 pub mod schemas;
@@ -16,6 +17,7 @@ pub mod store;
 mod test_utils;
 
 pub use adr::{AdrCreateResult, create_adr};
+pub use curation::{CurationView, MatchedVia, Resolution};
 pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
 pub use schemas::{

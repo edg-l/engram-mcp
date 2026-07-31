@@ -57,7 +57,7 @@ fn test_memory_crud() {
 fn test_migration_creates_tables() {
     let db = Database::open_in_memory().unwrap();
 
-    // Verify schema_version table exists and has version 6
+    // Verify schema_version table exists and is at the latest migration
     let conn = db.conn.lock().unwrap();
     let version: i64 = conn
         .query_row(
@@ -66,7 +66,17 @@ fn test_migration_creates_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
+
+    // Verify the curation sidecars exist
+    for table in ["memory_status", "memory_trash"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} should exist and be empty");
+    }
 
     // Verify memory_clusters table exists
     let count: i64 = conn
@@ -216,8 +226,7 @@ fn test_merge_memories() {
     db.store_memory(&new_mem).unwrap();
 
     // Merge
-    db.merge_memories("mem_new", "mem_old", "Old fact preview")
-        .unwrap();
+    db.merge_memories("mem_new", "mem_old").unwrap();
 
     // Old memory should be deleted
     assert!(db.get_memory("mem_old").unwrap().is_none());
@@ -231,6 +240,70 @@ fn test_merge_memories() {
     let sources = merged.merged_from.unwrap();
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].id, "mem_old");
+    // Provenance must carry what the consumed memory said, not a truncation of it:
+    // the merge deleted the only other copy.
+    assert_eq!(sources[0].content.as_deref(), Some("Old fact"));
+
+    // And the consumed memory is recoverable.
+    let entry = db.latest_trash_for_memory("mem_old").unwrap().unwrap();
+    assert_eq!(entry.op, crate::db::OP_MERGE);
+    assert_eq!(entry.memory.content, "Old fact");
+}
+
+/// A merge that keeps the *existing* memory must still record the consumed one.
+///
+/// The survivor is chosen by scope (a global memory beats a local one), so the consumed
+/// memory is not always the older of the pair. Provenance that described the survivor
+/// would point at content that was never lost.
+#[test]
+fn merge_records_the_memory_that_was_actually_consumed() {
+    let db = Database::open_in_memory().unwrap();
+    let project = crate::memory::Project {
+        id: "merge-side".to_string(),
+        name: "merge-side".to_string(),
+        root_path: None,
+        decay_rate: 0.01,
+        created_at: 0,
+    };
+    db.create_project(&project).unwrap();
+
+    let survivor = Memory {
+        id: "mem_survivor".to_string(),
+        project_id: "merge-side".to_string(),
+        memory_type: MemoryType::Fact,
+        content: "Survivor content".to_string(),
+        summary: None,
+        tags: vec![],
+        importance: 0.5,
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: 0,
+        updated_at: 0,
+        last_accessed_at: 0,
+        branch: None,
+        merged_from: None,
+        external_artifacts: None,
+        pinned: false,
+        global: true,
+    };
+    let consumed = Memory {
+        id: "mem_consumed".to_string(),
+        content: "Consumed content that is longer than a preview would keep".to_string(),
+        global: false,
+        ..survivor.clone()
+    };
+    db.store_memory(&survivor).unwrap();
+    db.store_memory(&consumed).unwrap();
+
+    db.merge_memories("mem_survivor", "mem_consumed").unwrap();
+
+    let merged = db.get_memory("mem_survivor").unwrap().unwrap();
+    let sources = merged.merged_from.unwrap();
+    assert_eq!(sources[0].id, "mem_consumed");
+    assert_eq!(
+        sources[0].content.as_deref(),
+        Some("Consumed content that is longer than a preview would keep")
+    );
 }
 
 #[test]
@@ -1201,4 +1274,202 @@ fn insert_adr_sidecar_explicit_number() {
     // Verify get_adr_by_number works.
     let mid = db.get_adr_by_number("adr-explicit", 7).unwrap();
     assert_eq!(mid, Some("adr-exp-1".to_string()));
+}
+
+// ============================================
+// Curation: supersession, dead status, trash
+// ============================================
+
+/// Build a project with two memories and return the db.
+fn curation_fixture() -> Database {
+    let db = Database::open_in_memory().unwrap();
+    let project = Project {
+        id: "curation".to_string(),
+        name: "curation".to_string(),
+        root_path: None,
+        decay_rate: 0.01,
+        created_at: 0,
+    };
+    db.create_project(&project).unwrap();
+
+    for (id, content) in [
+        ("mem_old", "The collapse is X"),
+        ("mem_new", "The collapse is Y"),
+    ] {
+        let memory = Memory {
+            id: id.to_string(),
+            project_id: "curation".to_string(),
+            memory_type: MemoryType::Decision,
+            content: content.to_string(),
+            summary: None,
+            tags: vec!["collapse".to_string()],
+            importance: 0.7,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: 0,
+            updated_at: 0,
+            last_accessed_at: 0,
+            branch: None,
+            merged_from: None,
+            external_artifacts: None,
+            pinned: false,
+            global: false,
+        };
+        db.store_memory(&memory).unwrap();
+    }
+    db
+}
+
+fn supersedes_edge(db: &Database, newer: &str, older: &str) {
+    let rel = crate::memory::Relationship {
+        id: format!("rel_{newer}_{older}"),
+        source_id: newer.to_string(),
+        target_id: older.to_string(),
+        relation_type: crate::memory::RelationType::Supersedes,
+        strength: 1.0,
+        created_at: 0,
+    };
+    db.create_relationship(&rel).unwrap();
+}
+
+#[test]
+fn supersession_map_reads_the_edge_direction() {
+    let db = curation_fixture();
+    supersedes_edge(&db, "mem_new", "mem_old");
+
+    let map = db.get_supersession_map("curation").unwrap();
+    assert!(
+        map.is_superseded("mem_old"),
+        "the target of the edge is the superseded one"
+    );
+    assert!(!map.is_superseded("mem_new"));
+    assert_eq!(map.terminal_successor("mem_old"), Some("mem_new"));
+}
+
+#[test]
+fn dead_status_round_trips() {
+    let db = curation_fixture();
+    assert!(!db.is_dead("mem_old").unwrap());
+
+    db.set_dead("mem_old", true, Some("service retired"))
+        .unwrap();
+    assert!(db.is_dead("mem_old").unwrap());
+    assert_eq!(db.count_dead("curation").unwrap(), 1);
+    assert!(db.get_dead_ids("curation").unwrap().contains("mem_old"));
+
+    db.set_dead("mem_old", false, None).unwrap();
+    assert!(!db.is_dead("mem_old").unwrap());
+    assert_eq!(db.count_dead("curation").unwrap(), 0);
+}
+
+#[test]
+fn delete_puts_the_memory_in_the_trash() {
+    let db = curation_fixture();
+    db.delete_memory("mem_old").unwrap();
+
+    assert!(db.get_memory("mem_old").unwrap().is_none());
+    let entry = db.latest_trash_for_memory("mem_old").unwrap().unwrap();
+    assert_eq!(entry.op, crate::db::OP_DELETE);
+    assert_eq!(entry.memory.content, "The collapse is X");
+    assert_eq!(db.count_trash("curation").unwrap(), 1);
+}
+
+#[test]
+fn restore_brings_back_content_embedding_and_edges() {
+    let db = curation_fixture();
+    supersedes_edge(&db, "mem_new", "mem_old");
+    db.store_embedding("mem_old", &[0.25_f32; 256], "test-model")
+        .unwrap();
+
+    db.delete_memory("mem_old").unwrap();
+    assert!(db.get_embedding("mem_old").unwrap().is_none());
+    assert!(
+        db.get_supersession_map("curation")
+            .unwrap()
+            .terminal_successor("mem_old")
+            .is_none()
+    );
+
+    let entry = db.latest_trash_for_memory("mem_old").unwrap().unwrap();
+    let outcome = db.restore_trash_entry(entry.trash_id).unwrap();
+
+    assert_eq!(outcome.edges_restored, 1);
+    assert_eq!(outcome.edges_dropped, 0);
+    assert!(!outcome.overwrote_existing);
+
+    let restored = db.get_memory("mem_old").unwrap().unwrap();
+    assert_eq!(restored.content, "The collapse is X");
+    assert_eq!(db.get_embedding("mem_old").unwrap().unwrap().len(), 256);
+    // The supersedes edge is back, so retrieval will redirect again.
+    let map = db.get_supersession_map("curation").unwrap();
+    assert_eq!(map.terminal_successor("mem_old"), Some("mem_new"));
+    // The entry is consumed.
+    assert!(db.latest_trash_for_memory("mem_old").unwrap().is_none());
+}
+
+/// An edge whose other end was also deleted cannot be recreated; the restore must say so
+/// rather than fail or silently drop it.
+#[test]
+fn restore_reports_edges_it_could_not_reconnect() {
+    let db = curation_fixture();
+    supersedes_edge(&db, "mem_new", "mem_old");
+
+    db.delete_memory("mem_old").unwrap();
+    db.delete_memory("mem_new").unwrap();
+
+    let entry = db.latest_trash_for_memory("mem_old").unwrap().unwrap();
+    let outcome = db.restore_trash_entry(entry.trash_id).unwrap();
+    assert_eq!(outcome.edges_restored, 0);
+    assert_eq!(outcome.edges_dropped, 1);
+}
+
+#[test]
+fn restoring_over_a_live_memory_snapshots_it_first() {
+    let db = curation_fixture();
+
+    // Simulate a content-replacing update: snapshot, then overwrite.
+    db.trash_memory("mem_old", crate::db::OP_UPDATE).unwrap();
+    let mut edited = db.get_memory("mem_old").unwrap().unwrap();
+    edited.content = "A reconstruction that lost the tail".to_string();
+    db.update_memory(&edited).unwrap();
+
+    let entry = db.latest_trash_for_memory("mem_old").unwrap().unwrap();
+    let outcome = db.restore_trash_entry(entry.trash_id).unwrap();
+
+    assert!(outcome.overwrote_existing);
+    assert_eq!(
+        db.get_memory("mem_old").unwrap().unwrap().content,
+        "The collapse is X"
+    );
+    // The reconstruction is itself recoverable, so the restore is undoable.
+    let latest = db.latest_trash_for_memory("mem_old").unwrap().unwrap();
+    assert_eq!(latest.memory.content, "A reconstruction that lost the tail");
+}
+
+#[test]
+fn sweep_trash_respects_the_retention_window() {
+    let db = curation_fixture();
+    db.delete_memory("mem_old").unwrap();
+    assert_eq!(db.count_trash("curation").unwrap(), 1);
+
+    // A retention window that has not elapsed keeps the entry.
+    assert_eq!(db.sweep_trash(30).unwrap(), 0);
+    assert_eq!(db.count_trash("curation").unwrap(), 1);
+
+    // Zero or negative means keep forever, not delete everything.
+    assert_eq!(db.sweep_trash(0).unwrap(), 0);
+    assert_eq!(db.count_trash("curation").unwrap(), 1);
+}
+
+#[test]
+fn wipe_is_recoverable() {
+    let db = curation_fixture();
+    let wiped = db.delete_project_data("curation").unwrap();
+    assert_eq!(wiped, 2);
+    assert_eq!(db.count_trash("curation").unwrap(), 2);
+
+    let entry = db.latest_trash_for_memory("mem_new").unwrap().unwrap();
+    assert_eq!(entry.op, crate::db::OP_WIPE);
+    db.restore_trash_entry(entry.trash_id).unwrap();
+    assert!(db.get_memory("mem_new").unwrap().is_some());
 }

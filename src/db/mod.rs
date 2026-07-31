@@ -14,8 +14,15 @@ mod handoffs;
 mod memories;
 mod migrations;
 mod relationships;
+mod status;
+mod trash;
 
 pub use handoffs::encode_section_embeddings;
+pub use status::SupersessionMap;
+// Each binary compiles these modules separately, so a re-export used by only one of them
+// reads as unused in the other.
+#[allow(unused_imports)]
+pub use trash::{OP_DELETE, OP_MERGE, OP_PRUNE, OP_UPDATE, OP_WIPE, RestoreOutcome, TrashEntry};
 
 #[cfg(test)]
 mod tests;
@@ -143,6 +150,29 @@ fn register_math_scalar_functions(conn: &Connection) -> Result<(), rusqlite::Err
         |ctx| {
             let x: f64 = ctx.get(0)?;
             Ok(x.ln())
+        },
+    )?;
+    // RELEVANCE(days_since_access, importance, access_count, decay_rate).
+    //
+    // Makes `crate::decay::relevance_from_parts` the only definition of the decay
+    // algorithm: `update_relevance_scores` calls this rather than reimplementing the
+    // formula in SQL, so the clamps and the usage-boost shape cannot drift between the
+    // two.
+    conn.create_scalar_function(
+        "RELEVANCE",
+        4,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let days: f64 = ctx.get(0)?;
+            let importance: f64 = ctx.get(1)?;
+            let access_count: i64 = ctx.get(2)?;
+            let decay_rate: f64 = ctx.get(3)?;
+            Ok(crate::decay::relevance_from_parts(
+                days,
+                importance,
+                access_count,
+                decay_rate,
+            ))
         },
     )?;
     Ok(())

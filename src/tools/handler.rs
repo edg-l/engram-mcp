@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -19,14 +19,18 @@ use crate::memory::{
 use crate::summarize::{generate_summary, should_auto_summarize};
 
 use super::adr::create_adr;
+use super::curation::{
+    CurationView, MatchedVia, Resolution, SupersessionCandidate, supersession_candidates,
+};
 use super::handoff::{create_handoff, handoff_section_key_texts, resume_handoff, search_handoffs};
 use super::schemas::{
     AdrCreateInput, AdrExportInput, AdrListInput, AdrShowInput, AdrUpdateStatusInput,
     HandoffCreateInput, HandoffResumeInput, HandoffSearchInput, MemoryContextInput,
     MemoryDedupInput, MemoryDeleteBatchInput, MemoryDeleteInput, MemoryExportInput,
-    MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryPromoteInput, MemoryPruneInput,
-    MemoryQueryInput, MemoryStatsInput, MemoryStoreBatchInput, MemoryStoreInput, MemoryUpdateInput,
-    ToolProfile, dedup_threshold, get_tool_definitions_for,
+    MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryListInput, MemoryPromoteInput,
+    MemoryPruneInput, MemoryQueryInput, MemoryRestoreInput, MemoryStatsInput,
+    MemoryStoreBatchInput, MemoryStoreInput, MemoryTrashInput, MemoryUpdateInput, ToolProfile,
+    dedup_threshold, get_tool_definitions_for,
 };
 use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
@@ -99,6 +103,13 @@ pub struct MemoryStoreResult {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_info: Option<MergeInfo>,
+    /// Memories this store superseded, as requested via `supersedes`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<String>,
+    /// Existing memories close enough to be about the same subject but not close enough
+    /// to merge. Reported so the caller can supersede one deliberately; never automatic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_supersedes: Vec<SupersessionCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -315,6 +326,9 @@ impl ToolHandler {
             "memory_stats" => self.memory_stats(arguments),
             "memory_projects" => self.memory_projects(),
             "memory_context" => self.memory_context(arguments),
+            "memory_list" => self.memory_list(arguments),
+            "memory_trash" => self.memory_trash(arguments),
+            "memory_restore" => self.memory_restore(arguments),
             "memory_prune" => self.memory_prune(arguments),
             "memory_promote" => self.memory_promote(arguments),
             "memory_dedup" => self.memory_dedup(arguments),
@@ -331,7 +345,7 @@ impl ToolHandler {
     }
 
     fn memory_store(&self, arguments: Value) -> Result<Value, MemoryError> {
-        use super::store::{StoreOutcome, store_with_dedup};
+        use super::store::{StoreOutcome, store_with_dedup_exempting};
 
         let input: MemoryStoreInput = parse_args("memory_store", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
@@ -397,8 +411,16 @@ impl ToolHandler {
         // Handoffs are session snapshots; bypass dedup.
         // Pass None for embedding_service to skip dedup for handoffs.
         let dedup_thr = dedup_threshold();
+        // Memories the caller has explicitly tied to this one are distinct from it by
+        // assertion, so dedup must not collapse them together.
+        let dedup_exempt: HashSet<String> = input
+            .related_to
+            .iter()
+            .chain(input.supersedes.iter())
+            .cloned()
+            .collect();
         let outcome = if memory_type != MemoryType::Handoff {
-            store_with_dedup(
+            store_with_dedup_exempting(
                 &self.db,
                 Some(&self.embedding),
                 &project,
@@ -406,6 +428,7 @@ impl ToolHandler {
                 Some(&embedding),
                 dedup_thr,
                 None, // MCP path never skips — always merges duplicates
+                &dedup_exempt,
             )?
         } else {
             // Handoff: store directly, bypassing dedup.
@@ -454,6 +477,47 @@ impl ToolHandler {
             self.db.create_relationship(&rel)?;
         }
 
+        // Record what this memory replaces. The edge is the only record of supersession;
+        // retrieval reads it to redirect the superseded memory's matches here.
+        let mut superseded: Vec<String> = Vec::new();
+        for old_id in &input.supersedes {
+            if self.db.get_memory(old_id)?.is_none() {
+                return Err(MemoryError::NotFound(old_id.clone()));
+            }
+            let rel = Relationship {
+                id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
+                source_id: final_id.clone(),
+                target_id: old_id.clone(),
+                relation_type: RelationType::Supersedes,
+                strength: 1.0,
+                created_at: now,
+            };
+            self.db.create_relationship(&rel)?;
+            superseded.push(old_id.clone());
+        }
+
+        // Surface near-duplicates that were too far apart to merge but close enough to be
+        // about the same thing. The similarities are already computed for dedup and
+        // otherwise thrown away; a caller storing "X is now Y" has no other way to learn
+        // that a months-old memory says "X is Z", because that memory never surfaced.
+        // A memory the store just merged with is reported as a merge, not as something
+        // that might need superseding.
+        let mut candidate_exclusions: Vec<&str> = vec![final_id.as_str()];
+        if let Some(info) = &merge_info {
+            candidate_exclusions.push(info.merged_with.as_str());
+        }
+        let possible_supersedes = if superseded.is_empty() {
+            supersession_candidates(
+                &self.db,
+                &project,
+                &embedding,
+                memory_type,
+                &candidate_exclusions,
+            )?
+        } else {
+            Vec::new()
+        };
+
         // Assign to cluster
         let _cluster_id = self.assign_to_cluster(
             &project,
@@ -478,6 +542,8 @@ impl ToolHandler {
             project,
             branch,
             merge_info,
+            superseded,
+            possible_supersedes,
         }))
     }
 
@@ -510,20 +576,19 @@ impl ToolHandler {
                 branch_filter,
             )?;
 
-            let results: Vec<MemoryWithScore> = memories
+            let candidates: HashMap<String, Memory> =
+                memories.iter().map(|m| (m.id.clone(), m.clone())).collect();
+            let ranked: Vec<(String, f64, f64, f64, f64)> = memories
+                .iter()
+                .map(|m| (m.id.clone(), m.relevance_score, 0.0, 0.0, 0.0))
+                .collect();
+            let curation = self.curation_view(&project, &candidates, input.include_superseded)?;
+
+            let results: Vec<MemoryWithScore> = self
+                .apply_curation(&curation, &candidates, ranked)?
                 .into_iter()
                 .skip(input.offset)
                 .take(input.limit)
-                .map(|m| {
-                    let score = m.relevance_score;
-                    MemoryWithScore {
-                        memory: m,
-                        score,
-                        semantic_score: 0.0,
-                        keyword_score: 0.0,
-                        rrf_score: 0.0,
-                    }
-                })
                 .collect();
 
             return Ok(json!(MemoryQueryResult {
@@ -731,28 +796,16 @@ impl ToolHandler {
         // Sort by final score descending.
         scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply pagination and build final results.
-        let mut results: Vec<MemoryWithScore> = Vec::new();
-        let mut result_ids: Vec<String> = Vec::new();
-
-        for (id, score, semantic_score, keyword_score, rrf_score) in scored_results
+        // Replace superseded matches with what superseded them, and drop dead ones.
+        // Runs before pagination so a page is never short because entries were suppressed.
+        let curation = self.curation_view(&project, &memories_map, input.include_superseded)?;
+        let results: Vec<MemoryWithScore> = self
+            .apply_curation(&curation, &memories_map, scored_results)?
             .into_iter()
             .skip(input.offset)
             .take(input.limit)
-        {
-            if let Some(memory) = memories_map.get(&id) {
-                result_ids.push(id);
-                let mut memory_clone = memory.clone();
-                memory_clone.access_count += 1;
-                results.push(MemoryWithScore {
-                    memory: memory_clone,
-                    score,
-                    semantic_score,
-                    keyword_score,
-                    rrf_score,
-                });
-            }
-        }
+            .collect();
+        let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
 
         // Batch record access for all result memories
         if !result_ids.is_empty() {
@@ -765,6 +818,123 @@ impl ToolHandler {
         }))
     }
 
+    /// Materialize a ranked id list into results, applying curation status.
+    ///
+    /// Dead matches are dropped, superseded matches are replaced by their successor at
+    /// the superseded memory's rank, and a successor reached both ways appears once.
+    /// `ranked` is `(memory_id, score, semantic_score, keyword_score, rrf_score)` in
+    /// descending score order; `candidates` supplies already-loaded memories, and
+    /// anything else is read from the database.
+    fn apply_curation(
+        &self,
+        curation: &CurationView,
+        candidates: &HashMap<String, Memory>,
+        ranked: Vec<(String, f64, f64, f64, f64)>,
+    ) -> Result<Vec<MemoryWithScore>, MemoryError> {
+        let mut results: Vec<MemoryWithScore> = Vec::new();
+        // Effective id -> index in `results`, so a successor reached both on its own merit
+        // and by redirect appears once, at its better rank.
+        let mut emitted: HashMap<String, usize> = HashMap::new();
+
+        for (id, score, semantic_score, keyword_score, rrf_score) in ranked {
+            let (effective_id, matched_via) = match curation.resolve(&id) {
+                Resolution::Keep => (id, None),
+                Resolution::Drop => continue,
+                Resolution::Redirect { successor_id, via } => (successor_id, Some(via)),
+            };
+
+            if let Some(&index) = emitted.get(&effective_id) {
+                // Already present. Keep the annotation if this is the first redirect into
+                // it, so the caller still learns that the superseded memory matched.
+                if let Some(via) = matched_via
+                    && results[index].matched_via.is_none()
+                {
+                    results[index].matched_via = Some(via);
+                }
+                continue;
+            }
+
+            // A redirect target need not have been a candidate itself.
+            let memory = match candidates.get(&effective_id) {
+                Some(m) => m.clone(),
+                None => match self.db.get_memory(&effective_id)? {
+                    Some(m) => m,
+                    None => continue,
+                },
+            };
+
+            emitted.insert(effective_id, results.len());
+            let mut memory_clone = memory;
+            memory_clone.access_count += 1;
+            results.push(MemoryWithScore {
+                memory: memory_clone,
+                score,
+                semantic_score,
+                keyword_score,
+                rrf_score,
+                matched_via,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Map a `memory_context` candidate to the memory that should actually be shown.
+    ///
+    /// Returns `None` when the hit should be dropped: the memory is dead, its successor
+    /// is dead or missing, the successor fails the caller's type filter, or the successor
+    /// was already emitted for an earlier hit. `emitted` tracks the ids already shown.
+    fn resolve_context_hit(
+        &self,
+        curation: &CurationView,
+        candidate: &Memory,
+        type_filters: &[MemoryType],
+        emitted: &mut HashSet<String>,
+    ) -> Result<Option<(Memory, Option<MatchedVia>)>, MemoryError> {
+        let (memory, via) = match curation.resolve(&candidate.id) {
+            Resolution::Drop => return Ok(None),
+            Resolution::Keep => (candidate.clone(), None),
+            Resolution::Redirect { successor_id, via } => {
+                let Some(successor) = self.db.get_memory(&successor_id)? else {
+                    return Ok(None);
+                };
+                // The filter was checked against the superseded memory; the successor is a
+                // different memory and has to satisfy it on its own terms.
+                if !type_filters.is_empty() && !type_filters.contains(&successor.memory_type) {
+                    return Ok(None);
+                }
+                (successor, Some(via))
+            }
+        };
+
+        if !emitted.insert(memory.id.clone()) {
+            return Ok(None);
+        }
+        Ok(Some((memory, via)))
+    }
+
+    /// Curation status for a retrieval call.
+    ///
+    /// `raw` short-circuits to an empty view: superseded and dead memories then come back
+    /// untouched, which is what curation needs and what ordinary retrieval must not do.
+    /// Previews are seeded from the candidate set so a redirect can say what it replaced
+    /// without a second round of lookups.
+    fn curation_view(
+        &self,
+        project: &str,
+        candidates: &HashMap<String, Memory>,
+        raw: bool,
+    ) -> Result<CurationView, MemoryError> {
+        if raw {
+            return Ok(CurationView::empty());
+        }
+        let mut view = CurationView::load(&self.db, project)?;
+        for (id, memory) in candidates {
+            view.note_preview(id, &memory.content);
+        }
+        Ok(view)
+    }
+
     fn memory_update(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryUpdateInput = parse_args("memory_update", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
@@ -773,6 +943,17 @@ impl ToolHandler {
             .db
             .get_memory(&input.id)?
             .ok_or_else(|| MemoryError::NotFound(input.id.clone()))?;
+
+        // Content is replaced wholesale, not patched, so the previous version is gone the
+        // moment the row is written. Snapshot it and hand it back to the caller.
+        let previous = memory.clone();
+        let content_replaced = input
+            .content
+            .as_ref()
+            .is_some_and(|new| *new != memory.content);
+        if content_replaced {
+            self.db.trash_memory(&input.id, crate::db::OP_UPDATE)?;
+        }
 
         let now = chrono::Utc::now().timestamp();
         memory.updated_at = now;
@@ -840,6 +1021,11 @@ impl ToolHandler {
             memory.pinned = pinned;
         }
 
+        if let Some(dead) = input.dead {
+            self.db
+                .set_dead(&input.id, dead, input.dead_reason.as_deref())?;
+        }
+
         // external_artifacts update semantics:
         //   - input.external_artifacts is None  -> preserve existing (omit = keep)
         //   - input.external_artifacts is Some([]) -> clear (empty array = delete)
@@ -875,12 +1061,24 @@ impl ToolHandler {
         // Invalidate search cache since we updated data
         self.invalidate_search_cache(&project);
 
-        Ok(json!({"success": true, "message": "Memory updated successfully"}))
+        Ok(json!({
+            "success": true,
+            "message": "Memory updated successfully",
+            "content_replaced": content_replaced,
+            "recoverable": content_replaced,
+            "dead": self.db.is_dead(&input.id)?,
+            "previous": previous,
+        }))
     }
 
     fn memory_delete(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryDeleteInput = parse_args("memory_delete", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
+
+        // Read the memory before it goes so the result can carry what was destroyed.
+        // A memory can hold several claims of different lifetimes, and only some of them
+        // are recoverable from the repository; the caller cannot check what it cannot see.
+        let doomed = self.db.get_memory(&input.id)?;
 
         // Remove from cluster before deleting
         if let Ok(Some(cluster_id)) = self.db.remove_from_cluster(&input.id) {
@@ -904,7 +1102,12 @@ impl ToolHandler {
         if deleted {
             // Invalidate search cache since we deleted data
             self.invalidate_search_cache(&project);
-            Ok(json!({"success": true, "message": "Memory deleted successfully"}))
+            Ok(json!({
+                "success": true,
+                "message": "Memory deleted successfully",
+                "recoverable": true,
+                "deleted": doomed,
+            }))
         } else {
             Ok(json!({"success": false, "message": "Memory not found"}))
         }
@@ -1180,6 +1383,15 @@ impl ToolHandler {
         let input: MemoryDeleteBatchInput = parse_args("memory_delete_batch", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
 
+        // Same as `memory_delete`: read the memories out before destroying them so the
+        // result says what was lost. Batch especially, since one id can stand for several
+        // claims that dedup collapsed into a single memory.
+        let doomed: Vec<Memory> = input
+            .ids
+            .iter()
+            .filter_map(|id| self.db.get_memory(id).ok().flatten())
+            .collect();
+
         // Remove from clusters before deleting
         let mut affected_clusters: HashSet<String> = HashSet::new();
         for id in &input.ids {
@@ -1214,6 +1426,8 @@ impl ToolHandler {
         Ok(json!({
             "success": true,
             "deleted": deleted,
+            "recoverable": true,
+            "memories": doomed,
             "message": format!("{} memories deleted", deleted)
         }))
     }
@@ -1515,6 +1729,8 @@ impl ToolHandler {
             "global_count": stats.global_count,
             "handoff_count": stats.handoff_count,
             "latest_handoff_at": stats.latest_handoff_at,
+            "dead_count": self.db.count_dead(&project)?,
+            "trash_count": self.db.count_trash(&project)?,
         }))
     }
 
@@ -1549,6 +1765,13 @@ impl ToolHandler {
         // Parse type filters
         let type_filters: Vec<MemoryType> =
             input.types.iter().filter_map(|t| t.parse().ok()).collect();
+
+        // Curation status for this project, shared by both retrieval branches. Context is
+        // the tool that feeds an agent its background, so a superseded conclusion reaching
+        // it unqualified is the worst case for stale memory; `emitted` keeps a successor
+        // from appearing twice when several of its predecessors match.
+        let curation = self.curation_view(&project, &HashMap::new(), false)?;
+        let mut emitted: HashSet<String> = HashSet::new();
 
         // Pre-filter candidate cap (configurable via ENGRAM_MAX_CANDIDATES, default 500)
         let max_candidates: usize = std::env::var("ENGRAM_MAX_CANDIDATES")
@@ -1795,7 +2018,17 @@ impl ToolHandler {
                             continue;
                         }
 
-                        memory_ids.push(id);
+                        let Some((memory, matched_via)) = self.resolve_context_hit(
+                            &curation,
+                            memory,
+                            &type_filters,
+                            &mut emitted,
+                        )?
+                        else {
+                            continue;
+                        };
+
+                        memory_ids.push(memory.id.clone());
                         memories.push(json!({
                             "id": memory.id,
                             "type": memory.memory_type.as_str(),
@@ -1805,6 +2038,7 @@ impl ToolHandler {
                             "importance": memory.importance,
                             "relevance_score": memory.relevance_score,
                             "similarity": similarity,
+                            "matched_via": matched_via,
                             "cluster_id": cluster_id,
                         }));
                         cluster_count += 1;
@@ -1994,7 +2228,13 @@ impl ToolHandler {
                         break;
                     }
 
-                    memory_ids.push(id);
+                    let Some((memory, matched_via)) =
+                        self.resolve_context_hit(&curation, memory, &type_filters, &mut emitted)?
+                    else {
+                        continue;
+                    };
+
+                    memory_ids.push(memory.id.clone());
                     memories.push(json!({
                         "id": memory.id,
                         "type": memory.memory_type.as_str(),
@@ -2004,6 +2244,7 @@ impl ToolHandler {
                         "importance": memory.importance,
                         "relevance_score": memory.relevance_score,
                         "similarity": similarity,
+                        "matched_via": matched_via,
                     }));
                 }
             }
@@ -2019,6 +2260,167 @@ impl ToolHandler {
                 "retrieval_mode": "flat",
             }))
         }
+    }
+
+    /// Enumerate memories without going through search.
+    ///
+    /// Retrieval is the wrong instrument for curation: it only shows what a query
+    /// surfaces, so the memories most in need of attention — the ones nothing ever
+    /// matches — are exactly the ones it hides. This lists them directly, and unlike
+    /// query it can show superseded and dead memories.
+    fn memory_list(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryListInput = parse_args("memory_list", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
+
+        let type_filters: Vec<MemoryType> =
+            input.types.iter().filter_map(|t| t.parse().ok()).collect();
+
+        let dead = self.db.get_dead_ids(&project)?;
+        let supersession = self.db.get_supersession_map(&project)?;
+
+        let mut memories: Vec<Memory> = self
+            .db
+            .get_all_memories_for_project(&project)?
+            .into_iter()
+            .filter(|m| type_filters.is_empty() || type_filters.contains(&m.memory_type))
+            .filter(|m| input.tags.is_empty() || input.tags.iter().any(|t| m.tags.contains(t)))
+            .filter(|m| {
+                let is_dead = dead.contains(&m.id);
+                let is_superseded = supersession.is_superseded(&m.id);
+                match input.status.as_str() {
+                    "dead" => is_dead,
+                    "superseded" => is_superseded,
+                    "all" => true,
+                    // "live" and anything unrecognized: only what retrieval would return.
+                    _ => !is_dead && !is_superseded,
+                }
+            })
+            .collect();
+
+        match input.order.as_str() {
+            "created" => memories.sort_by_key(|m| std::cmp::Reverse(m.created_at)),
+            "updated" => memories.sort_by_key(|m| std::cmp::Reverse(m.updated_at)),
+            "accessed" => memories.sort_by_key(|m| std::cmp::Reverse(m.last_accessed_at)),
+            _ => memories.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        }
+
+        let total = memories.len();
+        let rows: Vec<Value> = memories
+            .into_iter()
+            .skip(input.offset)
+            .take(input.limit)
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "type": m.memory_type.as_str(),
+                    "content": m.content.chars().take(input.content_length).collect::<String>(),
+                    "tags": m.tags,
+                    "importance": m.importance,
+                    "relevance_score": m.relevance_score,
+                    "access_count": m.access_count,
+                    "created_at": m.created_at,
+                    "updated_at": m.updated_at,
+                    "pinned": m.pinned,
+                    "branch": m.branch,
+                    "dead": dead.contains(&m.id),
+                    "superseded_by": supersession.terminal_successor(&m.id),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "project": project,
+            "status": input.status,
+            "order": input.order,
+            "total": total,
+            "count": rows.len(),
+            "offset": input.offset,
+            "memories": rows,
+        }))
+    }
+
+    /// List recoverable snapshots of destroyed memories.
+    fn memory_trash(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryTrashInput = parse_args("memory_trash", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
+
+        let entries = self.db.list_trash(&project, input.limit)?;
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "trash_id": e.trash_id,
+                    "memory_id": e.memory.id,
+                    "op": e.op,
+                    "trashed_at": e.trashed_at,
+                    "type": e.memory.memory_type.as_str(),
+                    "preview": e.memory.content.chars().take(200).collect::<String>(),
+                    "content_chars": e.memory.content.chars().count(),
+                    "relationships": e.relationships.len(),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "project": project,
+            "count": rows.len(),
+            "total": self.db.count_trash(&project)?,
+            "entries": rows,
+        }))
+    }
+
+    /// Put a trashed memory back.
+    fn memory_restore(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: MemoryRestoreInput = parse_args("memory_restore", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
+
+        let entry = match (input.trash_id, input.id.as_deref()) {
+            (Some(trash_id), _) => self.db.get_trash_entry(trash_id)?,
+            (None, Some(id)) => self.db.latest_trash_for_memory(id)?,
+            (None, None) => {
+                return Err(MemoryError::InvalidArguments {
+                    tool: "memory_restore".to_string(),
+                    message: "needs either `id` (restores its most recent snapshot) or \
+                              `trash_id` (restores one exact snapshot)"
+                        .to_string(),
+                    received: "neither".to_string(),
+                });
+            }
+        };
+
+        let entry = entry.ok_or_else(|| {
+            MemoryError::NotFound(
+                input
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("trash entry {:?}", input.trash_id)),
+            )
+        })?;
+
+        let outcome = self.db.restore_trash_entry(entry.trash_id)?;
+        self.invalidate_search_cache(&project);
+
+        Ok(json!({
+            "success": true,
+            "id": outcome.memory.id,
+            "trashed_by": outcome.op,
+            "overwrote_existing": outcome.overwrote_existing,
+            "edges_restored": outcome.edges_restored,
+            "edges_dropped": outcome.edges_dropped,
+            "memory": outcome.memory,
+            "message": if outcome.edges_dropped > 0 {
+                format!(
+                    "Memory restored. {} relationship(s) could not be restored because the memory at the other end is gone.",
+                    outcome.edges_dropped
+                )
+            } else {
+                "Memory restored".to_string()
+            },
+        }))
     }
 
     fn memory_prune(&self, arguments: Value) -> Result<Value, MemoryError> {
@@ -2067,7 +2469,9 @@ impl ToolHandler {
         if input.confirm {
             // Actually delete
             let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
-            let deleted = self.db.delete_memories_batch(&ids)?;
+            let deleted = self
+                .db
+                .delete_memories_batch_with_op(&ids, crate::db::OP_PRUNE)?;
 
             // Invalidate cache since we deleted data
             self.invalidate_search_cache(&project);
@@ -2158,6 +2562,29 @@ impl ToolHandler {
             .collect();
 
         // Build duplicate groups: for each pair with similarity >= threshold and same type
+        // Pairs the graph says are deliberately distinct. A `derived_from` edge is the
+        // shape of "this lesson came out of that finding": two memories on one subject
+        // with different lifetimes, which is exactly what must not be collapsed back into
+        // one record. `supersedes` pairs are the old and new answer to the same question,
+        // and merging them would erase the redirect.
+        let deliberate_pairs: HashSet<(String, String)> = self
+            .db
+            .get_all_relationships_for_project(&project)?
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.relation_type,
+                    RelationType::DerivedFrom | RelationType::Supersedes
+                )
+            })
+            .flat_map(|r| {
+                [
+                    (r.source_id.clone(), r.target_id.clone()),
+                    (r.target_id, r.source_id),
+                ]
+            })
+            .collect();
+
         let mut processed: HashSet<String> = HashSet::new();
         let mut groups: Vec<Vec<(String, f32)>> = Vec::new(); // groups of (id, similarity_to_first)
 
@@ -2181,6 +2608,9 @@ impl ToolHandler {
 
             for (id_j, vec_j) in all_embeddings.iter().skip(i + 1) {
                 if processed.contains(id_j) {
+                    continue;
+                }
+                if deliberate_pairs.contains(&(id_i.clone(), id_j.clone())) {
                     continue;
                 }
 
@@ -2259,11 +2689,7 @@ impl ToolHandler {
 
                 let keeper_id = sorted[0].0.clone();
                 for (old_id, _, _) in &sorted[1..] {
-                    let old_preview: String = all_memories
-                        .get(old_id)
-                        .map(|m| m.content.chars().take(100).collect())
-                        .unwrap_or_default();
-                    self.db.merge_memories(&keeper_id, old_id, &old_preview)?;
+                    self.db.merge_memories(&keeper_id, old_id)?;
                     merged_count += 1;
                 }
             }
@@ -2735,6 +3161,273 @@ mod tests {
         let (first_key, first_vec) = &retrieved_vecs[0];
         assert_eq!(first_key, "summary");
         assert!((first_vec[0] - dummy_vec(0.1)[0]).abs() < 1e-5);
+    }
+
+    /// A superseded memory must not come back from search, and its match must not vanish
+    /// either: the successor takes its place, marked with what it replaced.
+    ///
+    /// This is the whole point of supersession being a retrieval concept rather than a
+    /// note in the content. Marking a memory superseded in its own text leaves it ranking
+    /// exactly where it did, which is what pushes people to delete it instead.
+    #[test]
+    fn superseded_memory_is_replaced_by_its_successor_in_query() {
+        let db = Database::open_in_memory().unwrap();
+        let project = "supersede-query";
+        db.get_or_create_project(project, "Test").unwrap();
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let old = handler
+            .memory_store(json!({
+                "content": "The day-26 collapse is caused by connection pool exhaustion.",
+                "type": "decision",
+                "tags": ["collapse"],
+            }))
+            .unwrap();
+        let old_id = old["id"].as_str().unwrap().to_string();
+
+        let new = handler
+            .memory_store(json!({
+                "content": "The day-26 collapse is caused by a clock skew in the scheduler, not the pool.",
+                "type": "decision",
+                "tags": ["collapse"],
+                "supersedes": [old_id.clone()],
+            }))
+            .unwrap();
+        let new_id = new["id"].as_str().unwrap().to_string();
+        assert_eq!(new["superseded"][0].as_str(), Some(old_id.as_str()));
+
+        let results = handler
+            .memory_query(json!({"query": "what causes the day-26 collapse", "limit": 10}))
+            .unwrap();
+        let memories = results["memories"].as_array().unwrap();
+        assert!(!memories.is_empty(), "the query must not return silence");
+
+        let ids: Vec<&str> = memories
+            .iter()
+            .map(|m| m["memory"]["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !ids.contains(&old_id.as_str()),
+            "the superseded memory must not be returned"
+        );
+        assert!(
+            ids.contains(&new_id.as_str()),
+            "the successor must be returned in its place"
+        );
+
+        // The successor also matched on its own merit here, so it appears exactly once.
+        assert_eq!(
+            ids.iter().filter(|id| **id == new_id).count(),
+            1,
+            "a successor reached both directly and by redirect must not be duplicated"
+        );
+
+        // Auditing still reaches the old memory.
+        let raw = handler
+            .memory_query(json!({
+                "query": "what causes the day-26 collapse",
+                "limit": 10,
+                "include_superseded": true,
+            }))
+            .unwrap();
+        let raw_ids: Vec<&str> = raw["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["memory"]["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            raw_ids.contains(&old_id.as_str()),
+            "include_superseded must show what retrieval hides"
+        );
+    }
+
+    /// A memory whose only match is a superseded predecessor still yields the successor,
+    /// carrying `matched_via` to say where the match came from.
+    #[test]
+    fn redirect_annotates_where_the_match_came_from() {
+        let db = Database::open_in_memory().unwrap();
+        let project = "supersede-annotate";
+        db.get_or_create_project(project, "Test").unwrap();
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let old = handler
+            .memory_store(json!({
+                "content": "Deployments are gated on the nightly canary in Jenkins.",
+                "type": "fact",
+            }))
+            .unwrap();
+        let old_id = old["id"].as_str().unwrap().to_string();
+
+        handler
+            .memory_store(json!({
+                "content": "Release gating moved to GitHub Actions required checks.",
+                "type": "fact",
+                "supersedes": [old_id.clone()],
+            }))
+            .unwrap();
+
+        // Query the *old* wording, which the successor does not use.
+        let results = handler
+            .memory_query(json!({"query": "nightly canary Jenkins gate", "limit": 5}))
+            .unwrap();
+        let memories = results["memories"].as_array().unwrap();
+        assert!(
+            !memories.is_empty(),
+            "must redirect rather than return nothing"
+        );
+
+        let redirected = memories
+            .iter()
+            .find(|m| !m["matched_via"].is_null())
+            .expect("at least one result should be a redirect");
+        assert_eq!(
+            redirected["matched_via"]["superseded_id"].as_str(),
+            Some(old_id.as_str())
+        );
+    }
+
+    /// A dead memory is excluded outright: there is nothing current to point at.
+    #[test]
+    fn dead_memory_is_excluded_from_query() {
+        let db = Database::open_in_memory().unwrap();
+        let project = "dead-query";
+        db.get_or_create_project(project, "Test").unwrap();
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let stored = handler
+            .memory_store(json!({
+                "content": "The legacy billing cron runs at 03:00 on cron-box-2.",
+                "type": "fact",
+            }))
+            .unwrap();
+        let id = stored["id"].as_str().unwrap().to_string();
+
+        let found = handler
+            .memory_query(json!({"query": "legacy billing cron schedule", "limit": 5}))
+            .unwrap();
+        assert!(!found["memories"].as_array().unwrap().is_empty());
+
+        handler
+            .memory_update(json!({
+                "id": id,
+                "dead": true,
+                "dead_reason": "cron-box-2 was decommissioned",
+            }))
+            .unwrap();
+
+        let after = handler
+            .memory_query(json!({"query": "legacy billing cron schedule", "limit": 5}))
+            .unwrap();
+        let ids: Vec<&str> = after["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["memory"]["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !ids.contains(&id.as_str()),
+            "dead memories must not surface"
+        );
+    }
+
+    /// `memory_update` replaces content wholesale, so it must hand back what it replaced
+    /// and leave a recoverable snapshot.
+    #[test]
+    fn update_returns_the_content_it_replaced() {
+        let db = Database::open_in_memory().unwrap();
+        let project = "update-echo";
+        db.get_or_create_project(project, "Test").unwrap();
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let stored = handler
+            .memory_store(json!({
+                "content": "Original wording, including a tail nobody re-read.",
+                "type": "fact",
+            }))
+            .unwrap();
+        let id = stored["id"].as_str().unwrap().to_string();
+
+        let updated = handler
+            .memory_update(json!({"id": id, "content": "A reconstruction."}))
+            .unwrap();
+
+        assert_eq!(updated["content_replaced"], json!(true));
+        assert_eq!(
+            updated["previous"]["content"].as_str(),
+            Some("Original wording, including a tail nobody re-read.")
+        );
+
+        let restored = handler.memory_restore(json!({"id": id})).unwrap();
+        assert_eq!(
+            restored["memory"]["content"].as_str(),
+            Some("Original wording, including a tail nobody re-read.")
+        );
+    }
+
+    /// Deleting returns the memory it destroyed, and the delete stays undoable.
+    #[test]
+    fn delete_returns_what_it_destroyed_and_is_recoverable() {
+        let db = Database::open_in_memory().unwrap();
+        let project = "delete-echo";
+        db.get_or_create_project(project, "Test").unwrap();
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let stored = handler
+            .memory_store(json!({
+                "content": "A finding, plus a method lesson that is in no commit.",
+                "type": "debug",
+            }))
+            .unwrap();
+        let id = stored["id"].as_str().unwrap().to_string();
+
+        let deleted = handler.memory_delete(json!({"id": id.clone()})).unwrap();
+        assert_eq!(
+            deleted["deleted"]["content"].as_str(),
+            Some("A finding, plus a method lesson that is in no commit.")
+        );
+        assert_eq!(deleted["recoverable"], json!(true));
+
+        let trash = handler.memory_trash(json!({})).unwrap();
+        assert_eq!(trash["count"], json!(1));
+
+        handler.memory_restore(json!({"id": id.clone()})).unwrap();
+        assert!(db.get_memory(&id).unwrap().is_some());
     }
 
     /// 3A.8 test 2: handoff_create_rejects_detached_head

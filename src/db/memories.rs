@@ -1,13 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 
 use rusqlite::params;
 
+use crate::decay::{ACCESS_REINFORCEMENT, RELEVANCE_CEILING};
 use crate::error::MemoryError;
 use crate::memory::{Memory, MemoryType, Project, ProjectStats, ProjectSummary};
 
 use super::Database;
-use super::util::parse_memory_type_col;
+use super::util::{MEMORY_COLUMNS, map_memory_row};
+
+/// Reinforcement applied when retrieval returns a memory.
+///
+/// Params: `?1` = now, `?2` = memory id, `?3` = bump, `?4` = ceiling.
+const REINFORCE_SQL: &str = "UPDATE memories \
+     SET access_count = access_count + 1, \
+         last_accessed_at = ?1, \
+         relevance_score = MIN(?4, relevance_score + ?3) \
+     WHERE id = ?2";
 
 impl Database {
     // Project operations
@@ -152,39 +161,13 @@ impl Database {
 
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
-             FROM memories WHERE id = ?1"
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id])?;
 
         if let Some(row) = rows.next()? {
-            let memory_type_str: String = row.get(2)?;
-            let tags_json: String = row.get(5)?;
-            Ok(Some(Memory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                memory_type: MemoryType::from_str(&memory_type_str)
-                    .map_err(|_| MemoryError::InvalidType(memory_type_str.clone()))?,
-                content: row.get(3)?,
-                summary: row.get(4)?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                importance: row.get(6)?,
-                relevance_score: row.get(7)?,
-                access_count: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                last_accessed_at: row.get(11)?,
-                branch: row.get(12)?,
-                merged_from: row
-                    .get::<_, Option<String>>(13)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                pinned: row.get::<_, i64>(14)? != 0,
-                global: row.get::<_, i64>(15)? != 0,
-                external_artifacts: row
-                    .get::<_, Option<String>>(16)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-            }))
+            Ok(Some(map_memory_row(row)?))
         } else {
             Ok(None)
         }
@@ -222,15 +205,26 @@ impl Database {
     }
 
     pub fn delete_memory(&self, id: &str) -> Result<bool, MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        self.delete_memory_with_op(id, crate::db::OP_DELETE)
+    }
+
+    /// Delete a memory, recording which operation destroyed it.
+    ///
+    /// The snapshot and the delete share one transaction, so the memory is never
+    /// removed without a recoverable copy.
+    pub fn delete_memory_with_op(&self, id: &str, op: &str) -> Result<bool, MemoryError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        super::trash::trash_memory_in(&tx, id, op, chrono::Utc::now().timestamp())?;
         // Belt-and-suspenders: explicitly delete sidecar row before deleting the memory
         // so that the handoff_sections row is removed even if FOREIGN KEY CASCADE is
         // disabled or the constraint fires in an unexpected order.
-        conn.execute(
+        tx.execute(
             "DELETE FROM handoff_sections WHERE memory_id = ?1",
             params![id],
         )?;
-        let rows_affected = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        let rows_affected = tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(rows_affected > 0)
     }
 
@@ -260,10 +254,7 @@ impl Database {
     ) -> Result<Vec<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut sql = String::from(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
-             FROM memories WHERE project_id = ?1"
-        );
+        let mut sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE project_id = ?1");
 
         // Apply branch filter
         match branch_filter {
@@ -302,45 +293,19 @@ impl Database {
 
         let min_rel = min_relevance.unwrap_or(0.0);
 
-        // Helper to parse a row into Memory
-        fn parse_row(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
-            let memory_type_str: String = row.get(2)?;
-            let tags_json: String = row.get(5)?;
-            Ok(Memory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                memory_type: parse_memory_type_col(&memory_type_str, 2)?,
-                content: row.get(3)?,
-                summary: row.get(4)?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                importance: row.get(6)?,
-                relevance_score: row.get(7)?,
-                access_count: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                last_accessed_at: row.get(11)?,
-                branch: row.get(12)?,
-                merged_from: row
-                    .get::<_, Option<String>>(13)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                pinned: row.get::<_, i64>(14)? != 0,
-                global: row.get::<_, i64>(15)? != 0,
-                external_artifacts: row
-                    .get::<_, Option<String>>(16)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-            })
-        }
-
         let mut memories: Vec<Memory> = match branch_filter {
             Some(Some(branch)) => stmt
                 .query_map(
                     params![project_id, min_rel, fetch_limit as i64, branch],
-                    parse_row,
+                    map_memory_row,
                 )?
                 .filter_map(|r| r.ok())
                 .collect(),
             _ => stmt
-                .query_map(params![project_id, min_rel, fetch_limit as i64], parse_row)?
+                .query_map(
+                    params![project_id, min_rel, fetch_limit as i64],
+                    map_memory_row,
+                )?
                 .filter_map(|r| r.ok())
                 .collect(),
         };
@@ -398,8 +363,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
-            "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1, relevance_score = MIN(1.0, relevance_score + 0.1) WHERE id = ?2",
-            params![now, id],
+            REINFORCE_SQL,
+            params![now, id, ACCESS_REINFORCEMENT, RELEVANCE_CEILING],
         )?;
         Ok(())
     }
@@ -417,8 +382,8 @@ impl Database {
         let mut count = 0;
         for id in ids {
             let rows = tx.execute(
-                "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1, relevance_score = MIN(1.0, relevance_score + 0.1) WHERE id = ?2",
-                params![now, id],
+                REINFORCE_SQL,
+                params![now, id, ACCESS_REINFORCEMENT, RELEVANCE_CEILING],
             )?;
             count += rows;
         }
@@ -470,7 +435,7 @@ impl Database {
         // Build query with placeholders
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
+            "SELECT {MEMORY_COLUMNS}
              FROM memories WHERE id IN ({})",
             placeholders.join(",")
         );
@@ -481,33 +446,7 @@ impl Database {
         let params: Vec<&dyn rusqlite::ToSql> =
             ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            let memory_type_str: String = row.get(2)?;
-            let tags_json: String = row.get(5)?;
-            Ok(Memory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                memory_type: parse_memory_type_col(&memory_type_str, 2)?,
-                content: row.get(3)?,
-                summary: row.get(4)?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                importance: row.get(6)?,
-                relevance_score: row.get(7)?,
-                access_count: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                last_accessed_at: row.get(11)?,
-                branch: row.get(12)?,
-                merged_from: row
-                    .get::<_, Option<String>>(13)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                pinned: row.get::<_, i64>(14)? != 0,
-                global: row.get::<_, i64>(15)? != 0,
-                external_artifacts: row
-                    .get::<_, Option<String>>(16)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-            })
-        })?;
+        let rows = stmt.query_map(params.as_slice(), map_memory_row)?;
 
         let mut result = HashMap::new();
         for memory in rows.flatten() {
@@ -574,39 +513,13 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<Memory>, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, project_id, memory_type, content, summary, tags, importance, relevance_score, access_count, created_at, updated_at, last_accessed_at, branch, merged_from, pinned, global, external_artifacts
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MEMORY_COLUMNS}
              FROM memories WHERE project_id = ?1
              ORDER BY access_count DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![project_id, limit as i64], |row| {
-            let memory_type_str: String = row.get(2)?;
-            let tags_json: String = row.get(5)?;
-            Ok(Memory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                memory_type: parse_memory_type_col(&memory_type_str, 2)?,
-                content: row.get(3)?,
-                summary: row.get(4)?,
-                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                importance: row.get(6)?,
-                relevance_score: row.get(7)?,
-                access_count: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                last_accessed_at: row.get(11)?,
-                branch: row.get(12)?,
-                merged_from: row
-                    .get::<_, Option<String>>(13)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                pinned: row.get::<_, i64>(14)? != 0,
-                global: row.get::<_, i64>(15)? != 0,
-                external_artifacts: row
-                    .get::<_, Option<String>>(16)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-            })
-        })?;
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![project_id, limit as i64], map_memory_row)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -665,54 +578,60 @@ impl Database {
     /// Delete non-pinned, non-global memories that have fully decayed and were never accessed.
     ///
     /// Conditions: pinned = 0, global = 0, relevance_score <= 0.1, access_count = 0,
-    /// and created more than 30 days ago. Embeddings and relationships are removed by
-    /// CASCADE constraints on the memories table.
+    /// and created more than 30 days ago. Each one is snapshotted to the trash first;
+    /// this runs unattended on the decay job, so it is the destructive path least likely
+    /// to be noticed. Embeddings and relationships are removed by CASCADE constraints.
     ///
     /// Returns the IDs of deleted memories.
     #[allow(dead_code)] // Called by the decay background job in main.rs
-    pub fn auto_prune_dead_memories(&self, project_id: &str) -> Result<Vec<String>, MemoryError> {
-        let conn = self.conn.lock().unwrap();
+    pub fn auto_prune_stale_memories(&self, project_id: &str) -> Result<Vec<String>, MemoryError> {
         let cutoff = chrono::Utc::now().timestamp() - 30 * 86400;
 
-        let mut stmt = conn.prepare(
-            "SELECT id FROM memories
-             WHERE project_id = ?1
-               AND pinned = 0
-               AND global = 0
-               AND relevance_score <= 0.1
-               AND access_count = 0
-               AND created_at < ?2",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map(params![project_id, cutoff], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM memories
+                 WHERE project_id = ?1
+                   AND pinned = 0
+                   AND global = 0
+                   AND relevance_score <= 0.1
+                   AND access_count = 0
+                   AND created_at < ?2",
+            )?;
+            stmt.query_map(params![project_id, cutoff], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
 
         if ids.is_empty() {
             return Ok(ids);
         }
 
-        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
-        let sql = format!(
-            "DELETE FROM memories WHERE id IN ({})",
-            placeholders.join(",")
-        );
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = ids
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
-        conn.execute(&sql, params_refs.as_slice())?;
-
+        self.delete_memories_batch_with_op(&ids, super::OP_PRUNE)?;
         Ok(ids)
     }
 
     /// Delete all memories and relationships for a project
+    /// Delete every memory in a project, snapshotting each one to the trash first.
     pub fn delete_project_data(&self, project_id: &str) -> Result<usize, MemoryError> {
-        let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM memories WHERE project_id = ?1")?;
+            let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+        for id in &ids {
+            super::trash::trash_memory_in(&tx, id, super::OP_WIPE, now)?;
+        }
+
+        let rows = tx.execute(
             "DELETE FROM memories WHERE project_id = ?1",
             params![project_id],
         )?;
+        tx.commit()?;
         Ok(rows)
     }
 
@@ -810,14 +729,16 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
 
-        // Update relevance scores based on decay algorithm
-        // relevance = max(0.1, base_decay * importance_factor + usage_boost)
+        // The formula, including both clamps, lives in `crate::decay::relevance_from_parts`;
+        // RELEVANCE() is that function registered as a SQLite scalar.
         let rows_affected = conn.execute(
             r#"
             UPDATE memories
-            SET relevance_score = MAX(0.1,
-                EXP(-?1 * ((?2 - last_accessed_at) / 86400.0)) * (0.5 + importance * 0.5)
-                + LN(1 + access_count) * 0.1
+            SET relevance_score = RELEVANCE(
+                (?2 - last_accessed_at) / 86400.0,
+                importance,
+                access_count,
+                ?1
             )
             WHERE project_id = ?3
             AND pinned = 0
@@ -829,30 +750,34 @@ impl Database {
     }
 
     /// Merge a duplicate memory into an existing one.
-    /// Keeps the new memory's content, unions tags, takes max importance,
-    /// and records merge provenance in merged_from.
-    pub fn merge_memories(
-        &self,
-        new_id: &str,
-        old_id: &str,
-        old_content_preview: &str,
-    ) -> Result<(), MemoryError> {
+    ///
+    /// The survivor keeps its own content, gains the union of both tag sets and the
+    /// higher importance, and records the consumed memory in `merged_from`. The consumed
+    /// row is deleted, so before that happens it is snapshotted to the trash and its full
+    /// content is copied into the provenance entry: this is the only path that destroys
+    /// content without anyone asking, and a 100-character preview is not a record of what
+    /// was lost.
+    pub fn merge_memories(&self, survivor_id: &str, consumed_id: &str) -> Result<(), MemoryError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
 
-        // Get old memory's tags and importance
-        let (old_tags_json, old_importance): (String, f64) = tx.query_row(
-            "SELECT tags, importance FROM memories WHERE id = ?1",
-            params![old_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        // Read the consumed memory's own content, tags and importance here rather than
+        // accepting them from the caller, so the provenance entry always describes the
+        // memory that actually went away regardless of which side of the pair survives.
+        let (consumed_content, old_tags_json, old_importance): (String, String, f64) = tx
+            .query_row(
+                "SELECT content, tags, importance FROM memories WHERE id = ?1",
+                params![consumed_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         let old_tags: Vec<String> = serde_json::from_str(&old_tags_json).unwrap_or_default();
 
-        // Get new memory's current state
+        // Get the survivor's current state
         let (new_tags_json, new_importance, existing_merged_from): (String, f64, Option<String>) =
             tx.query_row(
                 "SELECT tags, importance, merged_from FROM memories WHERE id = ?1",
-                params![new_id],
+                params![survivor_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
         let mut new_tags: Vec<String> = serde_json::from_str(&new_tags_json).unwrap_or_default();
@@ -869,25 +794,30 @@ impl Database {
         let max_importance = new_importance.max(old_importance);
 
         // Build merged_from provenance
-        let now = chrono::Utc::now().timestamp();
         let mut merge_sources: Vec<crate::memory::MergeSource> = existing_merged_from
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        merge_sources.push(crate::memory::MergeSource {
-            id: old_id.to_string(),
-            content_preview: old_content_preview.to_string(),
-            merged_at: now,
-        });
+        merge_sources.push(crate::memory::MergeSource::new(
+            consumed_id.to_string(),
+            consumed_content,
+            now,
+        ));
         let merged_from_json = serde_json::to_string(&merge_sources)?;
 
-        // Update the new memory with merged data
+        // Update the survivor with merged data
         tx.execute(
             "UPDATE memories SET tags = ?1, importance = ?2, merged_from = ?3, updated_at = ?4 WHERE id = ?5",
-            params![merged_tags_json, max_importance, merged_from_json, now, new_id],
+            params![merged_tags_json, max_importance, merged_from_json, now, survivor_id],
         )?;
 
-        // Delete the old memory (provenance is already tracked in merged_from above)
-        tx.execute("DELETE FROM memories WHERE id = ?1", params![old_id])?;
+        // Snapshot the consumed memory before removing it. `merged_from` records what it
+        // said; the trash entry is what makes the merge reversible.
+        super::trash::trash_memory_in(&tx, consumed_id, super::OP_MERGE, now)?;
+        tx.execute(
+            "DELETE FROM handoff_sections WHERE memory_id = ?1",
+            params![consumed_id],
+        )?;
+        tx.execute("DELETE FROM memories WHERE id = ?1", params![consumed_id])?;
 
         tx.commit()?;
         Ok(())

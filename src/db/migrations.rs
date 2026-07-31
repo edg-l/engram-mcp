@@ -245,6 +245,53 @@ impl Database {
             )?;
         }
 
+        // Migration 7: curation sidecars.
+        //
+        // `memory_status` holds retrieval status that is not part of the memory itself.
+        // Supersession is read from the `supersedes` relationship edge, so the only
+        // status stored here is `dead`: the subject is gone and the memory should not
+        // surface, with no successor to redirect to.
+        //
+        // `memory_trash` holds snapshots of memories removed or overwritten by any
+        // destructive operation. It deliberately has no foreign key to `memories`,
+        // because its whole purpose is to outlive the row.
+        if current_version < 7 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS memory_status (
+                    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                    dead INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    marked_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memory_status_dead
+                    ON memory_status(dead) WHERE dead = 1;
+
+                CREATE TABLE IF NOT EXISTS memory_trash (
+                    trash_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    op TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    embedding BLOB,
+                    model_version TEXT,
+                    trashed_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trash_project
+                    ON memory_trash(project_id, trashed_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trash_memory
+                    ON memory_trash(memory_id, trashed_at DESC);
+                "#,
+            )?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![7],
+            )?;
+        }
+
         Ok(())
     }
 }

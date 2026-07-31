@@ -48,6 +48,8 @@ const CORE_TOOLS: &[&str] = &[
     "memory_store_batch",
     "memory_delete_batch",
     "memory_projects",
+    "memory_list",
+    "memory_restore",
     "adr_create",
     "adr_show",
     "adr_list",
@@ -175,6 +177,10 @@ pub struct MemoryStoreInput {
     pub summary: Option<String>,
     #[serde(default)]
     pub related_to: Vec<String>,
+    /// Memories this one replaces. Each gets a `supersedes` edge from the new memory and
+    /// stops being returned by retrieval, which redirects to this one instead.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
     /// Branch for this memory: null/omitted = global, "auto" = current branch, "branch-name" = explicit
     #[serde(default)]
     pub branch: Option<String>,
@@ -213,6 +219,10 @@ pub struct MemoryQueryInput {
     /// "all" = all branches, "global" = global only, or "branch-name" = specific branch
     #[serde(default = "default_branch_mode")]
     pub branch_mode: String,
+    /// Return superseded and dead memories as they are, with no redirect or suppression.
+    /// For curation; ordinary retrieval should leave it off.
+    #[serde(default)]
+    pub include_superseded: bool,
     /// Project to operate on. `None` = the server's own project.
     #[serde(default)]
     pub project: Option<String>,
@@ -226,8 +236,78 @@ pub struct MemoryUpdateInput {
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
     pub pinned: Option<bool>,
+    /// Mark the memory dead (its subject no longer exists) or bring it back. A dead
+    /// memory is excluded from retrieval with no redirect, because there is nothing
+    /// current to redirect to. Use `supersedes` on a new memory instead whenever a
+    /// replacement exists.
+    pub dead: Option<bool>,
+    /// Why it was marked dead. Recorded alongside the flag.
+    pub dead_reason: Option<String>,
     /// Replace external_artifacts list. Pass empty array to clear; omit to preserve existing.
     pub external_artifacts: Option<Vec<String>>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemoryListInput {
+    /// Sort order: "created", "updated", "accessed", or "relevance" (default).
+    #[serde(default = "default_list_order")]
+    pub order: String,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Status filter: "live" (default), "superseded", "dead", or "all".
+    #[serde(default = "default_list_status")]
+    pub status: String,
+    /// Characters of content to show per memory.
+    #[serde(default = "default_list_content_length")]
+    pub content_length: usize,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+fn default_list_order() -> String {
+    "relevance".to_string()
+}
+
+fn default_list_limit() -> usize {
+    50
+}
+
+fn default_list_status() -> String {
+    "live".to_string()
+}
+
+fn default_list_content_length() -> usize {
+    160
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemoryTrashInput {
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemoryRestoreInput {
+    /// Memory id to restore. The most recent snapshot of it is used unless `trash_id`
+    /// names a specific one.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Exact snapshot to restore, from `memory_trash`.
+    #[serde(default)]
+    pub trash_id: Option<i64>,
     /// Project to operate on. `None` = the server's own project.
     #[serde(default)]
     pub project: Option<String>,
@@ -538,6 +618,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "How critical this is. 0.3=minor detail, 0.5=normal (default), 0.7=important, 0.9=critical decision or constraint."},
                     "summary": {"type": "string", "description": "Optional short summary. Auto-generated for long content if omitted."},
                     "related_to": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs this relates to. Creates 'relates_to' links."},
+                    "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs this one replaces, when you have learned that an existing memory is no longer true. Those memories stop being returned by search; queries that would have matched them return this memory instead, marked with what it replaced. Use this rather than storing a second, contradicting memory. The store result reports `possible_supersedes` when it finds existing memories on the same subject."},
                     "branch": {"type": "string", "description": "Git branch scope. Omit for global (visible everywhere), 'auto' for current branch only, or an explicit branch name."},
                     "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."},
                     "global": {"type": "boolean", "description": "Make this memory visible across all projects. Global memories always have branch=null."},
@@ -559,6 +640,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "query": {"type": "string", "description": "Natural language question or keywords. E.g. 'what database do we use' or 'authentication decision'."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max results to return (default 10)."},
                     "offset": {"type": "integer", "minimum": 0, "description": "Skip first N results for pagination."},
+                    "include_superseded": {"type": "boolean", "description": "Return superseded and dead memories as they are, with no redirect and no suppression. For auditing the store; leave off for normal recall."},
                     "min_relevance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Minimum stored relevance (decay) threshold (default 0.1). Memories with decay below this are excluded regardless of retrieval score. Note: memory_context uses min_score for cosine cutoff — this field gates on stored decay only."},
                     "types": {"type": "array", "items": {"type": "string"}, "description": "Filter by memory type(s): fact, decision, preference, pattern, debug, entity."},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter to memories with any of these tags."},
@@ -597,6 +679,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces old)."},
                     "summary": {"type": "string", "description": "New summary (replaces old)."},
                     "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."},
+                    "dead": {"type": "boolean", "description": "Mark this memory dead: its subject no longer exists (the service was retired, the file deleted) and there is no replacement. Dead memories are excluded from search entirely. If a replacement exists, store it with `supersedes` instead so searches get redirected rather than nothing."},
+                    "dead_reason": {"type": "string", "description": "Why it is dead. Recorded alongside the flag."},
                     "external_artifacts": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -718,8 +802,45 @@ pub fn get_tool_definitions() -> Vec<Tool> {
             })),
         ),
         Tool::new(
+            "memory_list",
+            "Enumerate stored memories directly, without a search query. Use this to audit or curate the store: search only shows what a query matches, so the memories most in need of attention are the ones it never surfaces. Unlike memory_query this can show superseded and dead memories.",
+            project_scoped_schema(json!({
+                "type": "object",
+                "properties": {
+                    "order": {"type": "string", "enum": ["relevance", "created", "updated", "accessed"], "description": "Sort order, newest/highest first (default 'relevance')."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Max memories to return (default 50)."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Skip first N for pagination."},
+                    "types": {"type": "array", "items": {"type": "string"}, "description": "Filter by memory type(s)."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter to memories carrying any of these tags."},
+                    "status": {"type": "string", "enum": ["live", "superseded", "dead", "all"], "description": "'live' (default) = what retrieval would return; 'superseded' = replaced by a newer memory; 'dead' = subject is gone; 'all' = everything."},
+                    "content_length": {"type": "integer", "minimum": 1, "description": "Characters of content to show per memory (default 160)."}
+                }
+            })),
+        ),
+        Tool::new(
+            "memory_trash",
+            "List memories that were deleted, pruned, merged away by dedup, or overwritten by an update, and are still recoverable. Every destructive operation snapshots the memory here first. Use memory_restore to bring one back.",
+            project_scoped_schema(json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Max entries to return (default 50)."}
+                }
+            })),
+        ),
+        Tool::new(
+            "memory_restore",
+            "Restore a memory from the trash, along with its embedding and any relationships whose other end still exists. Pass `id` for the most recent snapshot of that memory, or `trash_id` from memory_trash for one exact snapshot.",
+            project_scoped_schema(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID to restore. Uses its most recent snapshot."},
+                    "trash_id": {"type": "integer", "description": "Exact snapshot to restore, from memory_trash."}
+                }
+            })),
+        ),
+        Tool::new(
             "memory_prune",
-            "Clean up memories that have decayed below a relevance threshold. Memories decay over time if not accessed. Dry run by default -- shows what would be removed without deleting.",
+            "Clean up memories that have decayed below a relevance threshold. Memories decay over time if not accessed. Dry run by default -- shows what would be removed without deleting. Pruned memories go to the trash and can be restored.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {

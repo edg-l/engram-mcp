@@ -128,6 +128,17 @@ fn get_current_branch() -> Option<String> {
 /// Default decay interval: 1 hour
 const DECAY_INTERVAL_SECS: u64 = 3600;
 
+/// Default number of days a trashed memory stays recoverable.
+const TRASH_RETENTION_DAYS: i64 = 30;
+
+/// Trash retention window in days; `0` keeps snapshots forever.
+fn trash_retention_days() -> i64 {
+    std::env::var("ENGRAM_TRASH_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TRASH_RETENTION_DAYS)
+}
+
 /// Run the background decay job that periodically updates relevance scores
 async fn run_decay_job(db_path: PathBuf, project_id: String) {
     let interval = Duration::from_secs(
@@ -161,11 +172,11 @@ async fn run_decay_job(db_path: PathBuf, project_id: String) {
                     }
                 }
 
-                match db.auto_prune_dead_memories(&project_id) {
+                match db.auto_prune_stale_memories(&project_id) {
                     Ok(pruned_ids) => {
                         if !pruned_ids.is_empty() {
                             tracing::debug!(
-                                "Auto-pruned {} dead memories: {:?}",
+                                "Auto-pruned {} stale memories: {:?}",
                                 pruned_ids.len(),
                                 pruned_ids
                             );
@@ -173,6 +184,17 @@ async fn run_decay_job(db_path: PathBuf, project_id: String) {
                     }
                     Err(e) => {
                         tracing::warn!("Auto-prune failed: {}", e);
+                    }
+                }
+
+                match db.sweep_trash(trash_retention_days()) {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::debug!("Swept {} expired trash entries", removed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Trash sweep failed: {}", e);
                     }
                 }
             }
@@ -391,18 +413,15 @@ fn dedup_within_clusters(db: &Database, project_id: &str) -> Result<usize, Memor
                 let similarity = cosine_similarity(emb_i, emb_j);
                 if similarity >= 0.90 {
                     // Determine survivor: global always wins; otherwise keep i (first seen)
-                    let (survivor_id, consumed_id, consumed_preview) =
-                        if mem_j.global && !mem_i.global {
-                            // j is global, i is local: j survives
-                            let preview: String = mem_i.content.chars().take(100).collect();
-                            (mem_j.id.clone(), mem_i.id.clone(), preview)
-                        } else {
-                            // i survives (i is global, or both same scope)
-                            let preview: String = mem_j.content.chars().take(100).collect();
-                            (mem_i.id.clone(), mem_j.id.clone(), preview)
-                        };
+                    let (survivor_id, consumed_id) = if mem_j.global && !mem_i.global {
+                        // j is global, i is local: j survives
+                        (mem_j.id.clone(), mem_i.id.clone())
+                    } else {
+                        // i survives (i is global, or both same scope)
+                        (mem_i.id.clone(), mem_j.id.clone())
+                    };
 
-                    db.merge_memories(&survivor_id, &consumed_id, &consumed_preview)?;
+                    db.merge_memories(&survivor_id, &consumed_id)?;
                     consumed.insert(consumed_id);
                     merge_count += 1;
                 }

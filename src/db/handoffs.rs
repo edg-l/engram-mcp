@@ -4,7 +4,7 @@ use crate::error::MemoryError;
 use crate::memory::{HandoffSections, Memory};
 
 use super::Database;
-use super::util::parse_memory_type_col;
+use super::util::{MEMORY_COLUMNS, map_memory_row};
 
 impl Database {
     // ============================================
@@ -316,82 +316,28 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let rows: Vec<Memory> = match branch {
             None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, project_id, memory_type, content, summary, tags, importance,
-                            relevance_score, access_count, created_at, updated_at,
-                            last_accessed_at, branch, merged_from, pinned, global, external_artifacts
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {MEMORY_COLUMNS}
                      FROM memories
                      WHERE project_id = ?1 AND memory_type = 'handoff'
                      ORDER BY created_at DESC
-                     LIMIT ?2",
-                )?;
-                stmt.query_map(params![project_id, limit as i64], |row| {
-                    let memory_type_str: String = row.get(2)?;
-                    let tags_json: String = row.get(5)?;
-                    Ok(Memory {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        memory_type: parse_memory_type_col(&memory_type_str, 2)?,
-                        content: row.get(3)?,
-                        summary: row.get(4)?,
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                        importance: row.get(6)?,
-                        relevance_score: row.get(7)?,
-                        access_count: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                        last_accessed_at: row.get(11)?,
-                        branch: row.get(12)?,
-                        merged_from: row
-                            .get::<_, Option<String>>(13)?
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                        pinned: row.get::<_, i64>(14)? != 0,
-                        global: row.get::<_, i64>(15)? != 0,
-                        external_artifacts: row
-                            .get::<_, Option<String>>(16)?
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(MemoryError::from)?
+                     LIMIT ?2"
+                ))?;
+                stmt.query_map(params![project_id, limit as i64], map_memory_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(MemoryError::from)?
             }
             Some(b) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, project_id, memory_type, content, summary, tags, importance,
-                            relevance_score, access_count, created_at, updated_at,
-                            last_accessed_at, branch, merged_from, pinned, global, external_artifacts
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {MEMORY_COLUMNS}
                      FROM memories
                      WHERE project_id = ?1 AND memory_type = 'handoff'
                        AND (branch IS NULL OR branch = ?3)
                      ORDER BY created_at DESC
-                     LIMIT ?2",
-                )?;
+                     LIMIT ?2"
+                ))?;
                 stmt.query_map(params![project_id, limit as i64, b], |row| {
-                    let memory_type_str: String = row.get(2)?;
-                    let tags_json: String = row.get(5)?;
-                    Ok(Memory {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        memory_type: parse_memory_type_col(&memory_type_str, 2)?,
-                        content: row.get(3)?,
-                        summary: row.get(4)?,
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-                        importance: row.get(6)?,
-                        relevance_score: row.get(7)?,
-                        access_count: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                        last_accessed_at: row.get(11)?,
-                        branch: row.get(12)?,
-                        merged_from: row
-                            .get::<_, Option<String>>(13)?
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                        pinned: row.get::<_, i64>(14)? != 0,
-                        global: row.get::<_, i64>(15)? != 0,
-                        external_artifacts: row
-                            .get::<_, Option<String>>(16)?
-                            .and_then(|s| serde_json::from_str(&s).ok()),
-                    })
+                    map_memory_row(row)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(MemoryError::from)?

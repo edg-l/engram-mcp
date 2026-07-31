@@ -29,16 +29,49 @@ Use `memory_query` when you need to recall a specific piece of knowledge -- "wha
 - **Use `pinned: true`** for permanent knowledge that should never decay or be pruned -- critical constraints, foundational decisions, or standing user preferences.
 - **Use `global: true`** for knowledge that applies across all projects -- user preferences, environment facts, or universal conventions.
 
+## Point at files, do not copy them
+
+If the claim already lives in a committed file, store the pointer and only the part the file does not say. Put the path in `external_artifacts` and write the reasoning, the count, or the lesson in the content.
+
+The test: **if someone edits that file, does my memory become wrong?** If yes, you copied instead of pointing. A memory restating a document goes stale the moment the document changes, silently, and nothing will tell you.
+
+## One memory, one lifetime
+
+A finding about current code and the general lesson it taught are two memories, not one. They stop being true at different times: the finding dies when the code is rewritten, the lesson does not.
+
+The test: **would this claim survive a rewrite of the subsystem?** If part of it would and part of it would not, split it. Store the durable half as `pattern` and link it with `derived_from`. Memories joined that way are never auto-merged, and neither are memories of different types.
+
+This matters most when something is later deleted. Checking "is this recoverable from git?" is only valid if every claim in the memory is the same kind of claim; a record that mixes a stale conclusion with a durable rule will pass the check on the conclusion and lose the rule.
+
 # Working across projects
 
 Every tool defaults to the project the server was launched in. To read or write another project's memories, pass its ID as the `project` argument (e.g. `memory_context` with `project: "/home/me/dev/other-repo"`). Call `memory_projects` to list the available project IDs with their memory, handoff, and ADR counts; an unknown ID is rejected with the known ones listed. Since branch names are per-repository, `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
+
+# When something you stored is no longer true
+
+Do not store a second, contradicting memory. Two memories that disagree both keep surfacing, and the next agent has no way to tell which one is current.
+
+- **A replacement exists** -> store the new memory with `supersedes: ["<old id>"]`. The old memory stops being returned, and searches that would have matched it return the new one instead, marked with what it replaced. The old text stays readable via `memory_list status=superseded`, so the history is not lost.
+- **The subject is gone entirely** (service retired, file deleted, approach abandoned with nothing in its place) -> `memory_update` with `dead: true`. Dead memories are excluded from retrieval outright. Prefer supersession whenever there is something to point at: returning nothing reads as "nobody looked into this", which invites the same wrong conclusion to be reached again.
+- **It is simply wrong or badly worded** -> `memory_update` with new content. This replaces the content wholesale rather than patching it; the result hands back the previous version, and the old one stays recoverable.
+
+Every `memory_store` result may include `possible_supersedes`: existing memories close enough to be about the same subject but not close enough to have been merged. Read it. That is usually the only way you will learn that a memory from months ago contradicts what you just stored, because a memory that never surfaces in search never becomes a candidate for anything.
 
 # Memory maintenance
 
 - Memories automatically decay in relevance if not accessed -- important memories persist, trivial ones fade.
 - Duplicates are automatically detected and merged when stored.
+- Use `memory_list` to see what is actually in the store. Search only shows what a query matches, so the memories most in need of attention are the ones it never surfaces. `status: "superseded"` and `status: "dead"` show what retrieval is hiding.
 - Use `memory_prune` periodically to clean up low-relevance memories.
 - Use `memory_dedup` to find and merge similar memories that weren't caught automatically.
+
+## Deleting is a last resort, and it is not free
+
+Prefer supersession or `dead` over deletion. A memory is often carrying more than the claim it appears to be about -- a lesson, a count of how often something has happened, context that exists nowhere else. Verifying "this conclusion is in git" does not verify the rest of it.
+
+Before deleting, read the whole memory, including `merged_from`: dedup may have folded several other memories into it, and one id can stand for several distinct claims.
+
+`memory_delete`, `memory_delete_batch`, `memory_prune`, and dedup merges all return what they destroyed and keep a recoverable snapshot. `memory_trash` lists them; `memory_restore` puts one back with its embedding and relationships. Snapshots expire, so recovering something is only possible for as long as the retention window.
 
 # Session handoffs
 

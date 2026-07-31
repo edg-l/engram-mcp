@@ -600,11 +600,43 @@ impl FromStr for RelationType {
     }
 }
 
+/// A memory that was consumed by a dedup merge.
+///
+/// Carries the predecessor's full content, not just a preview: the merge deletes the
+/// predecessor's row, so this is the only remaining copy of what it said. A preview
+/// alone makes the merge a silent, unrecoverable truncation of whatever the predecessor
+/// contained beyond the first hundred characters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeSource {
     pub id: String,
+    /// First 100 characters, retained for display.
     pub content_preview: String,
+    /// Everything the consumed memory said. Absent only on rows written before merges
+    /// began recording it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     pub merged_at: i64,
+}
+
+impl MergeSource {
+    /// Preview length retained for display alongside the full content.
+    pub const PREVIEW_CHARS: usize = 100;
+
+    pub fn new(id: String, content: String, merged_at: i64) -> Self {
+        Self {
+            id,
+            content_preview: content.chars().take(Self::PREVIEW_CHARS).collect(),
+            content: Some(content),
+            merged_at,
+        }
+    }
+
+    /// The consumed memory's full text, falling back to the preview for entries written
+    /// before merges recorded it.
+    #[allow(dead_code)] // Used by the CLI binary
+    pub fn content_or_preview(&self) -> &str {
+        self.content.as_deref().unwrap_or(&self.content_preview)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,6 +704,10 @@ pub struct MemoryWithScore {
     /// Fused RRF score before tag boost and relevance scaling (0.0 in Vector/Bm25 modes).
     #[serde(default)]
     pub rrf_score: f64,
+    /// Set when this memory is in the result because a memory it superseded matched.
+    /// The superseded memory itself is not returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_via: Option<crate::tools::MatchedVia>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

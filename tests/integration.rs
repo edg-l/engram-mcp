@@ -669,13 +669,8 @@ fn test_dedup_merge_direction_global_survives() {
         .expect("Failed to store local memory");
 
     // Simulate the dedup merge direction: global survives, local is consumed
-    // merge_memories(survivor_id, consumed_id, preview)
-    db.merge_memories(
-        "mem_global_orig",
-        "mem_local_dup",
-        "Some shared global fact (local copy)",
-    )
-    .expect("Failed to merge memories");
+    db.merge_memories("mem_global_orig", "mem_local_dup")
+        .expect("Failed to merge memories");
 
     // Global memory should still exist
     let survivor = db
@@ -852,8 +847,7 @@ fn test_store_auto_dedup() {
 
     // If similarity >= 0.90 (dedup threshold), test the merge
     if similarity >= 0.90 {
-        db.merge_memories("mem_dup_2", "mem_dup_1", "The database uses PostgreSQL")
-            .unwrap();
+        db.merge_memories("mem_dup_2", "mem_dup_1").unwrap();
 
         // Old memory should be gone
         assert!(db.get_memory("mem_dup_1").unwrap().is_none());
@@ -1355,7 +1349,7 @@ fn test_auto_prune_dead_memory_is_pruned() {
     let mem = make_dead_memory("prune_dead_1", project_id, false, false, 0, 45);
     db.store_memory(&mem).unwrap();
 
-    let pruned = db.auto_prune_dead_memories(project_id).unwrap();
+    let pruned = db.auto_prune_stale_memories(project_id).unwrap();
     assert_eq!(pruned.len(), 1, "dead memory should be pruned");
     assert_eq!(pruned[0], "prune_dead_1");
 
@@ -1378,7 +1372,7 @@ fn test_auto_prune_pinned_memory_not_pruned() {
     let mem = make_dead_memory("prune_pinned_1", project_id, true, false, 0, 45);
     db.store_memory(&mem).unwrap();
 
-    let pruned = db.auto_prune_dead_memories(project_id).unwrap();
+    let pruned = db.auto_prune_stale_memories(project_id).unwrap();
     assert!(pruned.is_empty(), "pinned memory should NOT be pruned");
 
     let retrieved = db.get_memory("prune_pinned_1").unwrap();
@@ -1397,7 +1391,7 @@ fn test_auto_prune_global_memory_not_pruned() {
     let mem = make_dead_memory("prune_global_1", project_id, false, true, 0, 45);
     db.store_memory(&mem).unwrap();
 
-    let pruned = db.auto_prune_dead_memories(project_id).unwrap();
+    let pruned = db.auto_prune_stale_memories(project_id).unwrap();
     assert!(pruned.is_empty(), "global memory should NOT be pruned");
 
     let retrieved = db.get_memory("prune_global_1").unwrap();
@@ -1417,7 +1411,7 @@ fn test_auto_prune_accessed_memory_not_pruned() {
     let mem = make_dead_memory("prune_accessed_1", project_id, false, false, 1, 45);
     db.store_memory(&mem).unwrap();
 
-    let pruned = db.auto_prune_dead_memories(project_id).unwrap();
+    let pruned = db.auto_prune_stale_memories(project_id).unwrap();
     assert!(pruned.is_empty(), "accessed memory should NOT be pruned");
 
     let retrieved = db.get_memory("prune_accessed_1").unwrap();
@@ -1437,7 +1431,7 @@ fn test_auto_prune_recent_memory_not_pruned() {
     let mem = make_dead_memory("prune_recent_1", project_id, false, false, 0, 5);
     db.store_memory(&mem).unwrap();
 
-    let pruned = db.auto_prune_dead_memories(project_id).unwrap();
+    let pruned = db.auto_prune_stale_memories(project_id).unwrap();
     assert!(pruned.is_empty(), "recent memory should NOT be pruned");
 
     let retrieved = db.get_memory("prune_recent_1").unwrap();
