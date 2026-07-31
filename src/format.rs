@@ -312,7 +312,12 @@ pub fn compact_tool_result(tool_name: &str, result: &Value, content_length: usiz
         "memory_dedup" => compact_dedup(result),
         "memory_stats" => compact_stats(result),
         "memory_projects" => compact_projects(result),
-        "memory_update" | "memory_delete" | "memory_delete_batch" => compact_simple(result),
+        "memory_update" => compact_update(result, content_length),
+        "memory_delete" => compact_delete(result, content_length),
+        "memory_delete_batch" => compact_delete_batch(result, content_length),
+        "memory_list" => compact_list(result),
+        "memory_trash" => compact_trash(result),
+        "memory_restore" => compact_restore(result),
         _ => compact_fallback(result),
     }
 }
@@ -337,7 +342,12 @@ pub fn compact_tool_result_with_db(
         "memory_dedup" => compact_dedup(result),
         "memory_stats" => compact_stats(result),
         "memory_projects" => compact_projects(result),
-        "memory_update" | "memory_delete" | "memory_delete_batch" => compact_simple(result),
+        "memory_update" => compact_update(result, content_length),
+        "memory_delete" => compact_delete(result, content_length),
+        "memory_delete_batch" => compact_delete_batch(result, content_length),
+        "memory_list" => compact_list(result),
+        "memory_trash" => compact_trash(result),
+        "memory_restore" => compact_restore(result),
         _ => compact_fallback(result),
     }
 }
@@ -369,6 +379,41 @@ fn compact_store(result: &Value) -> String {
             "\nMerged with duplicate {} (similarity: {:.2})",
             merged_with, sim
         ));
+    }
+
+    if let Some(superseded) = result.get("superseded").and_then(|v| v.as_array())
+        && !superseded.is_empty()
+    {
+        let ids: Vec<&str> = superseded.iter().filter_map(|v| v.as_str()).collect();
+        out.push_str(&format!(
+            "\nSupersedes {}. Those memories are no longer returned by search; queries that \
+             matched them now return this one.",
+            ids.join(", ")
+        ));
+    }
+
+    // The point of reporting candidates is that the caller is asked, so they have to be
+    // visible in the tool result an agent actually reads.
+    if let Some(candidates) = result.get("possible_supersedes").and_then(|v| v.as_array())
+        && !candidates.is_empty()
+    {
+        out.push_str("\n\nExisting memories on what looks like the same subject:");
+        for candidate in candidates {
+            let id = candidate.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let similarity = candidate
+                .get("similarity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let preview = candidate
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            out.push_str(&format!("\n  {} ({:.2}) {}", id, similarity, preview));
+        }
+        out.push_str(
+            "\nIf this replaces one of them, store again with `supersedes` rather than keeping \
+             both. If it merely elaborates, ignore this.",
+        );
     }
 
     out
@@ -414,6 +459,22 @@ fn compact_query(result: &Value, content_length: usize, db: Option<&Database>) -
             }
         }
         out.push('\n');
+        // A redirect: the query matched a memory this one superseded, and this is what
+        // replaced it. Saying so is the difference between a current answer and an
+        // unexplained one.
+        if let Some(via) = mem.get("matched_via")
+            && !via.is_null()
+        {
+            let superseded_id = via
+                .get("superseded_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let preview = via
+                .get("superseded_preview")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            out.push_str(&format!("replaces {}: {}\n", superseded_id, preview));
+        }
         // Section-aware rendering for handoffs via DB sidecar; plain content for other types.
         let formatted_content = if mem_type == "handoff" {
             if let Some(db) = db {
@@ -479,6 +540,16 @@ fn compact_context(result: &Value, content_length: usize, db: Option<&Database>)
             }
         }
         out.push('\n');
+        // A redirect: the context matched a memory this one superseded.
+        if let Some(via) = mem.get("matched_via")
+            && !via.is_null()
+        {
+            let superseded_id = via
+                .get("superseded_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!("replaces {}\n", superseded_id));
+        }
         // Section-aware rendering for handoffs via DB sidecar; plain content for other types.
         let formatted_content = if mem_type == "handoff" {
             if let Some(db) = db {
@@ -640,6 +711,255 @@ fn compact_dedup(result: &Value) -> String {
     }
 }
 
+/// Render the memory a destructive tool destroyed.
+///
+/// A memory often carries more than the claim it appears to be about, and only some of
+/// it is recoverable from the repository. Printing it is what lets the caller notice
+/// what they were about to lose while the tool result is still in front of them.
+fn render_destroyed(memory: &Value, content_length: usize, out: &mut String) {
+    let content = memory.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    out.push_str(&format!(
+        "\n\n{}",
+        truncate_str(content, content_length.max(500))
+    ));
+
+    if let Some(sources) = memory.get("merged_from").and_then(|v| v.as_array())
+        && !sources.is_empty()
+    {
+        out.push_str(&format!(
+            "\n\nThis memory had absorbed {} other memor{} by dedup:",
+            sources.len(),
+            if sources.len() == 1 { "y" } else { "ies" }
+        ));
+        for source in sources {
+            let id = source.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let text = source
+                .get("content")
+                .and_then(|v| v.as_str())
+                .or_else(|| source.get("content_preview").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            out.push_str(&format!(
+                "\n\n  [{}] {}",
+                id,
+                truncate_str(text, content_length.max(500))
+            ));
+        }
+    }
+}
+
+fn compact_update(result: &Value, content_length: usize) -> String {
+    if !result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return format!(
+            "Failed: {}",
+            result.get("message").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
+
+    let mut out = "Memory updated".to_string();
+
+    match result.get("dead").and_then(|v| v.as_bool()) {
+        Some(true) => out.push_str(" and marked dead: excluded from all retrieval."),
+        _ => out.push('.'),
+    }
+
+    // Content is replaced wholesale, not patched, so the previous version is gone unless
+    // the caller is handed it here.
+    if result
+        .get("content_replaced")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && let Some(previous) = result.get("previous")
+    {
+        out.push_str("\n\nReplaced content:");
+        render_destroyed(previous, content_length, &mut out);
+        let id = result
+            .get("previous")
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        out.push_str(&format!(
+            "\n\nRecoverable with memory_restore id={} until the trash is swept.",
+            id
+        ));
+    }
+
+    out
+}
+
+fn compact_delete(result: &Value, content_length: usize) -> String {
+    if !result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return format!(
+            "Failed: {}",
+            result.get("message").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
+
+    let mut out = "Memory deleted.".to_string();
+    if let Some(deleted) = result.get("deleted")
+        && !deleted.is_null()
+    {
+        out.push_str("\n\nDeleted content:");
+        render_destroyed(deleted, content_length, &mut out);
+        let id = deleted.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        out.push_str(&format!(
+            "\n\nRecoverable with memory_restore id={} until the trash is swept.",
+            id
+        ));
+    }
+    out
+}
+
+fn compact_delete_batch(result: &Value, content_length: usize) -> String {
+    let deleted = result.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut out = format!(
+        "{} memor{} deleted.",
+        deleted,
+        if deleted == 1 { "y" } else { "ies" }
+    );
+
+    if let Some(memories) = result.get("memories").and_then(|v| v.as_array()) {
+        for memory in memories {
+            let id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("\n\n[{}]", id));
+            render_destroyed(memory, content_length, &mut out);
+        }
+        if !memories.is_empty() {
+            out.push_str("\n\nAll recoverable with memory_restore until the trash is swept.");
+        }
+    }
+    out
+}
+
+fn compact_list(result: &Value) -> String {
+    let Some(rows) = result.get("memories").and_then(|v| v.as_array()) else {
+        return "No memories.".to_string();
+    };
+    if rows.is_empty() {
+        return "No memories.".to_string();
+    }
+
+    let status = result
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("live");
+    let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut out = format!("{} of {} ({}):\n", rows.len(), total, status);
+
+    for row in rows {
+        let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let mem_type = row.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let relevance = row
+            .get("relevance_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
+        let mut marks = String::new();
+        if row.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            marks.push_str(" [pinned]");
+        }
+        if row.get("dead").and_then(|v| v.as_bool()).unwrap_or(false) {
+            marks.push_str(" [dead]");
+        }
+        if let Some(successor) = row.get("superseded_by").and_then(|v| v.as_str()) {
+            marks.push_str(&format!(" [superseded by {}]", successor));
+        }
+
+        out.push_str(&format!(
+            "\n[{}] {} ({:.2}){}\n{}\n",
+            id, mem_type, relevance, marks, content
+        ));
+    }
+    out
+}
+
+fn compact_trash(result: &Value) -> String {
+    let Some(entries) = result.get("entries").and_then(|v| v.as_array()) else {
+        return "Trash is empty.".to_string();
+    };
+    if entries.is_empty() {
+        return "Trash is empty.".to_string();
+    }
+
+    let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut out = format!("{} of {} recoverable:\n", entries.len(), total);
+
+    for entry in entries {
+        let trash_id = entry.get("trash_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let memory_id = entry
+            .get("memory_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let op = entry.get("op").and_then(|v| v.as_str()).unwrap_or("?");
+        let mem_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+        let preview = entry.get("preview").and_then(|v| v.as_str()).unwrap_or("");
+        let chars = entry
+            .get("content_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "\ntrash_id {} — {} by {} ({}, {} chars)\n{}\n",
+            trash_id, memory_id, op, mem_type, chars, preview
+        ));
+    }
+    out.push_str("\nRestore with memory_restore id=<memory-id> or trash_id=<n>.");
+    out
+}
+
+fn compact_restore(result: &Value) -> String {
+    if !result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return format!(
+            "Failed: {}",
+            result.get("message").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
+
+    let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+    let op = result
+        .get("trashed_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let mut out = format!("Restored {} (removed by {}).", id, op);
+
+    if result
+        .get("overwrote_existing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        out.push_str("\nA live memory with that ID was replaced; it is now in the trash itself.");
+    }
+    let restored = result
+        .get("edges_restored")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if restored > 0 {
+        out.push_str(&format!("\nReconnected {} relationship(s).", restored));
+    }
+    let dropped = result
+        .get("edges_dropped")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if dropped > 0 {
+        out.push_str(&format!(
+            "\n{} relationship(s) could not be restored: the memory at the other end is gone.",
+            dropped
+        ));
+    }
+    out
+}
+
 fn compact_stats(result: &Value) -> String {
     let count = result
         .get("memory_count")
@@ -662,10 +982,26 @@ fn compact_stats(result: &Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("?");
 
-    format!(
+    let dead = result
+        .get("dead_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let trash = result
+        .get("trash_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut out = format!(
         "Project: {}\nMemories: {}, Relationships: {}, Clusters: {}, Avg relevance: {:.2}",
         project, count, rels, clusters, rel
-    )
+    );
+    if dead > 0 {
+        out.push_str(&format!("\nDead (excluded from retrieval): {}", dead));
+    }
+    if trash > 0 {
+        out.push_str(&format!("\nRecoverable in trash: {}", trash));
+    }
+    out
 }
 
 fn compact_projects(result: &Value) -> String {
@@ -715,19 +1051,6 @@ fn compact_projects(result: &Value) -> String {
         ));
     }
     out.trim_end().to_string()
-}
-
-fn compact_simple(result: &Value) -> String {
-    let success = result
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let message = result.get("message").and_then(|v| v.as_str()).unwrap_or("");
-    if success {
-        message.to_string()
-    } else {
-        format!("Failed: {}", message)
-    }
 }
 
 fn compact_fallback(result: &Value) -> String {
@@ -910,5 +1233,209 @@ mod tests {
 
         assert!(compact_100.len() < compact_300.len());
         assert!(compact_100.contains("..."));
+    }
+
+    /// The whole point of `possible_supersedes` is that the caller is asked. Over MCP the
+    /// tool result is the compact text and the JSON is discarded, so a field the renderer
+    /// drops does not exist as far as an agent is concerned.
+    #[test]
+    fn store_output_surfaces_supersession_candidates() {
+        let result = json!({
+            "id": "mem_new",
+            "message": "Memory stored successfully",
+            "project": "proj",
+            "possible_supersedes": [
+                {"id": "mem_old", "similarity": 0.83, "type": "fact",
+                 "preview": "Release gating runs on Jenkins.", "updated_at": 0}
+            ]
+        });
+        let out = compact_tool_result("memory_store", &result, 300);
+        assert!(out.contains("mem_old"), "candidate id missing from: {out}");
+        assert!(out.contains("Release gating runs on Jenkins."));
+        assert!(
+            out.contains("supersedes"),
+            "no instruction on what to do: {out}"
+        );
+    }
+
+    #[test]
+    fn store_output_reports_what_it_superseded() {
+        let result = json!({
+            "id": "mem_new",
+            "message": "Memory stored successfully",
+            "project": "proj",
+            "superseded": ["mem_old"]
+        });
+        let out = compact_tool_result("memory_store", &result, 300);
+        assert!(out.contains("Supersedes mem_old"), "got: {out}");
+    }
+
+    /// Update replaces content wholesale, so the previous version has to reach the caller.
+    #[test]
+    fn update_output_includes_the_replaced_content() {
+        let result = json!({
+            "success": true,
+            "message": "Memory updated successfully",
+            "content_replaced": true,
+            "dead": false,
+            "previous": {
+                "id": "mem_1",
+                "content": "Original wording, including a tail nobody re-read.",
+                "memory_type": "fact"
+            }
+        });
+        let out = compact_tool_result("memory_update", &result, 300);
+        assert!(out.contains("Original wording, including a tail nobody re-read."));
+        assert!(
+            out.contains("memory_restore id=mem_1"),
+            "no way back offered: {out}"
+        );
+    }
+
+    #[test]
+    fn update_output_reports_dead() {
+        let result = json!({
+            "success": true, "message": "Memory updated successfully",
+            "content_replaced": false, "dead": true
+        });
+        let out = compact_tool_result("memory_update", &result, 300);
+        assert!(out.contains("dead"), "got: {out}");
+    }
+
+    /// A delete must show the claims it destroyed, including any that dedup folded in:
+    /// one id can stand for several memories.
+    #[test]
+    fn delete_output_includes_content_and_merged_predecessors() {
+        let result = json!({
+            "success": true,
+            "message": "Memory deleted successfully",
+            "recoverable": true,
+            "deleted": {
+                "id": "mem_1",
+                "memory_type": "debug",
+                "content": "A finding about current code.",
+                "merged_from": [
+                    {"id": "mem_0", "content_preview": "trunc",
+                     "content": "A method lesson that is in no commit.", "merged_at": 0}
+                ]
+            }
+        });
+        let out = compact_tool_result("memory_delete", &result, 300);
+        assert!(out.contains("A finding about current code."));
+        assert!(
+            out.contains("A method lesson that is in no commit."),
+            "merged-in claim invisible, which is exactly how one gets lost: {out}"
+        );
+        assert!(out.contains("mem_0"));
+    }
+
+    #[test]
+    fn delete_batch_output_includes_every_memory() {
+        let result = json!({
+            "success": true, "deleted": 2, "message": "2 memories deleted",
+            "memories": [
+                {"id": "mem_1", "content": "first claim", "memory_type": "fact"},
+                {"id": "mem_2", "content": "second claim", "memory_type": "fact"}
+            ]
+        });
+        let out = compact_tool_result("memory_delete_batch", &result, 300);
+        assert!(
+            out.contains("first claim") && out.contains("second claim"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn list_output_marks_superseded_and_dead() {
+        let result = json!({
+            "project": "proj", "status": "all", "order": "relevance",
+            "total": 2, "count": 2, "offset": 0,
+            "memories": [
+                {"id": "mem_1", "type": "fact", "content": "old claim", "tags": [],
+                 "importance": 0.5, "relevance_score": 1.0, "access_count": 0,
+                 "created_at": 0, "updated_at": 0, "pinned": false,
+                 "dead": false, "superseded_by": "mem_2"},
+                {"id": "mem_3", "type": "fact", "content": "gone", "tags": [],
+                 "importance": 0.5, "relevance_score": 1.0, "access_count": 0,
+                 "created_at": 0, "updated_at": 0, "pinned": false,
+                 "dead": true, "superseded_by": null}
+            ]
+        });
+        let out = compact_tool_result("memory_list", &result, 300);
+        assert!(out.contains("[superseded by mem_2]"), "got: {out}");
+        assert!(out.contains("[dead]"), "got: {out}");
+    }
+
+    #[test]
+    fn trash_and_restore_render_their_own_shape() {
+        let trash = json!({
+            "project": "proj", "total": 1, "count": 1,
+            "entries": [{"trash_id": 3, "memory_id": "mem_1", "op": "merge",
+                         "trashed_at": 0, "type": "fact", "preview": "consumed by dedup",
+                         "content_chars": 759, "relationships": 0}]
+        });
+        let out = compact_tool_result("memory_trash", &trash, 300);
+        assert!(
+            out.contains("trash_id 3") && out.contains("by merge"),
+            "got: {out}"
+        );
+        assert!(out.contains("759 chars"));
+
+        let restore = json!({
+            "success": true, "id": "mem_1", "trashed_by": "delete",
+            "overwrote_existing": false, "edges_restored": 1, "edges_dropped": 2,
+            "message": "Memory restored"
+        });
+        let out = compact_tool_result("memory_restore", &restore, 300);
+        assert!(out.contains("Restored mem_1"), "got: {out}");
+        assert!(out.contains("Reconnected 1"), "got: {out}");
+        assert!(
+            out.contains("2 relationship(s) could not be restored"),
+            "got: {out}"
+        );
+    }
+
+    /// A redirected result must say it is a stand-in; otherwise it reads as a direct hit
+    /// on a query whose wording it does not even contain.
+    #[test]
+    fn query_and_context_output_mark_redirects() {
+        let query = json!({
+            "count": 1,
+            "memories": [{
+                "memory": {"id": "mem_new", "memory_type": "fact",
+                           "content": "Gating is on GitHub Actions.", "tags": [], "importance": 0.5},
+                "score": 0.7,
+                "matched_via": {"superseded_id": "mem_old",
+                                "superseded_preview": "Gating runs on Jenkins."}
+            }]
+        });
+        let out = compact_tool_result("memory_query", &query, 300);
+        assert!(out.contains("replaces mem_old"), "got: {out}");
+        assert!(out.contains("Gating runs on Jenkins."), "got: {out}");
+
+        let context = json!({
+            "context": "gating", "count": 1, "retrieval_mode": "flat",
+            "memories": [{"id": "mem_new", "type": "fact",
+                          "content": "Gating is on GitHub Actions.", "tags": [],
+                          "importance": 0.5, "similarity": 0.7,
+                          "matched_via": {"superseded_id": "mem_old",
+                                          "superseded_preview": "Gating runs on Jenkins."}}]
+        });
+        let out = compact_tool_result("memory_context", &context, 300);
+        assert!(out.contains("replaces mem_old"), "got: {out}");
+    }
+
+    #[test]
+    fn stats_output_includes_curation_counts() {
+        let result = json!({
+            "project_id": "proj", "memory_count": 10, "relationship_count": 2,
+            "avg_relevance": 0.5, "cluster_count": 1, "dead_count": 3, "trash_count": 4
+        });
+        let out = compact_tool_result("memory_stats", &result, 300);
+        assert!(
+            out.contains("Dead (excluded from retrieval): 3"),
+            "got: {out}"
+        );
+        assert!(out.contains("Recoverable in trash: 4"), "got: {out}");
     }
 }
