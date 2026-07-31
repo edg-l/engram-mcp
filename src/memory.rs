@@ -147,17 +147,22 @@ impl FromStr for AdrStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // Used by handoff create/resume/search tools (Phase 3)
 pub struct HandoffSections {
-    /// High-level summary of the session's work.
+    /// High-level summary of the session's work. The only required section.
     pub summary: String,
     /// Key decisions made during the session (each item is one decision).
+    #[serde(default)]
     pub decisions: Vec<String>,
     /// Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items.
+    #[serde(default)]
     pub todos: Vec<String>,
     /// Things preventing forward motion right now (missing access, failing dependency, unanswered question).
+    #[serde(default)]
     pub blockers: Vec<String>,
     /// Mental model: architecture, invariants, or context the next session needs.
+    #[serde(default)]
     pub mental_model: String,
     /// Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
+    #[serde(default)]
     pub next_steps: Vec<String>,
     /// Freeform notes that don't fit the other sections (optional).
     pub notes: Option<String>,

@@ -835,7 +835,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to restore. Uses its most recent snapshot."},
                     "trash_id": {"type": "integer", "description": "Exact snapshot to restore, from memory_trash."}
-                }
+                },
+                // Neither field alone is required, but one of them is. Expressed here so
+                // the published contract matches what the handler enforces.
+                "anyOf": [{"required": ["id"]}, {"required": ["trash_id"]}]
             })),
         ),
         Tool::new(
