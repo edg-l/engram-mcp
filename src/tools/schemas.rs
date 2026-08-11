@@ -956,7 +956,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Todo tools ===
         Tool::new(
             "todo_write",
-            "Apply changes to the project's durable todo list: add, done, drop, reopen, edit. Todos survive across sessions and never decay, so this is the right home for work that outlives one conversation.\n\nOps are applied in order and reported individually — one bad id does not discard the rest of the batch. `drop` requires a reason: closing a todo without one is indistinguishable from forgetting it. Adding reports `possible_duplicates` (existing open todos above 0.85 similarity) but never merges, since two similar todos can be separate work.\n\nDo NOT mirror the in-session task list here. Add a todo when work should be picked up by a *later* session.",
+            "Apply changes to the project's durable todo list: add, done, drop, reopen, edit. Todos survive across sessions and never decay, so this is the right home for work that outlives one conversation.\n\nOps are applied in order and reported individually — one bad id does not discard the rest of the batch. `drop` requires a reason: closing a todo without one is indistinguishable from forgetting it. Adding reports `possible_duplicates` (existing open todos at very high similarity) but never merges, since two similar todos can be separate work.\n\nDo NOT mirror the in-session task list here. Add a todo when work should be picked up by a *later* session.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
