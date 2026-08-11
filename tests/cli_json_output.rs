@@ -58,8 +58,8 @@ fn seed(db: &std::path::Path) -> String {
             "--non-interactive",
             "--summary",
             "Tuned the gateway rate limiter",
-            "--todos",
-            "Measure p99 under load",
+            "--blockers",
+            "Waiting on a load-test window",
         ],
     );
     assert_eq!(handoff.code, Some(0), "{}", handoff.stderr);

@@ -15,6 +15,7 @@ pub enum MemoryType {
     Entity,
     Handoff,
     Adr,
+    Todo,
 }
 
 impl MemoryType {
@@ -28,6 +29,7 @@ impl MemoryType {
             Self::Entity => "entity",
             Self::Handoff => "handoff",
             Self::Adr => "adr",
+            Self::Todo => "todo",
         }
     }
 }
@@ -62,6 +64,7 @@ impl FromStr for MemoryType {
             "entity" => Ok(Self::Entity),
             "handoff" => Ok(Self::Handoff),
             "adr" => Ok(Self::Adr),
+            "todo" => Ok(Self::Todo),
             _ => Err(ParseMemoryTypeError(s.to_string())),
         }
     }
@@ -137,6 +140,84 @@ impl FromStr for AdrStatus {
             _ => Err(ParseAdrStatusError(s.to_string())),
         }
     }
+}
+
+/// Lifecycle state of a `MemoryType::Todo` memory.
+///
+/// A todo is state rather than knowledge: it is closed explicitly, never by omission.
+/// `Dropped` is distinct from `Done` because "we decided not to" and "we finished it"
+/// are different facts, and only the former needs a reason recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Open,
+    Done,
+    Dropped,
+}
+
+impl TodoStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Done => "done",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    /// Whether the todo still counts as outstanding work.
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
+impl fmt::Display for TodoStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseTodoStatusError(pub String);
+
+impl fmt::Display for ParseTodoStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid todo status: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseTodoStatusError {}
+
+impl FromStr for TodoStatus {
+    type Err = ParseTodoStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "done" => Ok(Self::Done),
+            "dropped" => Ok(Self::Dropped),
+            _ => Err(ParseTodoStatusError(s.to_string())),
+        }
+    }
+}
+
+/// A todo item: the `MemoryType::Todo` memory plus its lifecycle sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub project_id: String,
+    /// The todo text.
+    pub text: String,
+    pub status: TodoStatus,
+    /// Why the todo was dropped. Required for `Dropped`, absent otherwise.
+    pub reason: Option<String>,
+    /// Branch the todo belongs to; `None` means it applies to the whole project.
+    pub branch: Option<String>,
+    pub tags: Vec<String>,
+    pub importance: f64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// When the todo left the `Open` state.
+    pub closed_at: Option<i64>,
 }
 
 /// Structured fields for a `MemoryType::Handoff` memory.

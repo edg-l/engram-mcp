@@ -75,11 +75,17 @@ Before deleting, read the whole memory, including `merged_from`: dedup may have 
 
 # Session handoffs
 
-Use `handoff_create` at session end and `handoff_resume` at session start to preserve and restore working context across sessions. Handoffs capture structured sections (summary, decisions, todos, blockers, tried, mental model, next steps, notes) and are pinned so they never decay. Use `handoff_search` to find specific section content across past sessions.
+Use `handoff_create` at session end and `handoff_resume` at session start to preserve and restore working context across sessions. Handoffs capture structured sections (summary, decisions, blockers, tried, mental model, next steps, notes) and are pinned so they never decay. Use `handoff_search` to find specific section content across past sessions.
 
-`tried` records approaches abandoned and why, so the next session does not pay to rediscover them. When writing a handoff that continues an earlier one, restate every `todos` and `blockers` item still open: `handoff_resume` returns the newest handoff's todos and blockers verbatim as `open_todos`/`open_blockers`, so anything omitted reads as done.
+`tried` records approaches abandoned and why, so the next session does not pay to rediscover them. When writing a handoff that continues an earlier one, restate every `blockers` item still unresolved: `handoff_resume` returns the newest handoff's blockers verbatim, so anything omitted reads as resolved.
 
-Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
+# Todos
+
+Outstanding work belongs in the durable todo list, not in a handoff: `todo_write` to add, finish (`done`), or abandon (`drop`, with a mandatory reason) items, and `todo_list` to read them. Todos never decay and survive across sessions.
+
+`handoff_resume` returns the live open list as `open_todos`, which is the nudge to check it — do that at session start, and reconcile as you work rather than only at the end. Add a todo when work should be picked up by a *later* session; do not mirror your in-session task list here. Omit `branch` for work that applies to the whole project, and scope to a branch only when the work is genuinely branch-specific, since a branch-scoped todo is invisible elsewhere.
+
+Section semantics: **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 
 # Architecture decisions
 

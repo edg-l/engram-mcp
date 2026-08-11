@@ -1,29 +1,35 @@
 use engram_mcp::tools::schemas::{ToolProfile, get_tool_definitions, get_tool_definitions_for};
 
 #[test]
-fn minimal_profile_has_three_tools() {
+fn minimal_profile_has_four_tools() {
     let tools = get_tool_definitions_for(ToolProfile::Minimal);
-    assert_eq!(tools.len(), 3);
-    let names: std::collections::HashSet<String> =
-        tools.iter().map(|t| t.name.to_string()).collect();
-    let expected: std::collections::HashSet<String> =
-        ["memory_context", "memory_store", "handoff_resume"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    assert_eq!(names, expected);
-}
-
-#[test]
-fn core_profile_has_seventeen_tools() {
-    let tools = get_tool_definitions_for(ToolProfile::Core);
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 4);
     let names: std::collections::HashSet<String> =
         tools.iter().map(|t| t.name.to_string()).collect();
     let expected: std::collections::HashSet<String> = [
         "memory_context",
         "memory_store",
         "handoff_resume",
+        "todo_write",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(names, expected);
+}
+
+#[test]
+fn core_profile_has_nineteen_tools() {
+    let tools = get_tool_definitions_for(ToolProfile::Core);
+    assert_eq!(tools.len(), 19);
+    let names: std::collections::HashSet<String> =
+        tools.iter().map(|t| t.name.to_string()).collect();
+    let expected: std::collections::HashSet<String> = [
+        "memory_context",
+        "memory_store",
+        "handoff_resume",
+        "todo_write",
+        "todo_list",
         "memory_query",
         "memory_update",
         "memory_delete",
@@ -48,7 +54,7 @@ fn core_profile_has_seventeen_tools() {
 #[test]
 fn full_profile_matches_default() {
     let full = get_tool_definitions_for(ToolProfile::Full);
-    assert_eq!(full.len(), 27);
+    assert_eq!(full.len(), 29);
     let full_names: std::collections::HashSet<String> =
         full.iter().map(|t| t.name.to_string()).collect();
     let all = get_tool_definitions();

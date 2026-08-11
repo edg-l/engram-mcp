@@ -314,6 +314,32 @@ impl Database {
             )?;
         }
 
+        // Migration 9: todo_items, the lifecycle sidecar for `MemoryType::Todo` memories.
+        //
+        // Branch scoping comes from `memories.branch` (NULL = applies to the whole project),
+        // so it is not duplicated here. Closing a todo also sets `memory_status.dead`, which
+        // is what keeps finished work out of query and context results.
+        if current_version < 9 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS todo_items (
+                    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    closed_at INTEGER
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_todo_items_status
+                    ON todo_items(status);
+                "#,
+            )?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![9],
+            )?;
+        }
+
         Ok(())
     }
 }

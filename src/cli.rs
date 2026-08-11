@@ -17,11 +17,13 @@ mod tools;
 use db::Database;
 use embedding::EmbeddingService;
 use error::MemoryError;
+use format::format_todo;
 use hooks::HookEvent;
 use memory::{
     AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, RelationType, Relationship,
 };
 use summarize::{generate_summary, should_auto_summarize};
+use tools::TodoOp;
 use tools::curation::{CurationView, MatchedVia, Resolution, supersession_candidates};
 
 #[derive(Parser)]
@@ -305,6 +307,67 @@ enum Commands {
         #[command(subcommand)]
         cmd: HooksCmd,
     },
+    /// Manage the project's durable todo list
+    Todo {
+        #[command(subcommand)]
+        cmd: TodoCmd,
+    },
+}
+
+/// Subcommands for `engram-cli todo`.
+#[derive(Subcommand)]
+enum TodoCmd {
+    /// Open a new todo
+    Add {
+        /// Todo text
+        text: String,
+        /// Scope to a branch. Omit for a project-wide todo; "auto" uses the current branch
+        #[arg(long)]
+        branch: Option<String>,
+        /// Topic tags (repeatable or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Importance (0.0-1.0, default 0.6)
+        #[arg(long)]
+        importance: Option<f64>,
+    },
+    /// List todos
+    List {
+        /// Lifecycle filter: open (default), done, dropped, all
+        #[arg(long, default_value = "open")]
+        status: String,
+        /// current (default), project, all, or a literal branch name
+        #[arg(long, default_value = "current")]
+        branch_mode: String,
+        /// Maximum results
+        #[arg(short, long, default_value = "100")]
+        limit: usize,
+    },
+    /// Mark a todo finished
+    Done {
+        /// Todo id
+        id: String,
+    },
+    /// Close a todo without doing it
+    Drop {
+        /// Todo id
+        id: String,
+        /// Why it was dropped (required)
+        #[arg(long)]
+        reason: String,
+    },
+    /// Return a closed todo to the open state
+    Reopen {
+        /// Todo id
+        id: String,
+    },
+    /// Rewrite a todo's text
+    Edit {
+        /// Todo id
+        id: String,
+        /// New text
+        text: String,
+    },
 }
 
 /// Subcommands for `engram-cli handoff`.
@@ -318,9 +381,6 @@ enum HandoffCmd {
         /// Key decisions made (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         decisions: Vec<String>,
-        /// Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. (can be repeated or comma-separated)
-        #[arg(long, value_delimiter = ',')]
-        todos: Vec<String>,
         /// Things preventing forward motion right now (missing access, failing dependency, unanswered question). (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         blockers: Vec<String>,
@@ -491,6 +551,7 @@ fn supports_json(cmd: &Commands) -> bool {
             HandoffCmd::Resume { .. } | HandoffCmd::Search { .. } | HandoffCmd::Show { .. }
         ),
         Commands::Adr { cmd } => matches!(cmd, AdrCmd::List { .. } | AdrCmd::Show { .. }),
+        Commands::Todo { cmd } => matches!(cmd, TodoCmd::List { .. }),
         _ => false,
     }
 }
@@ -662,6 +723,9 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
             HandoffCmd::Create { .. } | HandoffCmd::Resume { .. } | HandoffCmd::Search { .. }
         ),
         Commands::Adr { cmd: adr_cmd } => matches!(adr_cmd, AdrCmd::Create { .. }),
+        // Every todo mutation embeds its text (add/edit directly, the rest to reach the
+        // shared batch path); listing does not.
+        Commands::Todo { cmd: todo_cmd } => !matches!(todo_cmd, TodoCmd::List { .. }),
         Commands::HookEvent { .. } => true,
         Commands::Hooks { .. } => false,
         _ => false,
@@ -985,6 +1049,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &project_id,
                 embedding_service.as_ref(),
                 adr_cmd,
+                cli.json,
+            )?;
+        }
+        Commands::Todo { cmd: todo_cmd } => {
+            cmd_todo(
+                &db,
+                &project_id,
+                embedding_service.as_ref(),
+                current_branch.as_deref(),
+                todo_cmd,
                 cli.json,
             )?;
         }
@@ -2641,6 +2715,100 @@ fn prompt_list(label: &str) -> Vec<String> {
 
 /// Dispatch handoff subcommands.
 #[allow(clippy::too_many_arguments)]
+/// Handle `engram-cli todo <subcommand>`.
+fn cmd_todo(
+    db: &Database,
+    project_id: &str,
+    embedding_service: Option<&EmbeddingService>,
+    current_branch: Option<&str>,
+    cmd: TodoCmd,
+    json: bool,
+) -> Result<(), MemoryError> {
+    let embedding = || -> Result<&EmbeddingService, MemoryError> {
+        embedding_service
+            .ok_or_else(|| MemoryError::InvalidType("embedding service required".to_string()))
+    };
+
+    // Every mutation goes through the same `write_todos` batch path the MCP tool uses, so
+    // the two cannot disagree about validation or duplicate reporting.
+    let op = match cmd {
+        TodoCmd::List {
+            status,
+            branch_mode,
+            limit,
+        } => {
+            let status_filter = match status.as_str() {
+                "all" => None,
+                other => Some(other.parse().map_err(|_| {
+                    MemoryError::InvalidType(format!(
+                        "unknown todo status '{other}'; expected open, done, dropped, or all"
+                    ))
+                })?),
+            };
+            let branch_filter = match branch_mode.as_str() {
+                "all" => None,
+                "project" => Some(None),
+                "current" => current_branch.map(Some),
+                literal => Some(Some(literal)),
+            };
+            let result = tools::list_todos(db, project_id, status_filter, branch_filter, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+            if result.todos.is_empty() {
+                println!("No todos matched.");
+            } else {
+                for todo in &result.todos {
+                    println!("{}", format_todo(todo));
+                }
+            }
+            println!(
+                "\n{} open, {} done, {} dropped",
+                result.open_count, result.done_count, result.dropped_count
+            );
+            return Ok(());
+        }
+        TodoCmd::Add {
+            text,
+            branch,
+            tags,
+            importance,
+        } => TodoOp::Add {
+            text,
+            branch,
+            tags,
+            importance,
+        },
+        TodoCmd::Done { id } => TodoOp::Done { id },
+        TodoCmd::Drop { id, reason } => TodoOp::Drop { id, reason },
+        TodoCmd::Reopen { id } => TodoOp::Reopen { id },
+        TodoCmd::Edit { id, text } => TodoOp::Edit { id, text },
+    };
+
+    let result = tools::write_todos(db, embedding()?, project_id, current_branch, vec![op])?;
+
+    for r in &result.results {
+        match &r.error {
+            Some(err) => {
+                eprintln!("{} failed: {}", r.op, err);
+                std::process::exit(1);
+            }
+            None => println!("{} ok: {}", r.op, r.id),
+        }
+        for dup in &r.possible_duplicates {
+            println!(
+                "  possible duplicate: {} ({:.0}%) {}",
+                dup.id,
+                dup.similarity * 100.0,
+                dup.text
+            );
+        }
+    }
+    println!("{} open todo(s).", result.open_count);
+    Ok(())
+}
+
 fn cmd_handoff(
     db: &Database,
     project_id: &str,
@@ -2653,7 +2821,6 @@ fn cmd_handoff(
         HandoffCmd::Create {
             summary,
             decisions,
-            todos,
             blockers,
             tried,
             mental_model,
@@ -2707,12 +2874,6 @@ fn cmd_handoff(
                     prompt_list("Decisions")
                 };
 
-                let todos_list = if !todos.is_empty() || !interactive {
-                    todos
-                } else {
-                    prompt_list("Todos")
-                };
-
                 let blockers_list = if !blockers.is_empty() || !interactive {
                     blockers
                 } else {
@@ -2749,7 +2910,9 @@ fn cmd_handoff(
                 HandoffSections {
                     summary: summary_text,
                     decisions: decisions_list,
-                    todos: todos_list,
+                    // Open work lives in the durable todo list (`engram-cli todo`), which
+                    // handoff resume reads directly.
+                    todos: vec![],
                     blockers: blockers_list,
                     tried: tried_list,
                     mental_model: mental_model_text,

@@ -16,6 +16,7 @@ mod memories;
 mod migrations;
 mod relationships;
 mod status;
+mod todos;
 mod trash;
 
 // Each binary compiles these modules separately, so an export used by only one of them

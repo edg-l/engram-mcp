@@ -269,7 +269,7 @@ fn cli_current_branch_overrides_env() {
             "--non-interactive",
             "--summary",
             "Work done on another checkout",
-            "--todos",
+            "--blockers",
             "Finish the migration",
         ],
     );
@@ -287,7 +287,7 @@ fn cli_current_branch_overrides_env() {
         "env branch must not see the overridden branch's handoff, got: {stdout}"
     );
 
-    // With the override the handoff resumes, carrying its open todo.
+    // With the override the handoff resumes, carrying its unresolved blocker.
     let (status, stdout, _) = run_cli(
         &db_path,
         project,

@@ -26,16 +26,20 @@ src/
   error.rs     - MemoryError enum
   hooks/       - Claude Code lifecycle hook handlers: dispatch, filter, redact, install, payload structs
   db/status.rs   - retrieval status: supersession map (from edges) + dead flags
+  db/todos.rs    - todo lifecycle sidecar (status/reason/closed_at)
+  tools/todo.rs  - todo op batch, duplicate reporting, open-todo lookup for resume
   db/trash.rs    - recoverable snapshots for every destructive operation
   tools/curation.rs - applying supersession/dead status to a ranked result set
 ```
 
 ## Key Types
-- `MemoryType`: fact, decision, preference, pattern, debug, entity, handoff, adr
+- `MemoryType`: fact, decision, preference, pattern, debug, entity, handoff, adr, todo
 - `RelationType`: relates_to, supersedes, derived_from
 - `Memory`: id, project_id, content, tags, importance, relevance_score, timestamps, branch, merged_from
 - `MergeSource`: id, content_preview, content (full text of the consumed memory), merged_at
 - `MemoryCluster`: id, project_id, summary, member_count, centroid, timestamps
+- `TodoItem`: id, project_id, text, status, reason, branch, tags, importance, timestamps, closed_at
+- `TodoStatus`: open, done, dropped
 - `MemoryError`: Database, Json, Embedding, NotFound, InvalidType, InvalidRelation, UnknownTool, UnknownProject, InvalidArguments, Io
 
 ## MCP Capabilities
@@ -54,6 +58,8 @@ src/
 - `memory_projects` - list every project in the store with memory/handoff/ADR counts
 - `memory_context` - get relevant memories for context (hierarchical retrieval via clusters, flat fallback)
 - `memory_list` - enumerate memories without a query; filters by type/tag/status, orders by relevance/created/updated/accessed
+- `todo_write` - apply add/done/drop/reopen/edit ops to the durable todo list (batched, per-op results)
+- `todo_list` - list todos by lifecycle state and branch
 - `memory_trash` - list recoverable snapshots of destroyed memories
 - `memory_restore` - restore a memory from the trash with its embedding and relationships
 - `memory_prune` - remove low-relevance memories (dry run by default)
@@ -116,7 +122,14 @@ engram-cli handoff create --non-interactive --summary "..."  # never prompt; mis
 engram-cli handoff create --tried "bulk UPDATE, locked the table for 90s"  # record a dead end
 engram-cli handoff create --from-file session.md  # ingest pre-written markdown handoff
 engram-cli handoff resume [--branch X] [--query Q] [--max N]  # load context from recent handoffs
-engram-cli handoff search <query> [--branch X] [--section blockers,todos] [--limit N]  # search sections
+engram-cli handoff search <query> [--branch X] [--section blockers,tried] [--limit N]  # search sections
+engram-cli todo add "text"                 # open a project-wide todo
+engram-cli todo add "text" --branch auto   # scope it to the current branch
+engram-cli todo list [--status open|done|dropped|all] [--branch-mode current|project|all|<name>]
+engram-cli todo done <id>                  # mark finished
+engram-cli todo drop <id> --reason "..."   # close without doing it (reason required)
+engram-cli todo reopen <id>                # return to the open state
+engram-cli todo edit <id> "new text"
 engram-cli hook-event <Event>              # process a Claude Code lifecycle hook event (reads stdin JSON)
 engram-cli hooks install/uninstall/status  # manage Claude Code settings.json integration
 engram-cli adr create                      # create a new ADR interactively
@@ -250,18 +263,33 @@ The background job still has work a store cannot do. `sweep_trash` deletes on `t
 
 A consequence worth knowing: a freshly stored memory's relevance is now its importance factor (`0.5 + importance/2`), not a flat 1.0. Ranking respects importance from the first query rather than from whenever a decay pass happened to run.
 
-## Handoffs
-Section-based session capture (`summary, decisions, todos, blockers, tried, mental_model, next_steps, notes`). Handoffs are branch-aware `MemoryType::Handoff` memories, pinned by default, with a `handoff_sections` sidecar table holding per-section embeddings (256-dim f32 LE, prefix-free). Branch chaining via `continues_from` lives in the sidecar only (not a graph edge). Auto-links to `decision/pattern/debug` memories at cosine similarity >= 0.75 (cap 10 links). Bypasses dedup entirely. Two MCP prompts: `handoff` (capture) and `resume` (restore). CLI: `engram-cli handoff create/resume/search`.
+## Todos
 
-Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **tried** — Approaches attempted and abandoned, each with the reason it failed. **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
+A durable, per-project task list: `MemoryType::Todo` memories with a `todo_items` sidecar holding `status`, `reason`, and `closed_at`. It exists because a handoff is a *snapshot*, and open work is *state*: restating todos in every handoff and treating omission as completion cannot distinguish "finished" from "forgotten". A todo has an id and an explicit close, so it can't.
+
+- **Lifecycle**: `open → done`, `open → dropped`, and either back to `open` via reopen. **`drop` requires a reason** — a todo closed without one is indistinguishable from a forgotten one, which is the whole failure being designed against.
+- **Closing marks the memory dead.** `set_todo_status` writes `memory_status.dead`, so finished todos leave `memory_query`/`memory_context` through the curation layer that already exists; neither retrieval path knows what a todo is. Reopening clears it.
+- **Branch scoping reuses `memories.branch`**: `NULL` means the todo applies to the whole project, and a branch-scoped todo surfaces only on that branch (plus project-wide ones). Prefer project-wide, since a branch todo strands when its branch is merged and deleted.
+- **Pinned, and bypasses dedup and clustering.** Pinned so decay and prune leave it alone: an old todo is not less true, it is more overdue. Merging two todos would destroy a work item, so `store_todo_atomic` skips the dedup path entirely.
+- **Duplicates are reported, never merged.** Adding returns `possible_duplicates` (existing open todos at cosine >= `TODO_DUPLICATE_MIN` = 0.97, top 3). Agents re-adding the same todo each session is the failure mode a durable list invites; collapsing them automatically is not the fix.
+- **0.97 is measured, not chosen.** Short texts sit in a narrow high band on this embedding model: against "Migrate the remaining 40 legacy subscriptions", an identical string scores 1.00, a rewording of the same work 0.98, a *different* task on the same subject 0.95, unrelated todos 0.86-0.93, an unrelated non-todo sentence 0.84. A threshold near the 0.85-0.90 used elsewhere in this codebase flags unrelated todos as duplicates, and a field that cries duplicate on everything is one the caller learns to skip.
+- **`handoff_resume` has a compact renderer** (`compact_handoff_resume`) that leads with open todos. Raw serialization buried `open_todos` behind `linked_memories`, and a nudge the caller scrolls past is not a nudge. It states the empty case explicitly too, since silence reads as "no list exists".
+- **A failing op does not abort the batch.** `todo_write` reports per-op results, so one bad id cannot discard the valid closes beside it.
+- **`handoff_create` rejects a `todos` section** rather than dropping it silently. The field survives on `HandoffSections` so handoffs written before the split still parse and render.
+
+## Handoffs
+Section-based session capture (`summary, decisions, blockers, tried, mental_model, next_steps, notes`). Handoffs are branch-aware `MemoryType::Handoff` memories, pinned by default, with a `handoff_sections` sidecar table holding per-section embeddings (256-dim f32 LE, prefix-free). Branch chaining via `continues_from` lives in the sidecar only (not a graph edge). Auto-links to `decision/pattern/debug` memories at cosine similarity >= 0.75 (cap 10 links). Bypasses dedup entirely. Two MCP prompts: `handoff` (capture) and `resume` (restore). CLI: `engram-cli handoff create/resume/search`.
+
+Section semantics: **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **tried** — Approaches attempted and abandoned, each with the reason it failed. **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 
 ### Carry-over
 
-`handoff_resume` returns `open_todos` and `open_blockers`: the newest handoff's todos and blockers verbatim, outside the similarity ranking and unaffected by `max_sections`. Ranked retrieval alone loses long-running work — a task spanning several sessions competes for section slots against whatever the latest session happened to be about, and drops out exactly when it has been open longest.
+`handoff_resume` returns two things outside the similarity ranking and unaffected by `max_sections`, because ranked retrieval alone loses long-running work — it competes for section slots against whatever the latest session was about, and drops out exactly when it has been open longest:
 
-That guarantee only holds if each handoff restates what is still open, which is what the tool schema and the `handoff` prompt instruct. An omitted todo therefore reads as done; that is the intended encoding, since a snapshot cannot distinguish "finished" from "forgotten" any other way.
+- **`open_todos`** comes from the durable todo list, not from any handoff, and is present even when no handoff exists (a project can have todos before its first handoff). This is also the nudge: it is the one field that makes an agent check the list at session start.
+- **`open_blockers`** is the newest handoff's blockers verbatim. Blockers are still snapshot state, so each handoff must restate what is unresolved; an omitted blocker reads as resolved.
 
-`tried` is deliberately excluded from carry-over. A dead end is a permanent fact rather than open state, so it is recorded once and reached later via `handoff_search` with `section_filter: ["tried"]`. Restating dead ends in every subsequent handoff would grow without bound.
+`tried` is excluded from carry-over. A dead end is a permanent fact rather than open state, so it is recorded once and reached later via `handoff_search` with `section_filter: ["tried"]`. Restating dead ends in every subsequent handoff would grow without bound.
 
 ## Config (env vars)
 - `ENGRAM_DB` - SQLite path (default: ~/.local/share/engram/memories.db)
@@ -276,7 +304,7 @@ That guarantee only holds if each handoff restates what is still open, which is 
 - `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` - opt-in flag for the `UserPromptSubmit` hook (default off; even when on, captures require an explicit `#remember` cue)
 - `ENGRAM_TRASH_RETENTION_DAYS` - days a destroyed memory stays recoverable in `memory_trash`; `0` = keep forever (default: 30). Swept on the decay tick.
 - `ENGRAM_ADR_DIR` - output directory for `adr_export` file writes (default: `docs/adr` relative to server cwd). Overridden by the `dir` argument on the tool/CLI call.
-- `ENGRAM_MCP_TOOL_PROFILE` - advertised MCP tool surface: `full` (27 tools, default), `core` (17; includes adr_create/adr_show/adr_list, memory_projects, memory_list and memory_restore), or `minimal` (3: memory_context, memory_store, handoff_resume). `adr_update_status` and `adr_export` are full-only. Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process.
+- `ENGRAM_MCP_TOOL_PROFILE` - advertised MCP tool surface: `full` (29 tools, default), `core` (19; includes todo_write/todo_list, adr_create/adr_show/adr_list, memory_projects, memory_list and memory_restore), or `minimal` (4: memory_context, memory_store, handoff_resume, todo_write — writable because a read-only nudge is useless if the agent cannot close what it finishes). `adr_update_status` and `adr_export` are full-only. Dispatch stays permissive — non-advertised tools still execute with a one-time `[engram]` warning per process.
 
 ## Commands
 ```bash

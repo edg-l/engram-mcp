@@ -29,8 +29,8 @@ use super::schemas::{
     MemoryDedupInput, MemoryDeleteBatchInput, MemoryDeleteInput, MemoryExportInput,
     MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryListInput, MemoryPromoteInput,
     MemoryPruneInput, MemoryQueryInput, MemoryRestoreInput, MemoryStatsInput,
-    MemoryStoreBatchInput, MemoryStoreInput, MemoryTrashInput, MemoryUpdateInput, ToolProfile,
-    dedup_threshold, get_tool_definitions_for,
+    MemoryStoreBatchInput, MemoryStoreInput, MemoryTrashInput, MemoryUpdateInput, TodoListInput,
+    TodoWriteInput, ToolProfile, dedup_threshold, get_tool_definitions_for,
 };
 use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
@@ -336,6 +336,8 @@ impl ToolHandler {
             "memory_promote" => self.memory_promote(arguments),
             "memory_dedup" => self.memory_dedup(arguments),
             "handoff_create" => self.handoff_create(arguments),
+            "todo_write" => self.todo_write(arguments),
+            "todo_list" => self.todo_list(arguments),
             "handoff_resume" => self.handoff_resume(arguments),
             "handoff_search" => self.handoff_search(arguments),
             "adr_create" => self.adr_create(arguments),
@@ -2751,9 +2753,63 @@ impl ToolHandler {
         }
     }
 
+    fn todo_write(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: TodoWriteInput = parse_args("todo_write", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
+        let result = crate::tools::todo::write_todos(
+            &self.db,
+            &self.embedding,
+            &project,
+            self.current_branch_for(&project),
+            input.ops,
+        )?;
+        Ok(json!(result))
+    }
+
+    fn todo_list(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let input: TodoListInput = parse_args("todo_list", arguments)?;
+        let project = self.resolve_project(input.project.as_deref())?;
+
+        let status = match input.status.as_str() {
+            "all" => None,
+            other => Some(other.parse().map_err(|_| {
+                MemoryError::InvalidType(format!(
+                    "unknown todo status '{other}'; expected open, done, dropped, or all"
+                ))
+            })?),
+        };
+
+        // "current" means this branch plus project-wide todos, and widens to every branch
+        // when the target is not the server's own project — the same reasoning as
+        // `branch_filter_for`: a branch name describes one checkout.
+        let branch_filter = match input.branch_mode.as_str() {
+            "all" => None,
+            "project" => Some(None),
+            "current" => self.current_branch_for(&project).map(Some),
+            literal => Some(Some(literal)),
+        };
+
+        let result =
+            crate::tools::todo::list_todos(&self.db, &project, status, branch_filter, input.limit)?;
+        Ok(json!(result))
+    }
+
     fn handoff_create(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: HandoffCreateInput = parse_args("handoff_create", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
+
+        // Open work lives in the todo list, which is what handoff_resume reads. The field
+        // survives on `HandoffSections` so handoffs written before the split still parse,
+        // but accepting it here would give the caller two homes for one concept and lose
+        // whichever one nobody read. Rejecting beats dropping it silently.
+        if !input.sections.todos.is_empty() {
+            return Err(MemoryError::InvalidType(
+                "handoff_create no longer accepts a `todos` section; open work belongs in \
+                 the todo list. Add the items with todo_write instead — handoff_resume \
+                 returns them as open_todos."
+                    .to_string(),
+            ));
+        }
 
         // Resolve branch: explicit input branch, then current branch from ToolHandler.
         // The server's branch describes its own checkout, so writing a handoff to

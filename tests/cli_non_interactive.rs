@@ -92,8 +92,8 @@ fn handoff_create_does_not_prompt_when_non_interactive() {
             "--non-interactive",
             "--summary",
             "Wired up the release pipeline",
-            "--todos",
-            "Tag the release",
+            "--blockers",
+            "Waiting on a signed changelog",
         ],
     )
     .expect("handoff create --non-interactive must not wait on stdin");

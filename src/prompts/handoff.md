@@ -16,9 +16,6 @@ One to three sentences covering both what the user asked for and what actually h
 **decisions**
 Each choice made this session: what was decided AND why, including trade-offs weighed. Record the assumptions you made that nobody specified, not only the deliberate architectural calls — an unstated assumption is what the next agent unknowingly contradicts. Omit choices that follow from a convention already written down.
 
-**todos**
-Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items; name the file, function, or literal command where one exists.
-
 **blockers**
 Things preventing forward motion right now (missing access, failing dependency, unanswered question).
 
@@ -34,11 +31,15 @@ Post-session follow-ups beyond the current thread. Future-facing, not for immedi
 **notes**
 Freeform notes that don't fit elsewhere: environment quirks, partial workarounds, references, or anything a fresh agent would find useful. Optional — omit if empty.
 
-## Carrying open work forward
+## Open work is not a section
 
-A handoff is a snapshot, so state that outlives one session only survives if each snapshot restates it. When this session resumed from an earlier handoff, re-emit every `todos` and `blockers` item that is still open, whether or not you touched it. `handoff_resume` returns the newest handoff's todos and blockers verbatim as `open_todos` / `open_blockers`, so an item you drop reads as finished and a task spanning several sessions disappears the first time nobody mentions it.
+There is no `todos` section, and passing one is an error. Outstanding work lives in the durable todo list, which has identity and an explicit close: call `todo_write` to add what a later session should pick up, and to mark `done` or `drop` what this session settled. `handoff_resume` reads that list directly and returns it as `open_todos`.
 
-`tried` works the opposite way: a dead end is a permanent fact, not open state. Record it once and leave it; `handoff_search` with `section_filter: ["tried"]` reaches it later.
+Before writing the handoff, walk the open todos and reconcile them — anything you finished should be closed here, not carried as prose. A handoff is a snapshot of a session; a todo is state that outlives one, and a snapshot cannot tell "finished" from "forgotten".
+
+**blockers** still work the snapshot way: re-emit every blocker that is still unresolved, whether or not you touched it, since `handoff_resume` returns the newest handoff's blockers verbatim and an omitted one reads as resolved.
+
+**tried** is the opposite of both: a dead end is a permanent fact, not open state. Record it once and leave it; `handoff_search` with `section_filter: ["tried"]` reaches it later.
 
 ## Sensitive data
 
@@ -53,7 +54,6 @@ After gathering all sections, call `handoff_create` with:
   "sections": {
     "summary": "...",
     "decisions": ["...", "..."],
-    "todos": ["...", "..."],
     "blockers": ["..."],
     "tried": ["...", "..."],
     "mental_model": "...",

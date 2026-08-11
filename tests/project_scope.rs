@@ -222,7 +222,6 @@ fn handoffs_can_be_written_and_read_across_projects() {
             "sections": {
                 "summary": "Cut the 2.0 release branch and froze the migration schema.",
                 "decisions": ["Freeze the migration schema before tagging"],
-                "todos": ["Tag the release once CI is green"],
                 "blockers": ["Waiting on the signed changelog"],
                 "mental_model": "Release branches only take cherry-picked fixes.",
                 "next_steps": ["Plan the 2.1 milestone"],

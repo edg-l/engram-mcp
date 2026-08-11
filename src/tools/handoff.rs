@@ -7,6 +7,7 @@ use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship};
 use crate::summarize::{generate_summary, should_auto_summarize};
+use crate::tools::todo::open_todo_texts;
 
 // ============================================
 // Handoff result structs
@@ -62,12 +63,13 @@ pub struct HandoffResumeResult {
     pub chain: Vec<String>,
     /// Top-scoring section excerpts across all handoffs in the chain.
     pub top_sections: Vec<HandoffSectionMatch>,
-    /// Verbatim `todos` from the newest handoff, outside the similarity ranking.
+    /// The project's live open todos for this branch, from the durable todo list.
     ///
-    /// Open work outlives the session that recorded it: a multi-session task stays open
-    /// across several handoffs, and ranking `top_sections` by similarity can push it out
-    /// of the response entirely. Returning it unconditionally is what makes a long-running
-    /// todo survive; each handoff is expected to restate the items still open.
+    /// Not derived from the handoff sections and not subject to the similarity ranking:
+    /// open work outlives the session that recorded it, and a task spanning several
+    /// sessions would otherwise compete for section slots and drop out exactly when it
+    /// has been open longest. Present even when no handoff exists, since a project can
+    /// have todos before it has a handoff.
     #[serde(default)]
     pub open_todos: Vec<String>,
     /// Verbatim `blockers` from the newest handoff, on the same unconditional basis.
@@ -479,6 +481,10 @@ pub fn resume_handoff_with_vec(
         ),
     };
 
+    // Step 1b: the open todo list. Fetched before the handoff lookup because it is
+    // independent of it — a project with todos but no handoff must still get the nudge.
+    let open_todos = open_todo_texts(db, project_id, resolved_branch.as_deref(), 100)?;
+
     // Step 2: fetch latest handoffs.
     let latest_list = if fetch_all {
         db.list_recent_handoffs(project_id, 10)?
@@ -492,7 +498,7 @@ pub fn resume_handoff_with_vec(
             latest_handoff_id: None,
             chain: Vec::new(),
             top_sections: Vec::new(),
-            open_todos: Vec::new(),
+            open_todos,
             open_blockers: Vec::new(),
             linked_memories: Vec::new(),
             message,
@@ -531,10 +537,12 @@ pub fn resume_handoff_with_vec(
     // Reverse to oldest-first order.
     chain_ids.reverse();
 
-    // Step 3b: lift open work off the newest handoff, bypassing the similarity ranking.
-    let (open_todos, open_blockers) = match db.get_handoff_sections(&latest_id)? {
-        Some((sections, _)) => (sections.todos, sections.blockers),
-        None => (Vec::new(), Vec::new()),
+    // Step 3b: lift unresolved blockers off the newest handoff, bypassing the similarity
+    // ranking. Blockers are still a handoff snapshot restated forward; only todos moved to
+    // the durable list.
+    let open_blockers = match db.get_handoff_sections(&latest_id)? {
+        Some((sections, _)) => sections.blockers,
+        None => Vec::new(),
     };
 
     // Step 4: score every section across all chain handoffs (only when a query vec is available).

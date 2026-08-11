@@ -33,12 +33,21 @@ impl std::str::FromStr for ToolProfile {
     }
 }
 
-const MINIMAL_TOOLS: &[&str] = &["memory_context", "memory_store", "handoff_resume"];
+const MINIMAL_TOOLS: &[&str] = &[
+    "memory_context",
+    "memory_store",
+    "handoff_resume",
+    // A read-only nudge is worthless if the agent cannot close what it finishes, so the
+    // todo list is writable even in the smallest profile.
+    "todo_write",
+];
 
 const CORE_TOOLS: &[&str] = &[
     "memory_context",
     "memory_store",
     "handoff_resume",
+    "todo_write",
+    "todo_list",
     "memory_query",
     "memory_update",
     "memory_delete",
@@ -288,6 +297,43 @@ fn default_list_status() -> String {
 
 fn default_list_content_length() -> usize {
     160
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TodoWriteInput {
+    /// Operations to apply, in order.
+    pub ops: Vec<crate::tools::todo::TodoOp>,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TodoListInput {
+    /// Lifecycle filter: "open" (default), "done", "dropped", or "all".
+    #[serde(default = "default_todo_status")]
+    pub status: String,
+    /// Branch filter: "current" (default, branch + project-wide), "project" for
+    /// project-wide only, "all" for every branch, or a literal branch name.
+    #[serde(default = "default_todo_branch_mode")]
+    pub branch_mode: String,
+    #[serde(default = "default_todo_limit")]
+    pub limit: usize,
+    /// Project to operate on. `None` = the server's own project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+fn default_todo_status() -> String {
+    "open".to_string()
+}
+
+fn default_todo_branch_mode() -> String {
+    "current".to_string()
+}
+
+fn default_todo_limit() -> usize {
+    100
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,7 +923,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Handoff tools ===
         Tool::new(
             "handoff_create",
-            "Create a session handoff capturing decisions, todos, blockers, dead ends tried, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
+            "Create a session handoff capturing decisions, blockers, dead ends tried, mental model, and next steps. Pinned by default; bypasses dedup.\n\nThere is no `todos` section: open work lives in the todo list (`todo_write` / `todo_list`), which handoff_resume reads directly. Passing `todos` is an error rather than a silent drop.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -891,7 +937,6 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "properties": {
                             "summary": {"type": "string", "description": "1–3 sentence summary of the session. Keep under ~500 chars."},
                             "decisions": {"type": "array", "items": {"type": "string"}, "description": "Key decisions, one short line each (what + why, ≤300 chars per item). No transcripts."},
-                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items, one short line each. Restate any todo from the previous handoff that is still open — resume returns these verbatim, so an omitted todo reads as done."},
                             "blockers": {"type": "array", "items": {"type": "string"}, "description": "Things preventing forward motion right now (missing access, failing dependency, unanswered question). One short line each. Restate any blocker from the previous handoff that is still unresolved — resume returns these verbatim, so an omitted blocker reads as resolved."},
                             "tried": {"type": "array", "items": {"type": "string"}, "description": "Approaches attempted and abandoned, each with the concrete reason it failed, so the next session does not retry them. One short line each ('X, because Y'). Dead ends are permanent — do not restate ones already recorded in an earlier handoff."},
                             "mental_model": {"type": "string", "description": "Architecture or context the next session needs. 1–5 sentences or a short bulleted list. Not a deep dive — link related decision/pattern memories instead."},
@@ -908,9 +953,60 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "required": ["sections"]
             })),
         ),
+        // === Todo tools ===
+        Tool::new(
+            "todo_write",
+            "Apply changes to the project's durable todo list: add, done, drop, reopen, edit. Todos survive across sessions and never decay, so this is the right home for work that outlives one conversation.\n\nOps are applied in order and reported individually — one bad id does not discard the rest of the batch. `drop` requires a reason: closing a todo without one is indistinguishable from forgetting it. Adding reports `possible_duplicates` (existing open todos above 0.85 similarity) but never merges, since two similar todos can be separate work.\n\nDo NOT mirror the in-session task list here. Add a todo when work should be picked up by a *later* session.",
+            project_scoped_schema(json!({
+                "type": "object",
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "description": "Operations to apply, in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {"type": "string", "enum": ["add", "done", "drop", "reopen", "edit"], "description": "Which change to make."},
+                                "id": {"type": "string", "description": "Todo id. Required for done/drop/reopen/edit."},
+                                "text": {"type": "string", "description": "Todo text. Required for add and edit. One concrete, ready-to-execute item; name the file, function, or command where one exists."},
+                                "reason": {"type": "string", "description": "Why the todo was dropped. Required for drop."},
+                                "branch": {"type": "string", "description": "add only. Omit for a todo that applies to the whole project; pass \"auto\" for the current branch, or a literal branch name. Branch-scoped todos are only surfaced on that branch, so prefer omitting unless the work is genuinely branch-specific."},
+                                "tags": {"type": "array", "items": {"type": "string"}, "description": "add only. Short lowercase topic tags."},
+                                "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "add only. Default 0.6."}
+                            },
+                            "required": ["op"],
+                            // Which other fields are mandatory depends on `op`, so the
+                            // per-variant requirements are spelled out rather than left
+                            // to a comment: `drop` without a reason and `done` without an
+                            // id are both rejected by the deserializer.
+                            "anyOf": [
+                                {"required": ["op", "text"], "properties": {"op": {"enum": ["add"]}}},
+                                {"required": ["op", "id"], "properties": {"op": {"enum": ["done"]}}},
+                                {"required": ["op", "id", "reason"], "properties": {"op": {"enum": ["drop"]}}},
+                                {"required": ["op", "id"], "properties": {"op": {"enum": ["reopen"]}}},
+                                {"required": ["op", "id", "text"], "properties": {"op": {"enum": ["edit"]}}}
+                            ]
+                        }
+                    }
+                },
+                "required": ["ops"]
+            })),
+        ),
+        Tool::new(
+            "todo_list",
+            "List the project's durable todos. Defaults to open todos for the current branch plus project-wide ones. Returns counts for every lifecycle state, so a filtered call still reveals that closed work exists.",
+            project_scoped_schema(json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["open", "done", "dropped", "all"], "description": "Lifecycle filter. Default \"open\"."},
+                    "branch_mode": {"type": "string", "description": "\"current\" (default: this branch plus project-wide), \"project\" (project-wide only), \"all\" (every branch), or a literal branch name."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Maximum todos to return (default 100)."}
+                }
+            })),
+        ),
         Tool::new(
             "handoff_resume",
-            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.",
+            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.\n\nAlways returns `open_todos`: the project's live open todo list for this branch, independent of the handoff sections and of whether any handoff exists. Check it, work from it, and reconcile it via todo_write as you go — mark done what you finish and drop with a reason what no longer applies.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {

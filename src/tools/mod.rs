@@ -12,6 +12,7 @@ mod handoff;
 pub mod schemas;
 pub mod scoring;
 pub mod store;
+pub mod todo;
 
 #[cfg(test)]
 mod test_utils;
@@ -25,3 +26,4 @@ pub use schemas::{
 };
 pub use scoring::{SearchMode, compute_hybrid_score, compute_tag_boost};
 pub use store::{StoreOutcome, store_with_dedup};
+pub use todo::{TodoListResult, TodoOp, TodoWriteResult, list_todos, open_todo_texts, write_todos};

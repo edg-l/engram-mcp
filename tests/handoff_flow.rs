@@ -398,9 +398,10 @@ fn import_old_export_without_sidecar_fields() {
     );
 }
 
-/// Open work must survive the similarity ranking. A todo that spans several sessions is
-/// only useful if resume returns it every time, even when the ranked `top_sections` budget
-/// is spent on other content — otherwise a long-running task silently disappears.
+/// Unresolved blockers must survive the similarity ranking: when the ranked `top_sections`
+/// budget is spent on other content, a blocker restated forward would otherwise disappear.
+/// Open todos are covered in `tests/todo_list.rs` — they come from the durable list, not
+/// from a handoff snapshot.
 #[test]
 fn resume_returns_open_work_outside_the_ranking() {
     let db = Database::open_in_memory().expect("in-memory DB must open");
@@ -413,7 +414,7 @@ fn resume_returns_open_work_outside_the_ranking() {
     let sections = HandoffSections {
         summary: "Rewrote the payment webhook dispatcher".to_string(),
         decisions: vec!["Dispatch by event type, not by object shape".to_string()],
-        todos: vec!["Migrate the remaining 40 legacy subscriptions".to_string()],
+        todos: vec![],
         blockers: vec!["Waiting on production DB credentials".to_string()],
         tried: vec!["Bulk UPDATE in one transaction, locked the table for 90s".to_string()],
         mental_model: "Dispatcher fans out to per-type handlers".to_string(),
@@ -435,7 +436,7 @@ fn resume_returns_open_work_outside_the_ranking() {
     .expect("create handoff must succeed");
 
     // One section slot, and a query aimed at the summary — the ranking has no room for
-    // todos or blockers.
+    // blockers.
     let result = resume_handoff(
         &db,
         &embedding,
@@ -448,11 +449,6 @@ fn resume_returns_open_work_outside_the_ranking() {
     )
     .expect("resume must succeed");
 
-    assert_eq!(
-        result.open_todos,
-        vec!["Migrate the remaining 40 legacy subscriptions".to_string()],
-        "open todos must be returned verbatim regardless of ranking"
-    );
     assert_eq!(
         result.open_blockers,
         vec!["Waiting on production DB credentials".to_string()],

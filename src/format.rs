@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::db::Database;
-use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory};
+use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory, TodoItem, TodoStatus};
 use serde_json::Value;
 
 /// Return true if `path` looks like a local filesystem path that should be
@@ -235,6 +235,31 @@ pub fn format_memory_content(memory: &Memory, max_len: usize) -> String {
     }
 }
 
+/// Render one todo as a checkbox line: `- [ ] text` open, `- [x]` done, `- [~]` dropped
+/// with its reason, since a dropped todo without the reason is the thing the reason exists
+/// to prevent.
+pub fn format_todo(todo: &TodoItem) -> String {
+    let (box_mark, suffix) = match todo.status {
+        TodoStatus::Open => (" ", String::new()),
+        TodoStatus::Done => ("x", String::new()),
+        TodoStatus::Dropped => (
+            "~",
+            match todo.reason.as_deref() {
+                Some(r) => format!(" (dropped: {r})"),
+                None => " (dropped)".to_string(),
+            },
+        ),
+    };
+    let scope = match todo.branch.as_deref() {
+        Some(b) => format!(" [{b}]"),
+        None => String::new(),
+    };
+    format!(
+        "- [{}] {}{}{}  {}",
+        box_mark, todo.text, scope, suffix, todo.id
+    )
+}
+
 /// Render a Handoff or ADR memory using the DB sidecar row.
 ///
 /// For Handoff: calls `db.get_handoff_sections`. For ADR: calls `db.get_adr_sections`.
@@ -254,6 +279,10 @@ fn format_memory_content_with_db(memory: &Memory, db: &Database, max_len: usize)
                 let rendered = format_adr(number, status, &sections);
                 truncate_str(&rendered, max_len)
             }
+            _ => format_memory_content(memory, max_len),
+        },
+        MemoryType::Todo => match db.get_todo(&memory.id) {
+            Ok(Some(todo)) => truncate_str(&format_todo(&todo), max_len),
             _ => format_memory_content(memory, max_len),
         },
         _ => format_memory_content(memory, max_len),
@@ -325,6 +354,9 @@ pub fn compact_tool_result(tool_name: &str, result: &Value, content_length: usiz
         "memory_delete_batch" => compact_delete_batch(result, content_length),
         "memory_list" => compact_list(result),
         "memory_trash" => compact_trash(result),
+        "handoff_resume" => compact_handoff_resume(result),
+        "todo_write" => compact_todo_write(result),
+        "todo_list" => compact_todo_list(result),
         "memory_restore" => compact_restore(result),
         _ => compact_fallback(result),
     }
@@ -355,6 +387,9 @@ pub fn compact_tool_result_with_db(
         "memory_delete_batch" => compact_delete_batch(result, content_length),
         "memory_list" => compact_list(result),
         "memory_trash" => compact_trash(result),
+        "handoff_resume" => compact_handoff_resume(result),
+        "todo_write" => compact_todo_write(result),
+        "todo_list" => compact_todo_list(result),
         "memory_restore" => compact_restore(result),
         _ => compact_fallback(result),
     }
@@ -1059,6 +1094,199 @@ fn compact_projects(result: &Value) -> String {
         ));
     }
     out.trim_end().to_string()
+}
+
+/// Lead with open work. The raw serialization buries `open_todos` behind whatever
+/// `linked_memories` happens to contain, and a nudge the caller has to scroll past is not
+/// a nudge — outstanding work is the first thing a resuming agent needs.
+fn compact_handoff_resume(result: &Value) -> String {
+    let mut out = String::new();
+
+    let branch = result
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no branch)");
+    let latest = result
+        .get("latest_handoff_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+    let chain_len = result
+        .get("chain")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    out.push_str(&format!(
+        "Resuming {branch}: {chain_len} handoff(s) in chain, latest {latest}\n"
+    ));
+
+    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Note: {msg}\n"));
+    }
+
+    // Always stated, including the empty case: silence reads as "no list exists" and the
+    // caller stops looking.
+    let todos = result
+        .get("open_todos")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or_default();
+    if todos.is_empty() {
+        out.push_str(
+            "\nOpen todos: none. Add one with todo_write when work should outlive this session.\n",
+        );
+    } else {
+        out.push_str("\nOpen todos (durable list — reconcile with todo_write as you work):\n");
+        for t in todos {
+            if let Some(text) = t.as_str() {
+                out.push_str(&format!("- [ ] {text}\n"));
+            }
+        }
+    }
+
+    if let Some(blockers) = result.get("open_blockers").and_then(|v| v.as_array())
+        && !blockers.is_empty()
+    {
+        out.push_str("\nOpen blockers:\n");
+        for b in blockers {
+            if let Some(text) = b.as_str() {
+                out.push_str(&format!("- {text}\n"));
+            }
+        }
+    }
+
+    if let Some(sections) = result.get("top_sections").and_then(|v| v.as_array())
+        && !sections.is_empty()
+    {
+        out.push_str("\nTop sections:\n");
+        for sec in sections {
+            let name = sec
+                .get("section_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let hid = sec
+                .get("handoff_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let score = sec.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let text = sec
+                .get("section_text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            out.push_str(&format!(
+                "\n[{name}] {hid} ({})\n{text}\n",
+                format_score(score)
+            ));
+        }
+    }
+
+    if let Some(linked) = result.get("linked_memories").and_then(|v| v.as_array())
+        && !linked.is_empty()
+    {
+        out.push_str("\nLinked memories:\n");
+        for m in linked {
+            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let mtype = m
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("memory");
+            let preview: String = m
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .or_else(|| m.get("content").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .chars()
+                .take(160)
+                .collect();
+            out.push_str(&format!("- [{mtype}] {preview}  {id}\n"));
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Report what each op did, and surface `possible_duplicates` prominently — the whole
+/// point of reporting them is that the caller reconsiders before leaving two copies.
+fn compact_todo_write(result: &Value) -> String {
+    let empty = vec![];
+    let results = result
+        .get("results")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let open_count = result
+        .get("open_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    for r in results {
+        let op = r.get("op").and_then(|v| v.as_str()).unwrap_or("?");
+        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        match r.get("error").and_then(|v| v.as_str()) {
+            Some(err) => out.push_str(&format!("{op} failed: {err}\n")),
+            None => out.push_str(&format!("{op} ok: {id}\n")),
+        }
+        if let Some(dups) = r.get("possible_duplicates").and_then(|v| v.as_array())
+            && !dups.is_empty()
+        {
+            out.push_str("  possible duplicates of an existing open todo:\n");
+            for d in dups {
+                let did = d.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let text = d.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let sim = d.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                out.push_str(&format!("  - [{}] {} ({})\n", did, text, format_score(sim)));
+            }
+        }
+    }
+    out.push_str(&format!("{open_count} open todo(s)."));
+    out
+}
+
+fn compact_todo_list(result: &Value) -> String {
+    let empty = vec![];
+    let todos = result
+        .get("todos")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let open = result
+        .get("open_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let done = result
+        .get("done_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let dropped = result
+        .get("dropped_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tally = format!("{open} open, {done} done, {dropped} dropped");
+
+    if todos.is_empty() {
+        return format!("No todos matched. Project totals: {tally}.");
+    }
+
+    let mut out = String::new();
+    for t in todos {
+        let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+        let mark = match status {
+            "done" => "x",
+            "dropped" => "~",
+            _ => " ",
+        };
+        let scope = match t.get("branch").and_then(|v| v.as_str()) {
+            Some(b) => format!(" [{b}]"),
+            None => String::new(),
+        };
+        let reason = match (status, t.get("reason").and_then(|v| v.as_str())) {
+            ("dropped", Some(r)) => format!(" (dropped: {r})"),
+            _ => String::new(),
+        };
+        out.push_str(&format!("- [{mark}] {text}{scope}{reason}  {id}\n"));
+    }
+    out.push_str(&format!("Project totals: {tally}."));
+    out
 }
 
 fn compact_fallback(result: &Value) -> String {
