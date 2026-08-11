@@ -100,6 +100,14 @@ pub fn format_handoff(memory: &Memory, sections: &HandoffSections) -> String {
         }
     }
 
+    // Dead ends, so they are not retried
+    if !sections.tried.is_empty() {
+        out.push_str("\n## Tried\n");
+        for t in &sections.tried {
+            out.push_str(&format!("- {}\n", t));
+        }
+    }
+
     // Mental model
     if !sections.mental_model.is_empty() {
         out.push_str("\n## Mental Model\n");

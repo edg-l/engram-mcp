@@ -158,6 +158,10 @@ pub struct HandoffSections {
     /// Things preventing forward motion right now (missing access, failing dependency, unanswered question).
     #[serde(default)]
     pub blockers: Vec<String>,
+    /// Approaches attempted and abandoned, each with the reason it failed, so the next
+    /// session does not pay to rediscover the same dead end.
+    #[serde(default)]
+    pub tried: Vec<String>,
     /// Mental model: architecture, invariants, or context the next session needs.
     #[serde(default)]
     pub mental_model: String,
@@ -207,6 +211,14 @@ impl HandoffSections {
             out.push('\n');
         }
 
+        if !self.tried.is_empty() {
+            out.push_str("## Tried\n\n");
+            for t in &self.tried {
+                out.push_str(&format!("- {}\n", t));
+            }
+            out.push('\n');
+        }
+
         if !self.mental_model.is_empty() {
             out.push_str("## Mental Model\n\n");
             out.push_str(&self.mental_model);
@@ -240,91 +252,61 @@ impl HandoffSections {
     pub fn parse_markdown(content: &str) -> Result<HandoffSections, MemoryError> {
         let malformed = || MemoryError::InvalidType("handoff: malformed sections".to_string());
 
-        let mut summary = String::new();
-        let mut decisions: Vec<String> = Vec::new();
-        let mut todos: Vec<String> = Vec::new();
-        let mut blockers: Vec<String> = Vec::new();
-        let mut mental_model = String::new();
-        let mut next_steps: Vec<String> = Vec::new();
-        let mut notes: Option<String> = None;
+        /// Bullet-list items, tolerating the `- [ ]` / `- [x] ` checkboxes used by Todos.
+        fn bullets(body: &str) -> Vec<String> {
+            body.lines()
+                .filter_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("- [ ] ")
+                        .or_else(|| l.strip_prefix("- [x] "))
+                        .or_else(|| l.strip_prefix("- [X] "))
+                        .or_else(|| l.strip_prefix("- "))
+                        .map(|s| s.trim().to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
 
-        #[derive(PartialEq)]
         enum Section {
             None,
             Summary,
             Decisions,
             Todos,
             Blockers,
+            Tried,
             MentalModel,
             NextSteps,
             Notes,
         }
 
+        let mut out = HandoffSections {
+            summary: String::new(),
+            decisions: Vec::new(),
+            todos: Vec::new(),
+            blockers: Vec::new(),
+            tried: Vec::new(),
+            mental_model: String::new(),
+            next_steps: Vec::new(),
+            notes: None,
+            continues_from: None,
+        };
+
         let mut current = Section::None;
         let mut body_lines: Vec<&str> = Vec::new();
 
-        let flush = |current: &Section,
-                     body_lines: &[&str],
-                     summary: &mut String,
-                     decisions: &mut Vec<String>,
-                     todos: &mut Vec<String>,
-                     blockers: &mut Vec<String>,
-                     mental_model: &mut String,
-                     next_steps: &mut Vec<String>,
-                     notes: &mut Option<String>| {
+        let flush = |current: &Section, body_lines: &[&str], out: &mut HandoffSections| {
             let body = body_lines.join("\n").trim().to_string();
             match current {
-                Section::Summary => *summary = body,
-                Section::Decisions => {
-                    *decisions = body
-                        .lines()
-                        .filter_map(|l| {
-                            let l = l.trim();
-                            l.strip_prefix("- ").map(|s| s.trim().to_string())
-                        })
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-                Section::Todos => {
-                    *todos = body
-                        .lines()
-                        .filter_map(|l| {
-                            let l = l.trim();
-                            // Strip "- [ ] " or "- [x] " or "- "
-                            let stripped = l
-                                .strip_prefix("- [ ] ")
-                                .or_else(|| l.strip_prefix("- [x] "))
-                                .or_else(|| l.strip_prefix("- [X] "))
-                                .or_else(|| l.strip_prefix("- "));
-                            stripped.map(|s| s.trim().to_string())
-                        })
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-                Section::Blockers => {
-                    *blockers = body
-                        .lines()
-                        .filter_map(|l| {
-                            let l = l.trim();
-                            l.strip_prefix("- ").map(|s| s.trim().to_string())
-                        })
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-                Section::MentalModel => *mental_model = body,
-                Section::NextSteps => {
-                    *next_steps = body
-                        .lines()
-                        .filter_map(|l| {
-                            let l = l.trim();
-                            l.strip_prefix("- ").map(|s| s.trim().to_string())
-                        })
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+                Section::Summary => out.summary = body,
+                Section::Decisions => out.decisions = bullets(&body),
+                Section::Todos => out.todos = bullets(&body),
+                Section::Blockers => out.blockers = bullets(&body),
+                Section::Tried => out.tried = bullets(&body),
+                Section::MentalModel => out.mental_model = body,
+                Section::NextSteps => out.next_steps = bullets(&body),
                 Section::Notes => {
                     if !body.is_empty() {
-                        *notes = Some(body);
+                        out.notes = Some(body);
                     }
                 }
                 Section::None => {}
@@ -333,18 +315,7 @@ impl HandoffSections {
 
         for line in content.lines() {
             if let Some(heading) = line.strip_prefix("## ") {
-                // Flush current section
-                flush(
-                    &current,
-                    &body_lines,
-                    &mut summary,
-                    &mut decisions,
-                    &mut todos,
-                    &mut blockers,
-                    &mut mental_model,
-                    &mut next_steps,
-                    &mut notes,
-                );
+                flush(&current, &body_lines, &mut out);
                 body_lines.clear();
 
                 current = match heading.trim() {
@@ -352,6 +323,7 @@ impl HandoffSections {
                     "Decisions" => Section::Decisions,
                     "Todos" => Section::Todos,
                     "Blockers" => Section::Blockers,
+                    "Tried" => Section::Tried,
                     "Mental Model" => Section::MentalModel,
                     "Next Steps" => Section::NextSteps,
                     "Notes" => Section::Notes,
@@ -362,33 +334,13 @@ impl HandoffSections {
             }
         }
 
-        // Flush last section
-        flush(
-            &current,
-            &body_lines,
-            &mut summary,
-            &mut decisions,
-            &mut todos,
-            &mut blockers,
-            &mut mental_model,
-            &mut next_steps,
-            &mut notes,
-        );
+        flush(&current, &body_lines, &mut out);
 
-        if summary.is_empty() {
+        if out.summary.is_empty() {
             return Err(malformed());
         }
 
-        Ok(HandoffSections {
-            summary,
-            decisions,
-            todos,
-            blockers,
-            mental_model,
-            next_steps,
-            notes,
-            continues_from: None,
-        })
+        Ok(out)
     }
 }
 
@@ -765,6 +717,7 @@ mod tests {
             decisions: vec!["Use Rust".to_string(), "SQLite for storage".to_string()],
             todos: vec!["Write more tests".to_string()],
             blockers: vec!["Awaiting review".to_string()],
+            tried: vec!["Tokio task per query, thrashed the connection pool".to_string()],
             mental_model: "Layered architecture with clear boundaries".to_string(),
             next_steps: vec!["Deploy to staging".to_string()],
             notes: Some("Remember to update the README".to_string()),
@@ -784,6 +737,11 @@ mod tests {
         assert!(md.contains("- [ ] Write more tests"), "missing todo");
         assert!(md.contains("## Blockers"), "missing Blockers header");
         assert!(md.contains("- Awaiting review"), "missing blocker");
+        assert!(md.contains("## Tried"), "missing Tried header");
+        assert!(
+            md.contains("- Tokio task per query, thrashed the connection pool"),
+            "missing dead end"
+        );
         assert!(
             md.contains("## Mental Model"),
             "missing Mental Model header"
@@ -799,6 +757,7 @@ mod tests {
             decisions: vec![],
             todos: vec![],
             blockers: vec![],
+            tried: vec![],
             mental_model: String::new(),
             next_steps: vec![],
             notes: None,
@@ -828,6 +787,7 @@ mod tests {
         assert_eq!(parsed.decisions, original.decisions);
         assert_eq!(parsed.todos, original.todos);
         assert_eq!(parsed.blockers, original.blockers);
+        assert_eq!(parsed.tried, original.tried);
         assert_eq!(parsed.mental_model, original.mental_model);
         assert_eq!(parsed.next_steps, original.next_steps);
         assert_eq!(parsed.notes, original.notes);

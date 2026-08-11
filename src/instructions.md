@@ -75,7 +75,9 @@ Before deleting, read the whole memory, including `merged_from`: dedup may have 
 
 # Session handoffs
 
-Use `handoff_create` at session end and `handoff_resume` at session start to preserve and restore working context across sessions. Handoffs capture structured sections (summary, decisions, todos, blockers, mental model, next steps, notes) and are pinned so they never decay. Use `handoff_search` to find specific section content across past sessions.
+Use `handoff_create` at session end and `handoff_resume` at session start to preserve and restore working context across sessions. Handoffs capture structured sections (summary, decisions, todos, blockers, tried, mental model, next steps, notes) and are pinned so they never decay. Use `handoff_search` to find specific section content across past sessions.
+
+`tried` records approaches abandoned and why, so the next session does not pay to rediscover them. When writing a handoff that continues an earlier one, restate every `todos` and `blockers` item still open: `handoff_resume` returns the newest handoff's todos and blockers verbatim as `open_todos`/`open_blockers`, so anything omitted reads as done.
 
 Section semantics: **todos** — Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items. **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 

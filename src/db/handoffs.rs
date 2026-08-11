@@ -1,10 +1,90 @@
-use rusqlite::params;
+use rusqlite::{Connection, params};
 
 use crate::error::MemoryError;
 use crate::memory::{HandoffSections, Memory};
 
 use super::Database;
 use super::util::{MEMORY_COLUMNS, map_memory_row};
+
+/// Bind the sidecar columns for `sections` in the order used by both the INSERT and the
+/// UPDATE below. Keeping one builder means a new section touches one place, not four.
+fn section_params(
+    sections: &HandoffSections,
+) -> Result<(String, String, String, String, String), MemoryError> {
+    Ok((
+        serde_json::to_string(&sections.decisions)?,
+        serde_json::to_string(&sections.todos)?,
+        serde_json::to_string(&sections.blockers)?,
+        serde_json::to_string(&sections.tried)?,
+        serde_json::to_string(&sections.next_steps)?,
+    ))
+}
+
+/// Insert the sidecar row for a handoff. Shared by the standalone and transactional paths.
+fn insert_sections_row(
+    conn: &Connection,
+    memory_id: &str,
+    sections: &HandoffSections,
+    section_keys: &str,
+    section_embeddings: &[u8],
+) -> Result<(), MemoryError> {
+    let (decisions, todos, blockers, tried, next_steps) = section_params(sections)?;
+    conn.execute(
+        "INSERT INTO handoff_sections (
+            memory_id, summary, decisions, todos, blockers, tried,
+            mental_model, next_steps, notes, continues_from,
+            section_embedding_keys, section_embeddings
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            memory_id,
+            sections.summary,
+            decisions,
+            todos,
+            blockers,
+            tried,
+            sections.mental_model,
+            next_steps,
+            sections.notes,
+            sections.continues_from,
+            section_keys,
+            section_embeddings,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Overwrite the sidecar row for a handoff. Shared by the standalone and transactional paths.
+fn update_sections_row(
+    conn: &Connection,
+    memory_id: &str,
+    sections: &HandoffSections,
+    section_keys: &str,
+    section_embeddings: &[u8],
+) -> Result<(), MemoryError> {
+    let (decisions, todos, blockers, tried, next_steps) = section_params(sections)?;
+    conn.execute(
+        "UPDATE handoff_sections SET
+            summary = ?2, decisions = ?3, todos = ?4, blockers = ?5, tried = ?6,
+            mental_model = ?7, next_steps = ?8, notes = ?9, continues_from = ?10,
+            section_embedding_keys = ?11, section_embeddings = ?12
+         WHERE memory_id = ?1",
+        params![
+            memory_id,
+            sections.summary,
+            decisions,
+            todos,
+            blockers,
+            tried,
+            sections.mental_model,
+            next_steps,
+            sections.notes,
+            sections.continues_from,
+            section_keys,
+            section_embeddings,
+        ],
+    )?;
+    Ok(())
+}
 
 impl Database {
     // ============================================
@@ -25,31 +105,7 @@ impl Database {
         section_embeddings: &[u8],
     ) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let decisions_json = serde_json::to_string(&sections.decisions)?;
-        let todos_json = serde_json::to_string(&sections.todos)?;
-        let blockers_json = serde_json::to_string(&sections.blockers)?;
-        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
-        conn.execute(
-            "INSERT INTO handoff_sections (
-                memory_id, summary, decisions, todos, blockers,
-                mental_model, next_steps, notes, continues_from,
-                section_embedding_keys, section_embeddings
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                memory_id,
-                sections.summary,
-                decisions_json,
-                todos_json,
-                blockers_json,
-                sections.mental_model,
-                next_steps_json,
-                sections.notes,
-                sections.continues_from,
-                section_keys,
-                section_embeddings,
-            ],
-        )?;
-        Ok(())
+        insert_sections_row(&conn, memory_id, sections, section_keys, section_embeddings)
     }
 
     /// Store a handoff memory, its embedding, and the sidecar row atomically.
@@ -106,30 +162,7 @@ impl Database {
         )?;
 
         // Insert handoff sidecar row.
-        let decisions_json = serde_json::to_string(&sections.decisions)?;
-        let todos_json = serde_json::to_string(&sections.todos)?;
-        let blockers_json = serde_json::to_string(&sections.blockers)?;
-        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
-        tx.execute(
-            "INSERT INTO handoff_sections (
-                memory_id, summary, decisions, todos, blockers,
-                mental_model, next_steps, notes, continues_from,
-                section_embedding_keys, section_embeddings
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                memory.id,
-                sections.summary,
-                decisions_json,
-                todos_json,
-                blockers_json,
-                sections.mental_model,
-                next_steps_json,
-                sections.notes,
-                sections.continues_from,
-                section_keys,
-                section_embeddings,
-            ],
-        )?;
+        insert_sections_row(&tx, &memory.id, sections, section_keys, section_embeddings)?;
 
         tx.commit()?;
         Ok(())
@@ -147,7 +180,7 @@ impl Database {
     ) -> Result<Option<(HandoffSections, Vec<(String, Vec<f32>)>)>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT summary, decisions, todos, blockers, mental_model, next_steps,
+            "SELECT summary, decisions, todos, blockers, tried, mental_model, next_steps,
                     notes, continues_from, section_embedding_keys, section_embeddings
              FROM handoff_sections WHERE memory_id = ?1",
         )?;
@@ -161,19 +194,22 @@ impl Database {
                 serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?)?;
             let blockers: Vec<String> =
                 serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?)?;
-            let mental_model: String = row.get(4)?;
+            let tried: Vec<String> =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(4)?)?;
+            let mental_model: String = row.get(5)?;
             let next_steps: Vec<String> =
-                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(5)?)?;
-            let notes: Option<String> = row.get(6)?;
-            let continues_from: Option<String> = row.get(7)?;
-            let keys: String = row.get(8)?;
-            let embedding_bytes: Vec<u8> = row.get(9)?;
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(6)?)?;
+            let notes: Option<String> = row.get(7)?;
+            let continues_from: Option<String> = row.get(8)?;
+            let keys: String = row.get(9)?;
+            let embedding_bytes: Vec<u8> = row.get(10)?;
 
             let sections = HandoffSections {
                 summary,
                 decisions,
                 todos,
                 blockers,
+                tried,
                 mental_model,
                 next_steps,
                 notes,
@@ -235,30 +271,7 @@ impl Database {
         )?;
 
         // Update handoff sidecar.
-        let decisions_json = serde_json::to_string(&sections.decisions)?;
-        let todos_json = serde_json::to_string(&sections.todos)?;
-        let blockers_json = serde_json::to_string(&sections.blockers)?;
-        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
-        tx.execute(
-            "UPDATE handoff_sections SET
-                summary = ?2, decisions = ?3, todos = ?4, blockers = ?5,
-                mental_model = ?6, next_steps = ?7, notes = ?8, continues_from = ?9,
-                section_embedding_keys = ?10, section_embeddings = ?11
-             WHERE memory_id = ?1",
-            params![
-                memory.id,
-                sections.summary,
-                decisions_json,
-                todos_json,
-                blockers_json,
-                sections.mental_model,
-                next_steps_json,
-                sections.notes,
-                sections.continues_from,
-                section_keys,
-                section_embeddings,
-            ],
-        )?;
+        update_sections_row(&tx, &memory.id, sections, section_keys, section_embeddings)?;
 
         tx.commit()?;
         Ok(())
@@ -274,31 +287,7 @@ impl Database {
         section_embeddings: &[u8],
     ) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let decisions_json = serde_json::to_string(&sections.decisions)?;
-        let todos_json = serde_json::to_string(&sections.todos)?;
-        let blockers_json = serde_json::to_string(&sections.blockers)?;
-        let next_steps_json = serde_json::to_string(&sections.next_steps)?;
-        conn.execute(
-            "UPDATE handoff_sections SET
-                summary = ?2, decisions = ?3, todos = ?4, blockers = ?5,
-                mental_model = ?6, next_steps = ?7, notes = ?8, continues_from = ?9,
-                section_embedding_keys = ?10, section_embeddings = ?11
-             WHERE memory_id = ?1",
-            params![
-                memory_id,
-                sections.summary,
-                decisions_json,
-                todos_json,
-                blockers_json,
-                sections.mental_model,
-                next_steps_json,
-                sections.notes,
-                sections.continues_from,
-                section_keys,
-                section_embeddings,
-            ],
-        )?;
-        Ok(())
+        update_sections_row(&conn, memory_id, sections, section_keys, section_embeddings)
     }
 
     /// Fetch memories of type `handoff` for a project, filtered by branch.

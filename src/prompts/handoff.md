@@ -11,16 +11,19 @@ Each section is a SHORT SUMMARY meant to fit on a screen or two. Hard guidance:
 ## Section guidance
 
 **summary** (required)
-One to three sentences. What was this session about? What is the single most important thing the next session needs to know? Be concrete: mention files changed, features added, or problems solved. Avoid vague phrases like "made progress".
+One to three sentences covering both what the user asked for and what actually happened. State the goal even when it was not reached — a session that ended short of its target still needs the target recorded, or the next session inherits the work without the intent behind it. Be concrete: mention files changed, features added, or problems solved. Avoid vague phrases like "made progress".
 
 **decisions**
-List each architectural or design choice made this session. Format: what was decided AND why. Include trade-offs that were weighed. Omit trivial choices.
+Each choice made this session: what was decided AND why, including trade-offs weighed. Record the assumptions you made that nobody specified, not only the deliberate architectural calls — an unstated assumption is what the next agent unknowingly contradicts. Omit choices that follow from a convention already written down.
 
 **todos**
-Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items.
+Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items; name the file, function, or literal command where one exists.
 
 **blockers**
 Things preventing forward motion right now (missing access, failing dependency, unanswered question).
+
+**tried**
+Approaches attempted this session and abandoned, each with the concrete reason it failed: "X, because Y". This is the section that pays for itself — rediscovering a dead end costs the next session the same time it cost this one. Record what was ruled out even when the replacement worked.
 
 **mental_model**
 The architectural understanding needed to continue this work: how the relevant subsystems fit together, invariants the code relies on, non-obvious constraints. Write for an agent with no memory of this session. One to five sentences or a short bulleted list.
@@ -30,6 +33,12 @@ Post-session follow-ups beyond the current thread. Future-facing, not for immedi
 
 **notes**
 Freeform notes that don't fit elsewhere: environment quirks, partial workarounds, references, or anything a fresh agent would find useful. Optional — omit if empty.
+
+## Carrying open work forward
+
+A handoff is a snapshot, so state that outlives one session only survives if each snapshot restates it. When this session resumed from an earlier handoff, re-emit every `todos` and `blockers` item that is still open, whether or not you touched it. `handoff_resume` returns the newest handoff's todos and blockers verbatim as `open_todos` / `open_blockers`, so an item you drop reads as finished and a task spanning several sessions disappears the first time nobody mentions it.
+
+`tried` works the opposite way: a dead end is a permanent fact, not open state. Record it once and leave it; `handoff_search` with `section_filter: ["tried"]` reaches it later.
 
 ## Sensitive data
 
@@ -46,6 +55,7 @@ After gathering all sections, call `handoff_create` with:
     "decisions": ["...", "..."],
     "todos": ["...", "..."],
     "blockers": ["..."],
+    "tried": ["...", "..."],
     "mental_model": "...",
     "next_steps": ["...", "..."],
     "notes": "...",

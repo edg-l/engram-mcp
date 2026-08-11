@@ -48,6 +48,7 @@ fn make_sections(summary: &str, continues_from: Option<String>) -> HandoffSectio
         decisions: vec!["Use token-based auth".to_string()],
         todos: vec!["Write tests".to_string()],
         blockers: vec![],
+        tried: vec![],
         mental_model: "Authentication layer".to_string(),
         next_steps: vec!["Deploy to staging".to_string()],
         notes: None,

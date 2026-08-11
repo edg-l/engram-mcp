@@ -20,6 +20,7 @@ fn make_sections(
         decisions: vec!["Use SQLite for storage".to_string()],
         todos: vec!["Add integration tests".to_string()],
         blockers,
+        tried: vec![],
         mental_model: "Layered service architecture".to_string(),
         next_steps: vec!["Deploy to staging".to_string()],
         notes: None,
@@ -167,6 +168,7 @@ fn export_import_preserves_handoff_sections() {
         decisions: vec!["Additive export schema".to_string()],
         todos: vec!["Write more tests".to_string()],
         blockers: vec!["Waiting on CI".to_string()],
+        tried: vec![],
         mental_model: "Sidecar table holds per-section embeddings".to_string(),
         next_steps: vec!["Run full QA".to_string()],
         notes: Some("Remember to bump schema_version".to_string()),
@@ -393,5 +395,84 @@ fn import_old_export_without_sidecar_fields() {
     assert!(
         sidecar.is_none(),
         "old-format import must leave sidecar absent (got Some)"
+    );
+}
+
+/// Open work must survive the similarity ranking. A todo that spans several sessions is
+/// only useful if resume returns it every time, even when the ranked `top_sections` budget
+/// is spent on other content — otherwise a long-running task silently disappears.
+#[test]
+fn resume_returns_open_work_outside_the_ranking() {
+    let db = Database::open_in_memory().expect("in-memory DB must open");
+    let project_id = "carry-over-proj";
+    db.get_or_create_project(project_id, "Carry Over Test")
+        .expect("project creation must succeed");
+
+    let embedding = EmbeddingService::new().expect("embedding model must be available");
+
+    let sections = HandoffSections {
+        summary: "Rewrote the payment webhook dispatcher".to_string(),
+        decisions: vec!["Dispatch by event type, not by object shape".to_string()],
+        todos: vec!["Migrate the remaining 40 legacy subscriptions".to_string()],
+        blockers: vec!["Waiting on production DB credentials".to_string()],
+        tried: vec!["Bulk UPDATE in one transaction, locked the table for 90s".to_string()],
+        mental_model: "Dispatcher fans out to per-type handlers".to_string(),
+        next_steps: vec![],
+        notes: None,
+        continues_from: None,
+    };
+
+    create_handoff(
+        &db,
+        &embedding,
+        project_id,
+        Some("feat/webhooks"),
+        sections,
+        0.85,
+        true,
+        false,
+    )
+    .expect("create handoff must succeed");
+
+    // One section slot, and a query aimed at the summary — the ranking has no room for
+    // todos or blockers.
+    let result = resume_handoff(
+        &db,
+        &embedding,
+        project_id,
+        Some("feat/webhooks"),
+        Some("webhook dispatcher rewrite"),
+        1,
+        false,
+        None,
+    )
+    .expect("resume must succeed");
+
+    assert_eq!(
+        result.open_todos,
+        vec!["Migrate the remaining 40 legacy subscriptions".to_string()],
+        "open todos must be returned verbatim regardless of ranking"
+    );
+    assert_eq!(
+        result.open_blockers,
+        vec!["Waiting on production DB credentials".to_string()],
+        "open blockers must be returned verbatim regardless of ranking"
+    );
+
+    // The dead end round-trips through the sidecar and is reachable by section name.
+    let handoff_id = result.latest_handoff_id.expect("a handoff must be found");
+    let (stored, section_vecs) = db
+        .get_handoff_sections(&handoff_id)
+        .expect("get_handoff_sections must succeed")
+        .expect("sidecar must exist");
+    assert_eq!(
+        stored.tried,
+        vec!["Bulk UPDATE in one transaction, locked the table for 90s".to_string()],
+        "tried must round-trip through the sidecar"
+    );
+    assert!(
+        section_vecs.iter().any(|(k, _)| k == "tried"),
+        "tried must get its own section embedding, got {:?}",
+        section_vecs.iter().map(|(k, _)| k).collect::<Vec<_>>()
     );
 }

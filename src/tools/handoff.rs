@@ -62,6 +62,17 @@ pub struct HandoffResumeResult {
     pub chain: Vec<String>,
     /// Top-scoring section excerpts across all handoffs in the chain.
     pub top_sections: Vec<HandoffSectionMatch>,
+    /// Verbatim `todos` from the newest handoff, outside the similarity ranking.
+    ///
+    /// Open work outlives the session that recorded it: a multi-session task stays open
+    /// across several handoffs, and ranking `top_sections` by similarity can push it out
+    /// of the response entirely. Returning it unconditionally is what makes a long-running
+    /// todo survive; each handoff is expected to restate the items still open.
+    #[serde(default)]
+    pub open_todos: Vec<String>,
+    /// Verbatim `blockers` from the newest handoff, on the same unconditional basis.
+    #[serde(default)]
+    pub open_blockers: Vec<String>,
     /// Memories auto-linked (derived_from) from the latest handoff.
     pub linked_memories: Vec<Memory>,
     /// Explanatory message, e.g. when no branch was detected.
@@ -225,6 +236,7 @@ pub fn collect_section_warnings(sections: &HandoffSections) -> Vec<String> {
         ("decisions", &sections.decisions),
         ("todos", &sections.todos),
         ("blockers", &sections.blockers),
+        ("tried", &sections.tried),
         ("next_steps", &sections.next_steps),
     ]
     .into_iter()
@@ -325,6 +337,9 @@ pub fn handoff_section_key_texts(sections: &HandoffSections) -> Vec<(&'static st
     }
     if !sections.blockers.is_empty() {
         v.push(("blockers", sections.blockers.join("\n")));
+    }
+    if !sections.tried.is_empty() {
+        v.push(("tried", sections.tried.join("\n")));
     }
     if !sections.mental_model.is_empty() {
         v.push(("mental_model", sections.mental_model.clone()));
@@ -477,6 +492,8 @@ pub fn resume_handoff_with_vec(
             latest_handoff_id: None,
             chain: Vec::new(),
             top_sections: Vec::new(),
+            open_todos: Vec::new(),
+            open_blockers: Vec::new(),
             linked_memories: Vec::new(),
             message,
         });
@@ -513,6 +530,12 @@ pub fn resume_handoff_with_vec(
 
     // Reverse to oldest-first order.
     chain_ids.reverse();
+
+    // Step 3b: lift open work off the newest handoff, bypassing the similarity ranking.
+    let (open_todos, open_blockers) = match db.get_handoff_sections(&latest_id)? {
+        Some((sections, _)) => (sections.todos, sections.blockers),
+        None => (Vec::new(), Vec::new()),
+    };
 
     // Step 4: score every section across all chain handoffs (only when a query vec is available).
     // Load Memory structs for the chain so score_handoff_sections can iterate them.
@@ -651,6 +674,8 @@ pub fn resume_handoff_with_vec(
         latest_handoff_id: Some(latest_id),
         chain: chain_ids,
         top_sections,
+        open_todos,
+        open_blockers,
         linked_memories,
         message: final_message,
     })
@@ -729,6 +754,7 @@ pub fn get_section_text(sections: &HandoffSections, section_name: &str) -> Strin
         "decisions" => sections.decisions.join("\n"),
         "todos" => sections.todos.join("\n"),
         "blockers" => sections.blockers.join("\n"),
+        "tried" => sections.tried.join("\n"),
         "mental_model" => sections.mental_model.clone(),
         "next_steps" => sections.next_steps.join("\n"),
         "notes" => sections.notes.clone().unwrap_or_default(),
@@ -832,6 +858,7 @@ mod tests {
             decisions: vec!["picked A".into()],
             todos: vec!["do x".into()],
             blockers: vec![],
+            tried: vec![],
             mental_model: "tiny".into(),
             next_steps: vec![],
             notes: None,

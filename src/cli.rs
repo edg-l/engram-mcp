@@ -316,6 +316,9 @@ enum HandoffCmd {
         /// Things preventing forward motion right now (missing access, failing dependency, unanswered question). (can be repeated or comma-separated)
         #[arg(long, value_delimiter = ',')]
         blockers: Vec<String>,
+        /// Approaches attempted and abandoned, each with why it failed (can be repeated or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tried: Vec<String>,
         /// Architecture/context needed by the next session
         #[arg(long)]
         mental_model: Option<String>,
@@ -2639,6 +2642,7 @@ fn cmd_handoff(
             decisions,
             todos,
             blockers,
+            tried,
             mental_model,
             next_steps,
             notes,
@@ -2702,6 +2706,12 @@ fn cmd_handoff(
                     prompt_list("Blockers")
                 };
 
+                let tried_list = if !tried.is_empty() || !interactive {
+                    tried
+                } else {
+                    prompt_list("Tried (approaches that failed, and why)")
+                };
+
                 let mental_model_text = match mental_model {
                     Some(m) => m,
                     None if interactive => prompt_line("Mental model"),
@@ -2728,6 +2738,7 @@ fn cmd_handoff(
                     decisions: decisions_list,
                     todos: todos_list,
                     blockers: blockers_list,
+                    tried: tried_list,
                     mental_model: mental_model_text,
                     next_steps: next_steps_list,
                     notes: notes_text,
@@ -2823,6 +2834,20 @@ fn cmd_handoff(
                 println!("Chain ({} handoffs, oldest to newest):", result.chain.len());
                 for id in &result.chain {
                     println!("  {}", id);
+                }
+            }
+
+            if !result.open_todos.is_empty() {
+                println!("\nOpen todos:");
+                for todo in &result.open_todos {
+                    println!("  - [ ] {}", todo);
+                }
+            }
+
+            if !result.open_blockers.is_empty() {
+                println!("\nOpen blockers:");
+                for blocker in &result.open_blockers {
+                    println!("  - {}", blocker);
                 }
             }
 

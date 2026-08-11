@@ -66,7 +66,7 @@ fn test_migration_creates_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 
     // Verify the curation sidecars exist
     for table in ["memory_status", "memory_trash"] {
@@ -671,6 +671,7 @@ fn make_sections(summary: &str) -> HandoffSections {
         decisions: vec!["Use Rust".to_string()],
         todos: vec!["Write tests".to_string()],
         blockers: vec![],
+        tried: vec![],
         mental_model: "Layered architecture".to_string(),
         next_steps: vec!["Deploy".to_string()],
         notes: Some("Extra notes".to_string()),

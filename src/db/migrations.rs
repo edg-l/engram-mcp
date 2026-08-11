@@ -292,6 +292,28 @@ impl Database {
             )?;
         }
 
+        // Migration 8: add the `tried` handoff section (approaches attempted and abandoned).
+        // Existing rows default to an empty JSON array so `get_handoff_sections` decodes
+        // them unchanged.
+        if current_version < 8 {
+            let has_tried = conn
+                .prepare("PRAGMA table_info(handoff_sections)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .any(|name| name == "tried");
+
+            if !has_tried {
+                conn.execute_batch(
+                    "ALTER TABLE handoff_sections ADD COLUMN tried TEXT NOT NULL DEFAULT '[]';",
+                )?;
+            }
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                params![8],
+            )?;
+        }
+
         Ok(())
     }
 }

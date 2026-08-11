@@ -18,6 +18,7 @@ fn make_sections(i: usize, continues_from: Option<String>) -> HandoffSections {
         decisions: vec![format!("decision {} use SQLite", i)],
         todos: vec![format!("todo {} write tests", i)],
         blockers: vec![format!("blocker {} migration pending", i)],
+        tried: vec![],
         mental_model: format!("mental model {}: layered service architecture", i),
         next_steps: vec![format!("next {} deploy to staging", i)],
         notes: Some(format!("notes for session {}", i)),

@@ -877,7 +877,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Handoff tools ===
         Tool::new(
             "handoff_create",
-            "Create a session handoff capturing decisions, todos, blockers, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
+            "Create a session handoff capturing decisions, todos, blockers, dead ends tried, mental model, and next steps. Pinned by default; bypasses dedup.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -891,8 +891,9 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "properties": {
                             "summary": {"type": "string", "description": "1–3 sentence summary of the session. Keep under ~500 chars."},
                             "decisions": {"type": "array", "items": {"type": "string"}, "description": "Key decisions, one short line each (what + why, ≤300 chars per item). No transcripts."},
-                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items, one short line each."},
-                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Things preventing forward motion right now (missing access, failing dependency, unanswered question). One short line each."},
+                            "todos": {"type": "array", "items": {"type": "string"}, "description": "Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items, one short line each. Restate any todo from the previous handoff that is still open — resume returns these verbatim, so an omitted todo reads as done."},
+                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Things preventing forward motion right now (missing access, failing dependency, unanswered question). One short line each. Restate any blocker from the previous handoff that is still unresolved — resume returns these verbatim, so an omitted blocker reads as resolved."},
+                            "tried": {"type": "array", "items": {"type": "string"}, "description": "Approaches attempted and abandoned, each with the concrete reason it failed, so the next session does not retry them. One short line each ('X, because Y'). Dead ends are permanent — do not restate ones already recorded in an earlier handoff."},
                             "mental_model": {"type": "string", "description": "Architecture or context the next session needs. 1–5 sentences or a short bulleted list. Not a deep dive — link related decision/pattern memories instead."},
                             "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup. One short line each."},
                             "notes": {"type": "string", "description": "Freeform short notes (optional). Do not paste reports or logs here."},
