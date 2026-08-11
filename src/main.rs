@@ -853,7 +853,7 @@ const STDIO_ONLY_NOTICE: &str = concat!(
     "  engram-cli projects\n",
     "\n",
     "Configuration is via environment variables: ENGRAM_DB, ENGRAM_PROJECT,\n",
-    "ENGRAM_MCP_TOOL_PROFILE (see the README).\n",
+    "ENGRAM_BRANCH, ENGRAM_MCP_TOOL_PROFILE (see the README).\n",
 );
 
 /// What to do at startup, decided from argv and whether stdin is a terminal.

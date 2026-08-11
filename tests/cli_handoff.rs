@@ -245,3 +245,57 @@ fn cli_handoff_help() {
         "help should list 'show' subcommand"
     );
 }
+
+/// `--current-branch` overrides both git detection and `ENGRAM_BRANCH`, so a shell sitting
+/// in one checkout can write and read handoffs for the branch the work is actually on
+/// (the worktree case). The harness sets ENGRAM_BRANCH, so precedence is what is asserted.
+#[test]
+fn cli_current_branch_overrides_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let project = "cli-current-branch-proj";
+    if !cli_bin().exists() {
+        return;
+    }
+
+    let (status, stdout, stderr) = run_cli(
+        &db_path,
+        project,
+        &[
+            "--current-branch",
+            "feat/elsewhere",
+            "handoff",
+            "create",
+            "--non-interactive",
+            "--summary",
+            "Work done on another checkout",
+            "--todos",
+            "Finish the migration",
+        ],
+    );
+    assert!(status.success(), "create failed: {stdout}{stderr}");
+    assert!(
+        stdout.contains("feat/elsewhere"),
+        "handoff must be filed under the overridden branch, got: {stdout}"
+    );
+
+    // Without the override the harness branch applies, so nothing is found.
+    let (status, stdout, _) = run_cli(&db_path, project, &["handoff", "resume"]);
+    assert!(status.success());
+    assert!(
+        stdout.contains("No handoffs found"),
+        "env branch must not see the overridden branch's handoff, got: {stdout}"
+    );
+
+    // With the override the handoff resumes, carrying its open todo.
+    let (status, stdout, _) = run_cli(
+        &db_path,
+        project,
+        &["--current-branch", "feat/elsewhere", "handoff", "resume"],
+    );
+    assert!(status.success());
+    assert!(
+        stdout.contains("Finish the migration"),
+        "override must resume the right branch, got: {stdout}"
+    );
+}

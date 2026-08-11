@@ -36,6 +36,14 @@ struct Cli {
     #[arg(short, long)]
     project: Option<String>,
 
+    /// Treat this as the current git branch instead of detecting it from the working
+    /// directory. Use when the shell is in a different checkout than the work, e.g. a
+    /// worktree. Takes precedence over ENGRAM_BRANCH. Distinct from the per-command
+    /// `--branch` flags, which filter or tag a single command; this sets what "current
+    /// branch" resolves to for all of them.
+    #[arg(long, global = true)]
+    current_branch: Option<String>,
+
     /// Emit machine-readable JSON instead of human-readable text. Supported by the
     /// read commands: query, context, stats, projects, list, show,
     /// handoff resume/search/show, adr list/show.
@@ -561,7 +569,7 @@ fn get_project_id(cli_project: Option<String>) -> String {
 
 /// Detect the current git branch.
 /// Returns None if not in a git repository or on error.
-/// Priority: ENGRAM_BRANCH env var > git detection
+/// Priority: `--current-branch` (applied by the caller) > ENGRAM_BRANCH env var > git detection
 fn get_current_branch() -> Option<String> {
     // Check environment variable override first
     if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
@@ -727,8 +735,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Detect current branch once for commands that need it
-    let current_branch = get_current_branch();
+    // Resolve the current branch once for commands that need it.
+    // Precedence: --current-branch > ENGRAM_BRANCH > git detection.
+    let current_branch = cli
+        .current_branch
+        .clone()
+        .filter(|b| !b.is_empty())
+        .or_else(get_current_branch);
 
     match cli.command {
         Commands::Query {
