@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.11.0] - 2026-08-31
 
 ### Added
 - **`engram-cli sync <ssh-target>`**: bidirectional, incremental replication of the whole store (every project) with another machine over plain `ssh` — no hub, no daemon, no new auth. One `ssh` process per direction, JSON over stdin/stdout. Two independent per-remote watermarks (`sync_state.pull_watermark`/`push_watermark`, migration 11) track what has already moved in each direction, each derived from the payload's own `max(updated_at)` rather than wall-clock, so clock skew between machines can't skip a row. `--dry-run` previews both payload sizes without importing or pushing; `--pull-only`/`--push-only` run a single direction; `--remote-bin` points at a non-default `engram-cli` on the remote `PATH`. A new `memory_origin` table (migration 12) records which remote a memory was last pulled from, so the push half never echoes content straight back to the remote it just arrived from — without it, two machines with asymmetric usage patterns would re-transmit the same pulled rows on every run and never converge to a no-op. See `CLAUDE.md`'s **Sync** section for the full convergence rule and what's out of scope (deletions, trash, clusters).
