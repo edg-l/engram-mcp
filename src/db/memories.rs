@@ -183,9 +183,14 @@ impl Database {
             .filter(|v| !v.is_empty())
             .map(serde_json::to_string)
             .transpose()?;
+        let merged_from_json = memory
+            .merged_from
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         conn.execute(
-            "UPDATE memories SET content = ?1, summary = ?2, tags = ?3, importance = ?4, relevance_score = ?5, access_count = ?6, updated_at = ?7, last_accessed_at = ?8, pinned = ?9, global = ?10, external_artifacts = ?11
-             WHERE id = ?12",
+            "UPDATE memories SET content = ?1, summary = ?2, tags = ?3, importance = ?4, relevance_score = ?5, access_count = ?6, updated_at = ?7, last_accessed_at = ?8, pinned = ?9, global = ?10, external_artifacts = ?11, branch = ?12, merged_from = ?13
+             WHERE id = ?14",
             params![
                 memory.content,
                 memory.summary,
@@ -198,6 +203,8 @@ impl Database {
                 memory.pinned as i64,
                 memory.global as i64,
                 artifacts_json,
+                memory.branch,
+                merged_from_json,
                 memory.id,
             ],
         )?;

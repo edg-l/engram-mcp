@@ -6,10 +6,13 @@ use crate::memory::{Memory, TodoItem, TodoStatus};
 use super::Database;
 
 /// Columns of the join used to build a [`TodoItem`], in the order [`map_todo_row`] reads them.
-const TODO_COLUMNS: &str = "m.id, m.project_id, m.content, m.tags, m.importance, m.created_at, \
+///
+/// `pub(super)` so `db::sync`'s unbounded export getter can reuse the same join/mapper
+/// rather than duplicating it.
+pub(super) const TODO_COLUMNS: &str = "m.id, m.project_id, m.content, m.tags, m.importance, m.created_at, \
      m.updated_at, m.branch, t.status, t.reason, t.closed_at";
 
-fn map_todo_row(row: &Row) -> rusqlite::Result<TodoItem> {
+pub(super) fn map_todo_row(row: &Row) -> rusqlite::Result<TodoItem> {
     let tags_json: String = row.get(3)?;
     let status_str: String = row.get(8)?;
     Ok(TodoItem {
@@ -185,6 +188,30 @@ impl Database {
                 .unwrap_or_else(|| format!("todo {status}"));
             self.set_dead(memory_id, true, Some(&dead_reason))?;
         }
+        Ok(())
+    }
+
+    /// Write a todo's lifecycle sidecar directly, inserting or overwriting whatever is
+    /// there.
+    ///
+    /// Unlike [`set_todo_status`](Self::set_todo_status), this does not also flip
+    /// `memory_status.dead` — the caller (import) applies that separately from its own
+    /// `ExportedStatus` sidecar, and the two must not fight over which timestamp wins.
+    #[allow(dead_code)] // Used by engram-cli import
+    pub fn upsert_todo_item(
+        &self,
+        memory_id: &str,
+        status: TodoStatus,
+        reason: Option<&str>,
+        closed_at: Option<i64>,
+    ) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO todo_items (memory_id, status, reason, closed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(memory_id) DO UPDATE SET status = ?2, reason = ?3, closed_at = ?4",
+            params![memory_id, status.as_str(), reason, closed_at],
+        )?;
         Ok(())
     }
 

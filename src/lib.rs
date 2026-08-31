@@ -8,5 +8,6 @@ pub mod export;
 pub mod format;
 pub mod hooks;
 pub mod memory;
+pub mod project;
 pub mod summarize;
 pub mod tools;

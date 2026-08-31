@@ -66,7 +66,7 @@ fn test_migration_creates_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 12);
 
     // Verify the curation sidecars exist
     for table in ["memory_status", "memory_trash"] {

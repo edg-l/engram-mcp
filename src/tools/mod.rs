@@ -6,6 +6,7 @@
 #![allow(unused_imports)]
 
 mod adr;
+pub mod cluster;
 pub mod curation;
 mod handler;
 mod handoff;
@@ -18,6 +19,7 @@ pub mod todo;
 mod test_utils;
 
 pub use adr::{AdrCreateResult, create_adr};
+pub use cluster::{assign_to_cluster, compute_cluster_centroid, generate_cluster_summary};
 pub use curation::{CurationView, MatchedVia, Resolution};
 pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};

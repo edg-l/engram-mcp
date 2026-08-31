@@ -19,6 +19,15 @@ use crate::memory::RelationType;
 
 use super::Database;
 
+/// A `memory_status` row's payload, keyed by memory id in [`StatusRowMap`]: `(dead, reason,
+/// marked_at)`. Distinct from `export::StatusMap`, which is keyed the same way but holds the
+/// wire-format `ExportedStatus` struct instead of this raw tuple.
+pub type StatusRow = (bool, Option<String>, i64);
+
+/// `memory_id -> (dead, reason, marked_at)`, the shape returned by
+/// [`Database::export_status_rows`](super::sync).
+pub type StatusRowMap = HashMap<String, StatusRow>;
+
 /// Longest supersession chain followed when resolving a successor.
 ///
 /// Matches the handoff chain depth. A chain longer than this is almost certainly a
@@ -99,28 +108,45 @@ impl Database {
         Ok(SupersessionMap { direct })
     }
 
-    /// Mark a memory dead (excluded from retrieval) or bring it back.
+    /// Mark a memory dead (excluded from retrieval) or bring it back, at the current time.
     pub fn set_dead(
         &self,
         memory_id: &str,
         dead: bool,
         reason: Option<&str>,
     ) -> Result<(), MemoryError> {
+        self.set_dead_at(memory_id, dead, reason, chrono::Utc::now().timestamp())
+    }
+
+    /// Mark a memory dead or bring it back, with an explicit `marked_at`.
+    ///
+    /// Used by import to preserve the source machine's timestamp instead of stamping the
+    /// importer's clock, which would make every dead-only toggle look newer than it is and
+    /// defeat last-write-wins convergence. Also bumps `memories.updated_at` so a dead-only
+    /// toggle (no content change) is still visible to `--since` incremental exports.
+    ///
+    /// The row is upserted, never deleted, on revival: a revival with no persisted "alive
+    /// since T" signal cannot itself converge through export/import, since there would be
+    /// nothing to distinguish "never touched" from "explicitly revived" in the payload.
+    pub fn set_dead_at(
+        &self,
+        memory_id: &str,
+        dead: bool,
+        reason: Option<&str>,
+        marked_at: i64,
+    ) -> Result<(), MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let now = chrono::Utc::now().timestamp();
-        if dead {
-            conn.execute(
-                "INSERT INTO memory_status (memory_id, dead, reason, marked_at)
-                 VALUES (?1, 1, ?2, ?3)
-                 ON CONFLICT(memory_id) DO UPDATE SET dead = 1, reason = ?2, marked_at = ?3",
-                params![memory_id, reason, now],
-            )?;
-        } else {
-            conn.execute(
-                "DELETE FROM memory_status WHERE memory_id = ?1",
-                params![memory_id],
-            )?;
-        }
+        let dead_flag = i64::from(dead);
+        conn.execute(
+            "INSERT INTO memory_status (memory_id, dead, reason, marked_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(memory_id) DO UPDATE SET dead = ?2, reason = ?3, marked_at = ?4",
+            params![memory_id, dead_flag, reason, marked_at],
+        )?;
+        conn.execute(
+            "UPDATE memories SET updated_at = MAX(updated_at, ?2) WHERE id = ?1",
+            params![memory_id, marked_at],
+        )?;
         Ok(())
     }
 

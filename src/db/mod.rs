@@ -16,6 +16,7 @@ mod memories;
 mod migrations;
 mod relationships;
 mod status;
+mod sync;
 mod todos;
 mod trash;
 

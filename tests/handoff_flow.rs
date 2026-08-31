@@ -232,6 +232,9 @@ fn export_import_preserves_handoff_sections() {
         sidecars,
         &std::collections::HashMap::new(),
         Some("test-model".to_string()),
+        engram_mcp::export::ExportScope::Project,
+        &engram_mcp::export::StatusMap::new(),
+        &engram_mcp::export::TodoMap::new(),
     );
 
     // Verify the export JSON contains the sidecar fields for the handoff.
@@ -366,6 +369,8 @@ fn import_old_export_without_sidecar_fields() {
         adr_number: None,
         adr_status: None,
         adr_sections: None,
+        status: None,
+        todo: None,
     };
 
     // Store the memory row (simulating what memory_import does for the old format).

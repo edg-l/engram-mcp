@@ -313,6 +313,12 @@ engram-cli link mem_abc123 mem_def456 -r relates_to
 # Import/Export
 engram-cli export -o backup.json
 engram-cli import backup.json
+engram-cli export --all-projects --embeddings -o full.json  # whole-store export
+engram-cli import -                                          # import from stdin
+
+# Sync
+engram-cli sync user@host                # bidirectional incremental sync of the whole store
+engram-cli sync user@host --dry-run       # preview transfer sizes, no import/push
 
 # Projects
 engram-cli projects                              # list all projects in the store
@@ -358,7 +364,7 @@ engram-cli health
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ENGRAM_DB` | SQLite database path | `~/.local/share/engram/memories.db` |
-| `ENGRAM_PROJECT` | Project scope identifier | Git root directory name |
+| `ENGRAM_PROJECT` | Project scope override | Derived from cwd: git remote (`git:host/path`), else `~/`-relative path, else verbatim |
 | `ENGRAM_DECAY_INTERVAL` | Decay job interval (seconds) | `3600` (1 hour) |
 | `ENGRAM_RECLUSTER_INTERVAL` | Re-clustering job interval (seconds) | `21600` (6 hours) |
 | `ENGRAM_MAX_CANDIDATES` | Max candidate embeddings to score during context retrieval | `200` |
@@ -469,7 +475,7 @@ Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blocker
 - Single-node, single-user. No auth (it's a local MCP server).
 - Embedding model: mdbr-leaf-ir, 256-dim MRL.
 - Hybrid retrieval: SQLite FTS5 keyword + cosine.
-- Cross-PC sync is not supported (local SQLite only). Use `engram-cli export` / `import` for manual sync.
+- `engram-cli sync <user@host>` replicates the whole store (every project) both ways over plain `ssh`, incrementally via a per-remote watermark: `engram-cli sync <target> --dry-run` previews what would move before doing it for real. Last-write-wins on content; deletions, trash, and clusters never sync. See `CLAUDE.md`'s **Sync** section for the convergence rule and what's out of scope.
 
 ## Development
 

@@ -1,4 +1,4 @@
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::error::MemoryError;
 
@@ -24,6 +24,24 @@ impl Database {
         Ok(())
     }
 
+    /// The embedding model that produced the most stored vectors in this store.
+    ///
+    /// Store-wide, not per-project: exports carry this so an importer on another machine
+    /// can detect a model mismatch and re-embed rather than trust foreign vectors under
+    /// its own model's label.
+    #[allow(dead_code)] // Used by engram-cli export
+    pub fn dominant_model_version(&self) -> Result<Option<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let version = conn
+            .query_row(
+                "SELECT model_version FROM embeddings GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(version)
+    }
+
     #[allow(dead_code)] // Available for export functionality
     pub fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>, MemoryError> {
         let conn = self.conn.lock().unwrap();
@@ -33,8 +51,10 @@ impl Database {
         if let Some(row) = rows.next()? {
             let bytes: Vec<u8> = row.get(0)?;
             let vector: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             Ok(Some(vector))
         } else {
@@ -56,8 +76,10 @@ impl Database {
             let memory_id: String = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             let vector: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             Ok((memory_id, vector))
         })?;
@@ -94,8 +116,10 @@ impl Database {
             let memory_id: String = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             let vector: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             Ok((memory_id, vector))
         })?;
@@ -117,8 +141,10 @@ impl Database {
             let memory_id: String = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             let vector: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             Ok((memory_id, vector))
         })?;
@@ -149,8 +175,10 @@ impl Database {
             let memory_id: String = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             let vector: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             Ok((memory_id, vector))
         })?;

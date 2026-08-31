@@ -246,6 +246,9 @@ fn export_import_roundtrips_artifacts() {
         std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         None,
+        engram_mcp::export::ExportScope::Project,
+        &engram_mcp::export::StatusMap::new(),
+        &engram_mcp::export::TodoMap::new(),
     );
     assert!(validate_import(&export_data).is_ok());
 

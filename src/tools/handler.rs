@@ -1516,6 +1516,9 @@ impl ToolHandler {
             handoff_sidecars,
             &adr_sidecars,
             Some(self.embedding.model_version().to_string()),
+            export::ExportScope::Project,
+            &export::StatusMap::new(),
+            &export::TodoMap::new(),
         );
 
         Ok(json!(export_data))
@@ -1529,6 +1532,19 @@ impl ToolHandler {
 
         // Validate version
         export::validate_import(&export_data).map_err(MemoryError::Embedding)?;
+
+        // This path re-homes every imported memory under the resolved `project`
+        // unconditionally (below), unlike `engram-cli import`'s scope-aware routing.
+        // Feeding it an all-projects payload (from `engram-cli export --all-projects` or
+        // a `sync` pull) would silently collapse every project it carries into one, and
+        // nothing stops it — `memories.project_id` has no foreign-key constraint.
+        if export_data.scope == export::ExportScope::AllProjects {
+            return Err(MemoryError::Embedding(
+                "memory_import cannot accept an all-projects payload (scope: all_projects); \
+                 import it with `engram-cli import` instead."
+                    .to_string(),
+            ));
+        }
 
         // Warn about embedding model version mismatch
         let model_warning: Option<String> =
@@ -1566,6 +1582,7 @@ impl ToolHandler {
                 adr_number,
                 adr_status: adr_status_str,
                 adr_sections: adr_sections_data,
+                ..
             } = exported;
 
             let mem_created_at = memory.created_at;
@@ -3038,41 +3055,7 @@ impl ToolHandler {
     /// Generate a cluster summary from member memories.
     /// Uses the first sentence of the highest-importance member + top keywords across all members.
     fn generate_cluster_summary(&self, member_ids: &[String]) -> Result<String, MemoryError> {
-        if member_ids.is_empty() {
-            return Ok("Empty cluster".to_string());
-        }
-
-        let members = self.db.get_memories_batch(member_ids)?;
-        if members.is_empty() {
-            return Ok("Empty cluster".to_string());
-        }
-
-        // Find highest-importance member
-        let best_member = members
-            .values()
-            .max_by(|a, b| {
-                a.importance
-                    .partial_cmp(&b.importance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap();
-
-        // Get first sentence from best member
-        let first_sentence = crate::summarize::extract_first_sentence(&best_member.content);
-
-        // Collect keywords from all members
-        let all_content: String = members
-            .values()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let keywords = crate::summarize::extract_keywords(&all_content, 3);
-
-        if keywords.is_empty() {
-            Ok(first_sentence)
-        } else {
-            Ok(format!("{} [{}]", first_sentence, keywords.join(", ")))
-        }
+        super::cluster::generate_cluster_summary(&self.db, member_ids)
     }
 
     /// Assign a memory to the best matching cluster, or create a new one.
@@ -3082,64 +3065,11 @@ impl ToolHandler {
         memory_id: &str,
         embedding: &[f32],
         content: &str,
-        _importance: f64,
+        importance: f64,
     ) -> Result<Option<String>, MemoryError> {
-        use crate::memory::MemoryCluster;
-
-        let clusters = self.db.get_clusters_for_project(project)?;
-
-        // Find best matching cluster by centroid similarity
-        const CLUSTER_THRESHOLD: f32 = 0.75;
-        let mut best_match: Option<(String, f32)> = None;
-
-        for cluster in &clusters {
-            if let Some(ref centroid) = cluster.centroid {
-                let similarity = cosine_similarity(embedding, centroid);
-                if similarity >= CLUSTER_THRESHOLD
-                    && (best_match.is_none() || similarity > best_match.as_ref().unwrap().1)
-                {
-                    best_match = Some((cluster.id.clone(), similarity));
-                }
-            }
-        }
-
-        let now = chrono::Utc::now().timestamp();
-
-        if let Some((cluster_id, _)) = best_match {
-            // Add to existing cluster
-            self.db.add_to_cluster(&cluster_id, memory_id)?;
-
-            // Update centroid (running average)
-            let member_ids = self.db.get_cluster_member_ids(&cluster_id)?;
-            let new_centroid = self.compute_cluster_centroid(&member_ids)?;
-            let summary = self.generate_cluster_summary(&member_ids)?;
-
-            if let Some(centroid) = new_centroid {
-                self.db
-                    .update_cluster_centroid(&cluster_id, &centroid, &summary)?;
-            }
-
-            Ok(Some(cluster_id))
-        } else {
-            // Create new cluster
-            let cluster_id = format!("clust_{}", uuid::Uuid::new_v4().simple());
-            let summary = crate::summarize::extract_first_sentence(content);
-
-            let cluster = MemoryCluster {
-                id: cluster_id.clone(),
-                project_id: project.to_string(),
-                summary,
-                member_count: 1,
-                centroid: Some(embedding.to_vec()),
-                created_at: now,
-                updated_at: now,
-            };
-
-            self.db.create_cluster(&cluster)?;
-            self.db.add_to_cluster(&cluster_id, memory_id)?;
-
-            Ok(Some(cluster_id))
-        }
+        super::cluster::assign_to_cluster(
+            &self.db, project, memory_id, embedding, content, importance,
+        )
     }
 
     /// Compute the centroid (average embedding) for a set of memory IDs.
@@ -3147,36 +3077,7 @@ impl ToolHandler {
         &self,
         member_ids: &[String],
     ) -> Result<Option<Vec<f32>>, MemoryError> {
-        if member_ids.is_empty() {
-            return Ok(None);
-        }
-
-        let member_embeddings = self.db.get_embeddings_batch(member_ids)?;
-
-        let mut sum: Option<Vec<f32>> = None;
-        let mut count = 0usize;
-
-        for (_id, vec) in &member_embeddings {
-            count += 1;
-            match &mut sum {
-                None => sum = Some(vec.clone()),
-                Some(s) => {
-                    for (i, v) in vec.iter().enumerate() {
-                        if i < s.len() {
-                            s[i] += v;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(sum.map(|mut s| {
-            let c = count as f32;
-            for v in &mut s {
-                *v /= c;
-            }
-            s
-        }))
+        super::cluster::compute_cluster_centroid(&self.db, member_ids)
     }
 }
 

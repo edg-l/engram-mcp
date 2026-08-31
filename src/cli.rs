@@ -11,6 +11,7 @@ mod export;
 mod format;
 mod hooks;
 mod memory;
+mod project;
 mod summarize;
 mod tools;
 
@@ -29,6 +30,7 @@ use tools::curation::{CurationView, MatchedVia, Resolution, supersession_candida
 #[derive(Parser)]
 #[command(name = "engram-cli")]
 #[command(about = "CLI for Engram memory management", long_about = None)]
+#[command(version)]
 struct Cli {
     /// Database path (default: ~/.local/share/engram/memories.db)
     #[arg(short, long)]
@@ -209,14 +211,38 @@ enum Commands {
         /// Include embeddings
         #[arg(short, long)]
         embeddings: bool,
+        /// Export every project in the store, not just the current one
+        #[arg(long)]
+        all_projects: bool,
+        /// Only include rows updated at or after this unix timestamp (seconds)
+        #[arg(long)]
+        since: Option<i64>,
     },
     /// Import memories from JSON
     Import {
-        /// Input file
+        /// Input file, or "-" to read from stdin
         file: PathBuf,
         /// Import mode
         #[arg(short, long, default_value = "merge")]
         mode: String,
+    },
+    /// Bidirectional incremental sync of the whole store with a remote machine over ssh.
+    /// Shells out to `ssh <target> <remote-bin> ...`; deletions never propagate.
+    Sync {
+        /// ssh target, e.g. "user@host" or an entry from ~/.ssh/config
+        target: String,
+        /// engram-cli binary to invoke on the remote
+        #[arg(long, default_value = "engram-cli")]
+        remote_bin: String,
+        /// Report what would be transferred without importing or pushing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Only pull from the remote
+        #[arg(long, conflicts_with = "push_only")]
+        pull_only: bool,
+        /// Only push to the remote
+        #[arg(long)]
+        push_only: bool,
     },
     /// Show project statistics
     Stats,
@@ -590,100 +616,6 @@ fn get_db_path(cli_path: Option<PathBuf>) -> PathBuf {
         })
 }
 
-/// Find the git repository root by walking up from current directory.
-/// Returns None if not in a git repository.
-fn find_git_root() -> Option<PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-/// Determine project ID from git root path or current directory.
-fn get_project_id(cli_project: Option<String>) -> String {
-    // 1. Explicit override via CLI or env var
-    if let Some(project) = cli_project {
-        return project;
-    }
-    if let Ok(project) = std::env::var("ENGRAM_PROJECT") {
-        return project;
-    }
-
-    // 2. Try git root path
-    if let Some(git_root) = find_git_root() {
-        return git_root.to_string_lossy().to_string();
-    }
-
-    // 3. Fall back to current directory path
-    if let Ok(cwd) = std::env::current_dir() {
-        return cwd.to_string_lossy().to_string();
-    }
-
-    // 4. Ultimate fallback
-    "default".to_string()
-}
-
-/// Detect the current git branch.
-/// Returns None if not in a git repository or on error.
-/// Priority: `--current-branch` (applied by the caller) > ENGRAM_BRANCH env var > git detection
-fn get_current_branch() -> Option<String> {
-    // Check environment variable override first
-    if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
-        && !branch.is_empty()
-    {
-        return Some(branch);
-    }
-
-    // Find git root
-    let git_root = find_git_root()?;
-    let git_dir = git_root.join(".git");
-
-    // Try reading .git/HEAD directly (faster than spawning git process)
-    if let Ok(head_content) = std::fs::read_to_string(git_dir.join("HEAD")) {
-        let head = head_content.trim();
-        if let Some(branch_ref) = head.strip_prefix("ref: refs/heads/") {
-            return Some(branch_ref.to_string());
-        }
-        // Detached HEAD - use short SHA
-        if head.len() >= 7 {
-            return Some(format!("detached-{}", &head[..7]));
-        }
-    }
-
-    // Fallback: try git command
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&git_root)
-        .output()
-        && output.status.success()
-    {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if branch == "HEAD" {
-            // Detached HEAD - get short SHA
-            if let Ok(sha_output) = std::process::Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .current_dir(&git_root)
-                .output()
-                && sha_output.status.success()
-            {
-                let sha = String::from_utf8_lossy(&sha_output.stdout)
-                    .trim()
-                    .to_string();
-                return Some(format!("detached-{}", sha));
-            }
-        } else {
-            return Some(branch);
-        }
-    }
-
-    None
-}
-
 /// Whether a command only reads memories, so an explicit `--project` that does
 /// not exist yet is a mistake rather than a new project to create.
 fn requires_existing_project(cmd: &Commands) -> bool {
@@ -716,6 +648,7 @@ fn needs_embedding_service(cmd: &Commands) -> bool {
         | Commands::Store { .. }
         | Commands::Update { .. }
         | Commands::Import { .. }
+        | Commands::Sync { .. }
         | Commands::Dedup { .. }
         | Commands::Context { .. } => true,
         Commands::Handoff { cmd: handoff_cmd } => matches!(
@@ -754,7 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = get_db_path(cli.database);
     let project_was_explicit = cli.project.is_some();
-    let project_id = get_project_id(cli.project);
+    let project_id = project::resolve_project_id(cli.project);
 
     // Ensure database directory exists
     if let Some(parent) = db_path.parent() {
@@ -805,7 +738,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .current_branch
         .clone()
         .filter(|b| !b.is_empty())
-        .or_else(get_current_branch);
+        .or_else(project::current_branch);
 
     match cli.command {
         Commands::Query {
@@ -944,8 +877,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             cmd_link(&db, &source, &target, &relation, strength)?;
         }
-        Commands::Export { output, embeddings } => {
-            cmd_export(&db, &project_id, output, embeddings)?;
+        Commands::Export {
+            output,
+            embeddings,
+            all_projects,
+            since,
+        } => {
+            cmd_export(&db, &project_id, output, embeddings, all_projects, since)?;
         }
         Commands::Import { file, mode } => {
             cmd_import(
@@ -954,6 +892,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 embedding_service.as_ref().unwrap(),
                 &file,
                 &mode,
+            )?;
+        }
+        Commands::Sync {
+            target,
+            remote_bin,
+            dry_run,
+            pull_only,
+            push_only,
+        } => {
+            cmd_sync(
+                &db,
+                embedding_service.as_ref().unwrap(),
+                &target,
+                &remote_bin,
+                dry_run,
+                pull_only,
+                push_only,
             )?;
         }
         Commands::Stats => {
@@ -1846,17 +1801,36 @@ fn cmd_link(
     Ok(())
 }
 
-fn cmd_export(
+/// Build an `ExportData` payload straight from the database. Shared by `cmd_export`
+/// (writes it to a file or stdout) and `cmd_sync` (serializes it for a piped `ssh`
+/// transfer), so the sidecar-collection logic below exists exactly once.
+fn build_export_data(
     db: &Database,
-    project_id: &str,
-    output: Option<PathBuf>,
+    project_filter: Option<&str>,
+    since: Option<i64>,
     include_embeddings: bool,
-) -> Result<(), MemoryError> {
-    let memories = db.get_all_memories_for_project(project_id)?;
-    let relationships = db.get_all_relationships_for_project(project_id)?;
+    scope: export::ExportScope,
+    export_project_id: &str,
+    exclude_origin: Option<&str>,
+) -> Result<export::ExportData, MemoryError> {
+    let mut memories = db.export_memories(project_filter, since)?;
+    // Sync's push half only: drop memories that arrived unmodified from this exact
+    // remote (see `origin_unchanged_since_pull`), so a sync doesn't echo pulled content
+    // straight back to its own source on the very next run.
+    if let Some(remote) = exclude_origin {
+        let candidates: Vec<(String, i64)> = memories
+            .iter()
+            .map(|m| (m.id.clone(), m.updated_at))
+            .collect();
+        let exclude_ids = db.origin_unchanged_since_pull(remote, &candidates)?;
+        if !exclude_ids.is_empty() {
+            memories.retain(|m| !exclude_ids.contains(&m.id));
+        }
+    }
+    let relationships = db.export_relationships(project_filter, since)?;
 
     let embeddings = if include_embeddings {
-        Some(db.get_all_embeddings_for_project(project_id)?)
+        Some(db.export_embeddings(project_filter, since)?)
     } else {
         None
     };
@@ -1890,15 +1864,88 @@ fn cmd_export(
         }
     }
 
-    let export_data = export::create_export(
-        project_id,
+    // Status sidecar: every memory that has ever been marked dead or revived, so a
+    // revival converges through export/import the same way a dead-marking does.
+    let status_map: export::StatusMap = db
+        .export_status_rows(project_filter, since)?
+        .into_iter()
+        .map(|(id, (dead, reason, marked_at))| {
+            (
+                id,
+                export::ExportedStatus {
+                    dead,
+                    reason,
+                    marked_at,
+                },
+            )
+        })
+        .collect();
+
+    // Todo lifecycle sidecar.
+    let todo_map: export::TodoMap = db
+        .export_todo_rows(project_filter, since)?
+        .into_iter()
+        .map(|t| {
+            (
+                t.id,
+                export::ExportedTodo {
+                    status: t.status,
+                    reason: t.reason,
+                    closed_at: t.closed_at,
+                },
+            )
+        })
+        .collect();
+
+    Ok(export::create_export(
+        export_project_id,
         memories,
         relationships,
         embeddings,
         handoff_sidecars,
         &adr_sidecars,
+        db.dominant_model_version()?,
+        scope,
+        &status_map,
+        &todo_map,
+    ))
+}
+
+fn cmd_export(
+    db: &Database,
+    project_id: &str,
+    output: Option<PathBuf>,
+    include_embeddings: bool,
+    all_projects: bool,
+    since: Option<i64>,
+) -> Result<(), MemoryError> {
+    // `None` draws from every project; the unbounded `export_*` getters (src/db/sync.rs)
+    // replace the old `get_all_*_for_project` calls even for the default single-project
+    // case, so a store past `query_memories`'s 10000-row cap is never silently truncated.
+    let project_filter = if all_projects { None } else { Some(project_id) };
+
+    let scope = if all_projects {
+        export::ExportScope::AllProjects
+    } else {
+        export::ExportScope::Project
+    };
+    // Each memory carries its own project_id in an all-projects export; the top-level
+    // field is meaningless there and left empty rather than naming one arbitrary project.
+    let export_project_id = if all_projects {
+        String::new()
+    } else {
+        project_id.to_string()
+    };
+
+    let export_data = build_export_data(
+        db,
+        project_filter,
+        since,
+        include_embeddings,
+        scope,
+        &export_project_id,
         None,
-    );
+    )?;
 
     let json = serde_json::to_string_pretty(&export_data)?;
 
@@ -1912,28 +1959,45 @@ fn cmd_export(
     Ok(())
 }
 
-fn cmd_import(
+/// Counts from `import_export_data`, reported by both `cmd_import` (as prose) and
+/// `cmd_sync`'s pull half.
+struct ImportSummary {
+    imported: usize,
+    updated: usize,
+    rel_imported: usize,
+    skipped: usize,
+}
+
+/// The memory/relationship/sidecar merge loop, shared by `cmd_import` (a payload read
+/// from a file or stdin) and `cmd_sync`'s pull half (a payload already parsed from a
+/// remote's `export` stdout, always `ImportMode::Merge`). `project_id` only matters when
+/// `export_data.scope` is `Project`; an `AllProjects` payload re-homes nothing and keeps
+/// each memory's own `project_id`, ignoring this argument entirely.
+fn import_export_data(
     db: &Database,
     project_id: &str,
     embedding_service: &EmbeddingService,
-    file: &PathBuf,
-    mode: &str,
-) -> Result<(), MemoryError> {
-    let json = std::fs::read_to_string(file)?;
-    let export_data: export::ExportData = serde_json::from_str(&json)?;
+    export_data: export::ExportData,
+    import_mode: export::ImportMode,
+    origin_remote: Option<&str>,
+) -> Result<ImportSummary, MemoryError> {
+    let all_projects = export_data.scope == export::ExportScope::AllProjects;
 
-    export::validate_import(&export_data).map_err(MemoryError::Embedding)?;
+    // A payload from a different embedding model is not comparable to locally-stored
+    // vectors in cosine search: ignore it and re-embed locally instead of trusting
+    // foreign vectors under this store's model label.
+    let reembed_due_to_model_mismatch = export_data
+        .model_version
+        .as_deref()
+        .is_some_and(|v| v != embedding_service.model_version());
 
-    let import_mode: export::ImportMode = mode.parse().unwrap_or(export::ImportMode::Merge);
-
-    if import_mode == export::ImportMode::Replace {
-        db.delete_project_data(project_id)?;
-        println!("Cleared existing data.");
-    }
-
-    let now = chrono::Utc::now().timestamp();
     let mut imported = 0;
+    let mut updated = 0;
     let mut skipped = 0;
+    // Every distinct project touched by this import, so relevance scores are recomputed
+    // once per project rather than only for the CLI's own `-p`/cwd project. Also doubles
+    // as the "already ensured" set for `get_or_create_project` in all-projects mode.
+    let mut touched_projects: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for exported in export_data.memories {
         let mut memory = exported.memory;
@@ -1944,22 +2008,64 @@ fn cmd_import(
         let adr_number = exported.adr_number;
         let adr_status_str = exported.adr_status;
         let adr_sections_data = exported.adr_sections;
+        let status_sidecar = exported.status;
+        let todo_sidecar = exported.todo;
         let mem_created_at = memory.created_at;
         let mem_updated_at = memory.updated_at;
-        memory.project_id = project_id.to_string();
-        memory.updated_at = now;
-
-        if import_mode == export::ImportMode::Merge && db.get_memory(&memory.id)?.is_some() {
-            skipped += 1;
-            continue;
+        let incoming_updated_at = memory.updated_at;
+        // All-projects payloads keep each memory's own project_id and ignore the CLI's
+        // resolved `-p`/cwd project entirely; a single-project payload is re-homed to it,
+        // matching the pre-4.4 behavior.
+        let target_project_id = if all_projects {
+            memory.project_id.clone()
+        } else {
+            project_id.to_string()
+        };
+        memory.project_id = target_project_id.clone();
+        if all_projects && touched_projects.insert(target_project_id.clone()) {
+            db.get_or_create_project(&target_project_id, &target_project_id)?;
         }
+        // Preserve the source machine's updated_at rather than stamping "now": overwriting
+        // it would make the importer's copy look newest on every import and defeat
+        // last-write-wins convergence (it would ping-pong forever between two machines).
+
+        // Merge mode is last-write-wins on `updated_at`, ties keep the local copy. Replace
+        // mode has already cleared the project, so it never looks the id up at all — the
+        // existence check below is Merge-only, matching the pre-LWW behavior for Replace.
+        let mut content_differs = false;
+        let is_update = if import_mode == export::ImportMode::Merge {
+            match db.get_memory(&memory.id)? {
+                Some(existing_memory) if incoming_updated_at <= existing_memory.updated_at => {
+                    skipped += 1;
+                    continue;
+                }
+                Some(existing_memory) => {
+                    content_differs = existing_memory.content != memory.content;
+                    if content_differs {
+                        db.trash_memory(&memory.id, db::OP_UPDATE)?;
+                    }
+                    // access_count/last_accessed_at take the max of both sides rather than
+                    // LWW — they are usage counters, not a single machine's claim.
+                    memory.access_count = memory.access_count.max(existing_memory.access_count);
+                    memory.last_accessed_at = memory
+                        .last_accessed_at
+                        .max(existing_memory.last_accessed_at);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
 
         // For ADR memories with a known number, pre-check the number BEFORE storing
         // the memory row.  If the number is already taken, skip the entire memory
-        // (memory row + embedding + sidecar) to keep them consistent.
-        if memory.memory_type == MemoryType::Adr
+        // (memory row + embedding + sidecar) to keep them consistent. Only applies to
+        // brand-new ADRs; an existing ADR being updated already owns its number.
+        if !is_update
+            && memory.memory_type == MemoryType::Adr
             && let Some(num) = adr_number
-            && db.get_adr_by_number(project_id, num)?.is_some()
+            && db.get_adr_by_number(&target_project_id, num)?.is_some()
         {
             skipped += 1;
             eprintln!(
@@ -1969,21 +2075,81 @@ fn cmd_import(
             continue;
         }
 
-        db.store_memory(&memory)?;
-
-        // Handle embedding
-        if let Some(encoded) = encoded_embedding {
-            if let Ok(vector) = export::decode_embedding(&encoded) {
-                db.store_embedding(&memory.id, &vector, embedding_service.model_version())?;
-            }
+        if is_update {
+            db.update_memory(&memory)?;
+            updated += 1;
         } else {
-            let embedding = embedding_service.embed_memory(memory.memory_type, &memory.content)?;
-            db.store_embedding(&memory.id, &embedding, embedding_service.model_version())?;
+            db.store_memory(&memory)?;
+            imported += 1;
+        }
+        touched_projects.insert(target_project_id.clone());
+        // Pin this memory's origin so sync's push half never echoes it straight back to
+        // the remote it just arrived from (see `origin_unchanged_since_pull`). Only set
+        // during sync's own in-process pull import; a plain `engram-cli import` passes
+        // `None` and does no origin tracking, since there is no "remote" to attribute it to.
+        if let Some(remote) = origin_remote {
+            db.set_memory_origin(&memory.id, remote, memory.updated_at)?;
         }
 
-        // Import handoff sidecar if present.
+        // Handle embedding
+        let stored_vector: Option<Vec<f32>> = if reembed_due_to_model_mismatch {
+            None
+        } else {
+            encoded_embedding
+                .as_deref()
+                .and_then(|e| export::decode_embedding(e).ok())
+        };
+        let final_vector = match stored_vector {
+            Some(vector) => vector,
+            None => embedding_service.embed_memory(memory.memory_type, &memory.content)?,
+        };
+        db.store_embedding(&memory.id, &final_vector, embedding_service.model_version())?;
+
+        // Assign to a cluster for every inserted or content-updated memory, matching the
+        // per-store call shape `memory_store` uses — the background re-clustering job
+        // amortizes the full pairwise merge/split pass separately and on its own schedule.
+        // ADR and Todo memories are exempt: `store_adr_atomic`/`store_todo_atomic` never
+        // route them through clustering either (ADRs are project-global reference
+        // documents, and a task list clustered by topic serves no retrieval purpose).
+        if (!is_update || content_differs)
+            && memory.memory_type != MemoryType::Adr
+            && memory.memory_type != MemoryType::Todo
+        {
+            // A content-changed update may already belong to a cluster whose centroid no
+            // longer represents it. Vacate that membership first — mirroring memory_delete's
+            // pattern in handler.rs — so re-assignment can't leave the memory in two
+            // clusters at once with a stale, unrecomputed centroid left behind in the old one.
+            if is_update
+                && content_differs
+                && let Ok(Some(old_cluster_id)) = db.remove_from_cluster(&memory.id)
+            {
+                let member_ids = db.get_cluster_member_ids(&old_cluster_id)?;
+                if member_ids.is_empty() {
+                    let _ = db.delete_empty_clusters(&target_project_id);
+                } else {
+                    let new_centroid = tools::cluster::compute_cluster_centroid(db, &member_ids)?;
+                    let summary = tools::cluster::generate_cluster_summary(db, &member_ids)?;
+                    if let Some(centroid) = new_centroid {
+                        let _ = db.update_cluster_centroid(&old_cluster_id, &centroid, &summary);
+                    }
+                }
+            }
+
+            tools::cluster::assign_to_cluster(
+                db,
+                &target_project_id,
+                &memory.id,
+                &final_vector,
+                &memory.content,
+                memory.importance,
+            )?;
+        }
+
+        // Import handoff sidecar if present. Only for brand-new handoffs: handoff and ADR
+        // sidecars are not among the LWW-governed mutable fields, so an update leaves the
+        // local sidecar row alone.
         // Old exports without sidecar fields skip this step silently.
-        if memory.memory_type == MemoryType::Handoff {
+        if !is_update && memory.memory_type == MemoryType::Handoff {
             match (sections, section_embedding_keys, encoded_section_embeddings) {
                 (Some(sections_data), Some(keys), Some(encoded_bytes)) => {
                     match export::decode_section_embedding_bytes(&encoded_bytes) {
@@ -2029,9 +2195,10 @@ fn cmd_import(
             }
         }
 
-        // Import ADR sidecar if present.
+        // Import ADR sidecar if present (brand-new ADRs only; see note above).
         // Number-conflict check above guarantees the number is free at this point.
-        if memory.memory_type == MemoryType::Adr
+        if !is_update
+            && memory.memory_type == MemoryType::Adr
             && let (Some(num), Some(status_str), Some(adr_sec)) =
                 (adr_number, adr_status_str, adr_sections_data)
         {
@@ -2040,7 +2207,7 @@ fn cmd_import(
                 Ok(status) => {
                     if let Err(e) = db.insert_adr_sidecar(
                         &memory.id,
-                        project_id,
+                        &target_project_id,
                         num,
                         status,
                         &adr_sec,
@@ -2062,7 +2229,25 @@ fn cmd_import(
             }
         }
 
-        imported += 1;
+        // Apply retrieval-status and todo sidecars for both new and updated memories: both
+        // are LWW-governed fields (see the Convergence rule), and `set_dead_at`/
+        // `upsert_todo_item` are upsert-safe.
+        if let Some(status) = status_sidecar {
+            db.set_dead_at(
+                &memory.id,
+                status.dead,
+                status.reason.as_deref(),
+                status.marked_at,
+            )?;
+        }
+        if let Some(todo) = todo_sidecar {
+            db.upsert_todo_item(
+                &memory.id,
+                todo.status,
+                todo.reason.as_deref(),
+                todo.closed_at,
+            )?;
+        }
     }
 
     // Import relationships
@@ -2076,10 +2261,271 @@ fn cmd_import(
         }
     }
 
+    // New or changed knowledge advanced each touched project's clock, so relevance needs
+    // recomputing there — matches what a store does. Looping `touched_projects` (rather
+    // than the single CLI `-p`/cwd project) is what makes an all-projects import recompute
+    // every project it actually wrote to, not just the one the command happened to run in.
+    for pid in &touched_projects {
+        if let Some(project) = db.get_project(pid)? {
+            db.update_relevance_scores(pid, project.decay_rate)?;
+        }
+    }
+
+    Ok(ImportSummary {
+        imported,
+        updated,
+        rel_imported,
+        skipped,
+    })
+}
+
+fn cmd_import(
+    db: &Database,
+    project_id: &str,
+    embedding_service: &EmbeddingService,
+    file: &PathBuf,
+    mode: &str,
+) -> Result<(), MemoryError> {
+    let json = if file.as_os_str() == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(file)?
+    };
+    let export_data: export::ExportData = serde_json::from_str(&json)?;
+
+    export::validate_import(&export_data).map_err(MemoryError::Embedding)?;
+
+    let import_mode: export::ImportMode = mode.parse().unwrap_or(export::ImportMode::Merge);
+    let all_projects = export_data.scope == export::ExportScope::AllProjects;
+
+    if all_projects && import_mode == export::ImportMode::Replace {
+        return Err(MemoryError::Embedding(
+            "--mode replace cannot be used with an all-projects payload (scope: all_projects): \
+             replace would wipe every project in this store, not just the one the payload came \
+             from. Re-export a single project's scope, or import this payload with --mode merge."
+                .to_string(),
+        ));
+    }
+
+    if import_mode == export::ImportMode::Replace {
+        db.delete_project_data(project_id)?;
+        println!("Cleared existing data.");
+    }
+
+    let summary = import_export_data(
+        db,
+        project_id,
+        embedding_service,
+        export_data,
+        import_mode,
+        None,
+    )?;
+
     println!(
-        "Imported {} memories, {} relationships ({} skipped)",
-        imported, rel_imported, skipped
+        "Imported {} memories, {} updated, {} relationships ({} skipped)",
+        summary.imported, summary.updated, summary.rel_imported, summary.skipped
     );
+
+    Ok(())
+}
+
+/// The greatest `memories[].updated_at` in a payload, or `None` if it carried no
+/// memories. Watermarks derive from this rather than wall-clock, so clock skew between
+/// the two machines can never skip a row.
+fn max_memory_updated_at(data: &export::ExportData) -> Option<i64> {
+    data.memories.iter().map(|m| m.memory.updated_at).max()
+}
+
+/// Bidirectional incremental sync with one remote over `ssh`, one process per direction.
+///
+/// Order matters: the push payload is built from the *local* store before the pull half
+/// imports anything, so rows that just arrived from the remote are not immediately
+/// bounced back to it in the same invocation. The pull half runs in-process (the remote
+/// only exports; this binary does the merge, reusing `import_export_data` — the same
+/// re-embedding and cluster-assignment path a file-based `import` takes). The push half
+/// is a genuine subprocess: the remote's own `import --mode merge -` does that side's
+/// merge, on its own store.
+///
+/// The two watermarks are independent: a failed half leaves both untouched for that
+/// direction only, and never touches the other direction's watermark.
+#[allow(clippy::too_many_arguments)]
+fn cmd_sync(
+    db: &Database,
+    embedding_service: &EmbeddingService,
+    target: &str,
+    remote_bin: &str,
+    dry_run: bool,
+    pull_only: bool,
+    push_only: bool,
+) -> Result<(), MemoryError> {
+    let ssh_cmd = std::env::var("ENGRAM_SSH_CMD").unwrap_or_else(|_| "ssh".to_string());
+
+    // Preflight: confirm remote_bin is reachable and understands --version, so a missing
+    // binary or a broken PATH under non-interactive ssh fails with a clear cause instead
+    // of a confusing parse error further down.
+    let preflight = std::process::Command::new(&ssh_cmd)
+        .args([target, remote_bin, "--version"])
+        .output()?;
+    if !preflight.status.success() {
+        return Err(MemoryError::Embedding(format!(
+            "remote preflight failed: `{ssh_cmd} {target} {remote_bin} --version` exited with \
+             {}. Confirm {remote_bin} is on the remote's PATH under non-interactive ssh, or \
+             point at it explicitly with --remote-bin.\n{}",
+            preflight.status,
+            String::from_utf8_lossy(&preflight.stderr).trim()
+        )));
+    }
+
+    let (pull_wm, push_wm) = db.get_sync_state(target)?;
+    let now = chrono::Utc::now().timestamp();
+
+    // Built before the pull half imports anything (see doc comment above).
+    let push_payload = if !pull_only {
+        let data = build_export_data(
+            db,
+            None,
+            Some(push_wm),
+            true,
+            export::ExportScope::AllProjects,
+            "",
+            Some(target),
+        )?;
+        let count = data.memories.len();
+        let max_updated_at = max_memory_updated_at(&data);
+        let json = serde_json::to_string(&data)?;
+        let bytes = json.len();
+        Some((json, bytes, count, max_updated_at))
+    } else {
+        None
+    };
+
+    let pull_payload = if !push_only {
+        let output = std::process::Command::new(&ssh_cmd)
+            .args([
+                target,
+                remote_bin,
+                "export",
+                "--all-projects",
+                "--embeddings",
+                "--since",
+                &pull_wm.to_string(),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(MemoryError::Embedding(format!(
+                "remote export failed: `{ssh_cmd} {target} {remote_bin} export --all-projects \
+                 --embeddings --since {pull_wm}` exited with {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let stdout = String::from_utf8(output.stdout).map_err(|e| {
+            MemoryError::Embedding(format!("remote export produced invalid UTF-8: {e}"))
+        })?;
+        let data: export::ExportData = serde_json::from_str(&stdout)?;
+        export::validate_import(&data).map_err(MemoryError::Embedding)?;
+        // `export --all-projects` is what was requested above; a payload that comes back
+        // scoped to one project (including an old --remote-bin whose response predates
+        // `scope`, which `#[serde(default)]` would silently read as `Project`) would
+        // otherwise re-home every memory under the empty `project_id` sent for
+        // all-projects payloads, with no foreign key to stop it.
+        if data.scope != export::ExportScope::AllProjects {
+            return Err(MemoryError::Embedding(format!(
+                "remote export returned scope `{:?}`, expected `all_projects`; refusing to \
+                 re-home {} memories under an empty project id. Check --remote-bin.",
+                data.scope,
+                data.memories.len()
+            )));
+        }
+        let count = data.memories.len();
+        let max_updated_at = max_memory_updated_at(&data);
+        Some((data, stdout.len(), count, max_updated_at))
+    } else {
+        None
+    };
+
+    if dry_run {
+        if let Some((_, bytes, count, _)) = &push_payload {
+            println!(
+                "push: {count} memory(ies) staged, {bytes} bytes, since watermark {push_wm} \
+                 (dry run, not sent)"
+            );
+        }
+        if let Some((_, bytes, count, _)) = &pull_payload {
+            println!(
+                "pull: {count} memory(ies) available, {bytes} bytes, since watermark {pull_wm} \
+                 (dry run, not imported)"
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some((data, _bytes, count, max_updated_at)) = pull_payload {
+        let summary = import_export_data(
+            db,
+            "",
+            embedding_service,
+            data,
+            export::ImportMode::Merge,
+            Some(target),
+        )?;
+        println!(
+            "pull: {} memories, {} updated, {} relationships ({} skipped) from {count} received",
+            summary.imported, summary.updated, summary.rel_imported, summary.skipped
+        );
+        let new_pull_wm = match max_updated_at {
+            Some(m) => pull_wm.max(m),
+            None => pull_wm,
+        };
+        db.set_pull_watermark(target, new_pull_wm, now)?;
+    }
+
+    if let Some((json, _bytes, count, max_updated_at)) = push_payload {
+        let mut child = std::process::Command::new(&ssh_cmd)
+            .args([target, remote_bin, "import", "--mode", "merge", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        // Write stdin on its own thread, concurrently with wait_with_output() draining
+        // stdout/stderr below. A payload here can run ~10MB; writing it to completion
+        // before touching the child's output pipes risks a classic deadlock if the child
+        // (or ssh itself, e.g. a host-key banner) fills its stdout/stderr pipe buffer
+        // before it has read all of stdin — parent blocks writing, child blocks writing
+        // back, neither ever drains the other.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            stdin.write_all(json.as_bytes())
+        });
+        let output = child.wait_with_output()?;
+        writer
+            .join()
+            .expect("stdin writer thread panicked")
+            .map_err(MemoryError::Io)?;
+        if !output.stdout.is_empty() {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        if !output.status.success() {
+            return Err(MemoryError::Embedding(format!(
+                "remote import failed: `{ssh_cmd} {target} {remote_bin} import --mode merge -` \
+                 exited with {}; push watermark left unchanged\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        println!("push: sent {count} memories");
+        let new_push_wm = match max_updated_at {
+            Some(m) => push_wm.max(m),
+            None => push_wm,
+        };
+        db.set_push_watermark(target, new_push_wm, now)?;
+    }
 
     Ok(())
 }

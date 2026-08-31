@@ -412,8 +412,10 @@ pub fn decode_section_embeddings(
             let start = i * 256 * 4;
             let end = start + 256 * 4;
             let vec: Vec<f32> = bytes[start..end]
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             (key.to_string(), vec)
         })

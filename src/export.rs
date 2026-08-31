@@ -9,10 +9,13 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory, Relationship};
+use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory, Relationship, TodoStatus};
 
 /// Current export format version
-pub const EXPORT_VERSION: &str = "1.2";
+pub const EXPORT_VERSION: &str = "1.3";
+
+/// Previous export version (for backward compatibility)
+pub const EXPORT_VERSION_1_2: &str = "1.2";
 
 /// Previous export version (for backward compatibility)
 pub const EXPORT_VERSION_1_1: &str = "1.1";
@@ -20,13 +23,29 @@ pub const EXPORT_VERSION_1_1: &str = "1.1";
 /// Oldest supported export version (for backward compatibility)
 pub const EXPORT_VERSION_1_0: &str = "1.0";
 
+/// Whether an export carries memories scoped to one project or drawn from every project
+/// in the store.
+///
+/// `AllProjects` memories keep their own `project_id`; the importer re-homes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportScope {
+    #[default]
+    Project,
+    AllProjects,
+}
+
 /// Export format for memories
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportData {
     /// Format version for compatibility checks
     pub version: String,
-    /// Project ID these memories belong to
+    /// Project ID these memories belong to. Empty when `scope` is `AllProjects`; each
+    /// memory carries its own `project_id` in that case.
     pub project_id: String,
+    /// Whether this export is scoped to one project or drawn from the whole store.
+    #[serde(default)]
+    pub scope: ExportScope,
     /// Exported memories
     pub memories: Vec<ExportedMemory>,
     /// Exported relationships
@@ -70,6 +89,29 @@ pub struct ExportedMemory {
     /// Structured ADR sections (ADR memories only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adr_sections: Option<AdrSections>,
+    /// Retrieval status sidecar (`memory_status`), present when the memory has ever had
+    /// its dead status touched — dead or since-revived; absent means never touched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ExportedStatus>,
+    /// Todo lifecycle sidecar (`todo_items`), present only for `MemoryType::Todo` memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo: Option<ExportedTodo>,
+}
+
+/// Exported `memory_status` row: the subject is gone, with no successor to redirect to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedStatus {
+    pub dead: bool,
+    pub reason: Option<String>,
+    pub marked_at: i64,
+}
+
+/// Exported `todo_items` row: the lifecycle sidecar for a `MemoryType::Todo` memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedTodo {
+    pub status: TodoStatus,
+    pub reason: Option<String>,
+    pub closed_at: Option<i64>,
 }
 
 /// Import mode for handling existing memories
@@ -130,8 +172,10 @@ pub fn decode_embedding(encoded: &str) -> Result<Vec<f32>, String> {
     }
 
     let vector: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
 
     Ok(vector)
@@ -151,6 +195,14 @@ pub struct HandoffSidecar {
 /// Maps `memory_id → (adr_number, status, sections)`.
 pub type AdrSidecarMap = std::collections::HashMap<String, (u32, AdrStatus, AdrSections)>;
 
+/// Sidecar data for a memory's retrieval status in an export. Maps
+/// `memory_id → ExportedStatus`. An entry exists for any memory that has ever had its
+/// dead status touched, dead or since-revived; a missing entry means never touched.
+pub type StatusMap = std::collections::HashMap<String, ExportedStatus>;
+
+/// Sidecar data for todo memories in an export. Maps `memory_id → ExportedTodo`.
+pub type TodoMap = std::collections::HashMap<String, ExportedTodo>;
+
 /// Create export data from memories and relationships.
 ///
 /// `handoff_sidecars` maps handoff memory IDs to their sidecar data.  Pass an empty map
@@ -159,6 +211,10 @@ pub type AdrSidecarMap = std::collections::HashMap<String, (u32, AdrStatus, AdrS
 ///
 /// `adr_sidecars` maps ADR memory IDs to `(number, status, sections)` tuples.
 /// Pass an empty map when no ADR export is needed.
+///
+/// `status_map` and `todo_map` are additive sidecars, same shape as `handoff_sidecars`:
+/// pass an empty map when the caller does not populate them.
+#[allow(clippy::too_many_arguments)]
 pub fn create_export(
     project_id: &str,
     memories: Vec<Memory>,
@@ -167,6 +223,9 @@ pub fn create_export(
     handoff_sidecars: std::collections::HashMap<String, HandoffSidecar>,
     adr_sidecars: &AdrSidecarMap,
     model_version: Option<String>,
+    scope: ExportScope,
+    status_map: &StatusMap,
+    todo_map: &TodoMap,
 ) -> ExportData {
     let embedding_map: std::collections::HashMap<String, Vec<f32>> =
         embeddings.unwrap_or_default().into_iter().collect();
@@ -200,6 +259,9 @@ pub fn create_export(
                     (None, None, None)
                 };
 
+            let status = status_map.get(&memory.id).cloned();
+            let todo = todo_map.get(&memory.id).cloned();
+
             ExportedMemory {
                 memory,
                 embedding,
@@ -209,6 +271,8 @@ pub fn create_export(
                 adr_number,
                 adr_status,
                 adr_sections,
+                status,
+                todo,
             }
         })
         .collect();
@@ -216,6 +280,7 @@ pub fn create_export(
     ExportData {
         version: EXPORT_VERSION.to_string(),
         project_id: project_id.to_string(),
+        scope,
         memories: exported_memories,
         relationships,
         exported_at: chrono::Utc::now().timestamp(),
@@ -232,14 +297,20 @@ pub fn decode_section_embedding_bytes(encoded: &str) -> Result<Vec<u8>, String> 
 
 /// Validate import data version compatibility
 pub fn validate_import(data: &ExportData) -> Result<(), String> {
-    // Support 1.0 (pre-branch), 1.1 (with branch), and 1.2 (ADR round-trip)
+    // Support 1.0 (pre-branch), 1.1 (with branch), 1.2 (ADR round-trip), and 1.3
+    // (status/todo sidecars + scope).
     if data.version != EXPORT_VERSION
+        && data.version != EXPORT_VERSION_1_2
         && data.version != EXPORT_VERSION_1_1
         && data.version != EXPORT_VERSION_1_0
     {
         return Err(format!(
-            "Unsupported export version: {}. Expected: {}, {}, or {}",
-            data.version, EXPORT_VERSION, EXPORT_VERSION_1_1, EXPORT_VERSION_1_0
+            "Unsupported export version: {}. Expected: {}, {}, {}, or {}",
+            data.version,
+            EXPORT_VERSION,
+            EXPORT_VERSION_1_2,
+            EXPORT_VERSION_1_1,
+            EXPORT_VERSION_1_0
         ));
     }
     Ok(())
@@ -269,6 +340,7 @@ mod tests {
         let valid = ExportData {
             version: EXPORT_VERSION.to_string(),
             project_id: "test".to_string(),
+            scope: ExportScope::Project,
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
@@ -280,6 +352,7 @@ mod tests {
         let valid_v1 = ExportData {
             version: EXPORT_VERSION_1_0.to_string(),
             project_id: "test".to_string(),
+            scope: ExportScope::Project,
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
@@ -290,6 +363,7 @@ mod tests {
         let invalid = ExportData {
             version: "0.1".to_string(),
             project_id: "test".to_string(),
+            scope: ExportScope::Project,
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
@@ -304,6 +378,7 @@ mod tests {
         let data = ExportData {
             version: EXPORT_VERSION_1_1.to_string(),
             project_id: "test".to_string(),
+            scope: ExportScope::Project,
             memories: vec![],
             relationships: vec![],
             exported_at: 0,
@@ -367,14 +442,17 @@ mod tests {
             std::collections::HashMap::new(),
             &adr_sidecars,
             None,
+            ExportScope::Project,
+            &StatusMap::new(),
+            &TodoMap::new(),
         );
 
-        // Version must be "1.2".
+        // Version must be "1.3".
         assert_eq!(
             export_data.version, EXPORT_VERSION,
-            "exported version must be 1.2"
+            "exported version must be 1.3"
         );
-        assert_eq!(EXPORT_VERSION, "1.2");
+        assert_eq!(EXPORT_VERSION, "1.3");
 
         // Serialize → deserialize to simulate round-trip through JSON.
         let json_str = serde_json::to_string(&export_data).unwrap();

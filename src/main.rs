@@ -9,6 +9,7 @@ mod error;
 mod export;
 mod format;
 mod memory;
+mod project;
 mod summarize;
 mod tools;
 
@@ -53,76 +54,6 @@ fn mcp_error(e: MemoryError) -> McpError {
             McpError::internal_error(e.to_string(), None)
         }
     }
-}
-
-/// Find the git repository root by walking up from current directory.
-/// Returns None if not in a git repository.
-fn find_git_root() -> Option<PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-/// Detect the current git branch.
-/// Returns None if not in a git repository or on error.
-/// Priority: ENGRAM_BRANCH env var > git detection
-fn get_current_branch() -> Option<String> {
-    // Check environment variable override first
-    if let Ok(branch) = std::env::var("ENGRAM_BRANCH")
-        && !branch.is_empty()
-    {
-        return Some(branch);
-    }
-
-    // Find git root
-    let git_root = find_git_root()?;
-    let git_dir = git_root.join(".git");
-
-    // Try reading .git/HEAD directly (faster than spawning git process)
-    if let Ok(head_content) = std::fs::read_to_string(git_dir.join("HEAD")) {
-        let head = head_content.trim();
-        if let Some(branch_ref) = head.strip_prefix("ref: refs/heads/") {
-            return Some(branch_ref.to_string());
-        }
-        // Detached HEAD - use short SHA
-        if head.len() >= 7 {
-            return Some(format!("detached-{}", &head[..7]));
-        }
-    }
-
-    // Fallback: try git command
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&git_root)
-        .output()
-        && output.status.success()
-    {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if branch == "HEAD" {
-            // Detached HEAD - get short SHA
-            if let Ok(sha_output) = std::process::Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .current_dir(&git_root)
-                .output()
-                && sha_output.status.success()
-            {
-                let sha = String::from_utf8_lossy(&sha_output.stdout)
-                    .trim()
-                    .to_string();
-                return Some(format!("detached-{}", sha));
-            }
-        } else {
-            return Some(branch);
-        }
-    }
-
-    None
 }
 
 /// Default decay interval: 1 hour
@@ -941,19 +872,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Determine project ID (from env, git root, or current directory)
-    let project_id = std::env::var("ENGRAM_PROJECT").unwrap_or_else(|_| {
-        if let Some(git_root) = find_git_root() {
-            git_root.to_string_lossy().to_string()
-        } else {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "default".to_string())
-        }
-    });
+    // Determine project ID (from env, git remote, or current directory)
+    let project_id = project::resolve_project_id(None);
 
     // Detect current git branch
-    let current_branch = get_current_branch();
+    let current_branch = project::current_branch();
 
     tracing::info!("Starting Engram MCP server");
     tracing::info!("Database: {}", db_path.display());
