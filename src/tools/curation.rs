@@ -107,12 +107,18 @@ fn first_line(content: &str) -> String {
 /// Lowest similarity at which an existing memory is worth reporting as something a new
 /// memory might supersede.
 ///
-/// Set where same-subject memories stop being distinguishable from merely same-topic
-/// ones. There is no upper bound: a pair can sit above the dedup threshold and still not
-/// have merged, because dedup refuses composites and caller-exempted memories. Those are
-/// the *most* likely supersessions, not the least, so capping the band at the dedup
-/// threshold would hide exactly the pairs worth asking about.
-pub const SUPERSESSION_CANDIDATE_MIN: f32 = 0.75;
+/// Measured on a live store rather than picked by feel. Memories within one project sit in
+/// a narrow, high band: a new memory's nearest earlier same-type memory scores a median
+/// 0.86 (p90 0.90) whether or not it replaces it, while pairs a caller actually linked with
+/// `supersedes` score 0.82-0.98, median 0.90. At 0.75 the field fired on 98% of stores and
+/// callers stopped reading it; 0.88 fires on about a third and still catches 13 of 17 real
+/// supersessions. 0.90 would halve recall for little further quiet.
+///
+/// There is no upper bound: a pair can sit above the dedup threshold and still not have
+/// merged, because dedup refuses composites and caller-exempted memories. Those are the
+/// *most* likely supersessions, not the least, so capping the band at the dedup threshold
+/// would hide exactly the pairs worth asking about.
+pub const SUPERSESSION_CANDIDATE_MIN: f32 = 0.88;
 
 /// Most supersession candidates reported per store, highest similarity first.
 pub const SUPERSESSION_CANDIDATE_LIMIT: usize = 5;
