@@ -15,6 +15,7 @@ pub mod schemas;
 pub mod scoring;
 pub mod store;
 pub mod todo;
+pub mod update;
 
 #[cfg(test)]
 mod test_utils;
@@ -34,3 +35,4 @@ pub use todo::{
     OpenTodoItem, STALE_TODO_STORE_DAYS, TODO_TEXT_MAX, TodoListResult, TodoOp, TodoWriteResult,
     list_todos, open_todo_titles, stale_todos, todo_title, write_todos,
 };
+pub use update::{MemoryUpdateOutcome, MemoryUpdateRequest, update_memory};

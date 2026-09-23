@@ -13,8 +13,8 @@ use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::export::{self, ExportData, ExportedMemory, HandoffSidecar, ImportMode, ImportStats};
 use crate::memory::{
-    AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, MemoryWithScore, ProjectStats,
-    RelationType, Relationship,
+    AdrSections, AdrStatus, Memory, MemoryType, MemoryWithScore, ProjectStats, RelationType,
+    Relationship,
 };
 use crate::summarize::{generate_summary, should_auto_summarize};
 
@@ -22,7 +22,7 @@ use super::adr::create_adr;
 use super::curation::{
     CurationView, MatchedVia, Resolution, SupersessionCandidate, supersession_candidates,
 };
-use super::handoff::{create_handoff, handoff_section_key_texts, resume_handoff, search_handoffs};
+use super::handoff::{create_handoff, resume_handoff, search_handoffs};
 use super::links::{Redirect, resolve_link_target};
 use super::schemas::{
     AdrCreateInput, AdrExportInput, AdrListInput, AdrShowInput, AdrUpdateStatusInput,
@@ -37,6 +37,7 @@ use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
     compute_tag_boost, rrf_fuse,
 };
+use super::update::{MemoryUpdateRequest, update_memory};
 use crate::adr_export::{adr_export_target_dir, export_adr_to_disk};
 
 /// Decay rate used when a project row carries none.
@@ -1001,160 +1002,19 @@ impl ToolHandler {
         let input: MemoryUpdateInput = parse_args("memory_update", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
 
-        // Both end up rebuilding `content` and the section embeddings, so accepting both
-        // would leave it ambiguous which one wins.
-        if input.sections.is_some() && input.content.is_some() {
-            return Err(MemoryError::InvalidArguments {
-                tool: "memory_update".to_string(),
-                message: "`sections` and `content` are mutually exclusive; send one or the \
-                          other, not both"
-                    .to_string(),
-                received: "content, sections".to_string(),
-            });
-        }
-
-        let mut memory = self
-            .db
-            .get_memory(&input.id)?
-            .ok_or_else(|| MemoryError::NotFound(input.id.clone()))?;
-
-        if input.sections.is_some() && memory.memory_type != MemoryType::Handoff {
-            return Err(MemoryError::InvalidArguments {
-                tool: "memory_update".to_string(),
-                message: format!(
-                    "`sections` is only valid on handoff memories; {} is a {}",
-                    input.id, memory.memory_type
-                ),
-                received: "sections".to_string(),
-            });
-        }
-
-        // `sections` patches the stored sidecar sections (not the possibly-unparseable
-        // `content` string) and renders the result to markdown, then joins the regular
-        // content-update path below so the sidecar and section embeddings are rebuilt the
-        // same way a direct `content` edit would rebuild them.
-        let sections_markdown = match input.sections {
-            Some(patch) => {
-                let (existing, _) = self.db.get_handoff_sections(&input.id)?.ok_or_else(|| {
-                    MemoryError::NotFound(format!("handoff sections for {}", input.id))
-                })?;
-                Some(existing.merge_patch(patch).render_markdown())
-            }
-            None => None,
+        let request = MemoryUpdateRequest {
+            id: input.id,
+            content: input.content,
+            sections: input.sections,
+            importance: input.importance,
+            tags: input.tags,
+            summary: input.summary,
+            pinned: input.pinned,
+            dead: input.dead,
+            dead_reason: input.dead_reason,
+            external_artifacts: input.external_artifacts,
         };
-        let new_content = input.content.or(sections_markdown);
-
-        // Content is replaced wholesale, not patched, so the previous version is gone the
-        // moment the row is written. Snapshot it and hand it back to the caller.
-        let previous = memory.clone();
-        let content_replaced = new_content
-            .as_ref()
-            .is_some_and(|new| *new != memory.content);
-        if content_replaced {
-            self.db.trash_memory(&input.id, crate::db::OP_UPDATE)?;
-        }
-
-        let now = chrono::Utc::now().timestamp();
-        memory.updated_at = now;
-
-        // Handoff update invalidates and rebuilds section embeddings; sidecar must stay in sync
-        // with content. Validate and rebuild BEFORE any DB write so a parse failure is a clean
-        // abort — the memory row and sidecar are left untouched on error.
-        //
-        // The tuple carries: (new_sections, full_content_embedding, section_vecs).
-        // All three are needed for the atomic update so they are computed together here.
-        let handoff_sidecar_update: Option<(HandoffSections, Vec<f32>, Vec<Vec<f32>>)> =
-            if memory.memory_type == MemoryType::Handoff {
-                if let Some(ref content) = new_content {
-                    // (a) Re-parse to validate; reject malformed content before touching the DB.
-                    let new_sections = HandoffSections::parse_markdown(content)?;
-
-                    // (b) Regenerate full-content embedding.
-                    let full_embedding =
-                        self.embedding.embed_memory(MemoryType::Handoff, content)?;
-
-                    // (c) Regenerate per-section embeddings via prefix-free embed.
-                    let section_texts = handoff_section_key_texts(&new_sections);
-                    let mut section_vecs: Vec<Vec<f32>> = Vec::new();
-                    for (_, text) in &section_texts {
-                        section_vecs.push(self.embedding.embed(text)?);
-                    }
-
-                    Some((new_sections, full_embedding, section_vecs))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        if let Some(ref content) = new_content {
-            memory.content = content.clone();
-            // For non-Handoff types, store the embedding now (Handoff uses the atomic path below).
-            if memory.memory_type != MemoryType::Handoff {
-                let embedding = self.embedding.embed_memory(memory.memory_type, content)?;
-                self.db
-                    .store_embedding(&memory.id, &embedding, self.embedding.model_version())?;
-            }
-            // Regenerate summary if content changed and no explicit summary provided
-            if input.summary.is_none() && should_auto_summarize(content, memory.summary.as_deref())
-            {
-                memory.summary = Some(generate_summary(content));
-            }
-        }
-
-        if let Some(importance) = input.importance {
-            memory.importance = importance.clamp(0.0, 1.0);
-        }
-
-        if let Some(tags) = input.tags {
-            memory.tags = tags;
-        }
-
-        if let Some(summary) = input.summary {
-            memory.summary = Some(summary);
-        }
-
-        if let Some(pinned) = input.pinned {
-            memory.pinned = pinned;
-        }
-
-        if let Some(dead) = input.dead {
-            self.db
-                .set_dead(&input.id, dead, input.dead_reason.as_deref())?;
-        }
-
-        // external_artifacts update semantics:
-        //   - input.external_artifacts is None  -> preserve existing (omit = keep)
-        //   - input.external_artifacts is Some([]) -> clear (empty array = delete)
-        //   - input.external_artifacts is Some([a, b, ...]) -> replace with new list
-        if let Some(artifacts) = input.external_artifacts {
-            if artifacts.is_empty() {
-                memory.external_artifacts = None;
-            } else {
-                memory.external_artifacts = Some(artifacts);
-            }
-        }
-        // If None: leave memory.external_artifacts unchanged (preserves whatever was loaded from DB).
-
-        // (d) For Handoff memories with new content: write memory row + full-content embedding +
-        // sidecar in one transaction so a partial failure cannot leave them out of sync.
-        // For all other cases fall back to the regular single-table update.
-        if let Some((new_sections, full_embedding, section_vecs)) = handoff_sidecar_update {
-            let section_texts = handoff_section_key_texts(&new_sections);
-            let keys: Vec<&str> = section_texts.iter().map(|(k, _)| *k).collect();
-            let (section_keys_str, section_bytes) = encode_section_embeddings(&keys, &section_vecs);
-            self.db.update_memory_and_handoff_sidecar(
-                &memory,
-                &full_embedding,
-                self.embedding.model_version(),
-                &new_sections,
-                &section_keys_str,
-                &section_bytes,
-            )?;
-        } else {
-            self.db.update_memory(&memory)?;
-        }
+        let outcome = update_memory(&self.db, &self.embedding, request)?;
 
         // Invalidate search cache since we updated data
         self.invalidate_search_cache(&project);
@@ -1162,10 +1022,10 @@ impl ToolHandler {
         Ok(json!({
             "success": true,
             "message": "Memory updated successfully",
-            "content_replaced": content_replaced,
-            "recoverable": content_replaced,
-            "dead": self.db.is_dead(&input.id)?,
-            "previous": previous,
+            "content_replaced": outcome.content_replaced,
+            "recoverable": outcome.content_replaced,
+            "dead": outcome.dead,
+            "previous": outcome.previous,
         }))
     }
 

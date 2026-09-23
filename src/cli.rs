@@ -21,7 +21,8 @@ use error::MemoryError;
 use format::{format_todo, format_todo_compact};
 use hooks::HookEvent;
 use memory::{
-    AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, RelationType, Relationship,
+    AdrSections, AdrStatus, HandoffSections, HandoffSectionsPatch, Memory, MemoryType,
+    RelationType, Relationship,
 };
 use summarize::{generate_summary, should_auto_summarize};
 use tools::TodoOp;
@@ -159,6 +160,16 @@ enum Commands {
         /// New summary
         #[arg(short, long)]
         summary: Option<String>,
+        /// Partial patch to a handoff's structured sections, as a JSON object (fields:
+        /// summary, decisions, blockers, tried, mental_model, next_steps, notes; an
+        /// omitted field keeps its stored value). Handoffs only; mutually exclusive
+        /// with --content.
+        #[arg(
+            long = "sections-json",
+            value_name = "JSON",
+            conflicts_with = "content"
+        )]
+        sections_json: Option<String>,
         /// Replace external artifact list. Repeatable. Pass once with empty string to clear.
         #[arg(long = "artifact", value_name = "PATH")]
         artifacts: Vec<String>,
@@ -844,6 +855,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             importance,
             tags,
             summary,
+            sections_json,
             artifacts,
             clear_artifacts,
             dead,
@@ -868,11 +880,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            let sections = sections_json
+                .map(|json| serde_json::from_str::<HandoffSectionsPatch>(&json))
+                .transpose()?;
             cmd_update(
                 &db,
                 embedding_service.as_ref().unwrap(),
                 &id,
                 content,
+                sections,
                 importance,
                 tags,
                 summary,
@@ -1718,6 +1734,7 @@ fn cmd_update(
     embedding_service: &EmbeddingService,
     id: &str,
     content: Option<String>,
+    sections: Option<HandoffSectionsPatch>,
     importance: Option<f64>,
     tags: Option<String>,
     summary: Option<String>,
@@ -1725,61 +1742,26 @@ fn cmd_update(
     dead: Option<bool>,
     dead_reason: Option<&str>,
 ) -> Result<(), MemoryError> {
-    let mut memory = db
-        .get_memory(id)?
-        .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
-
-    // Content is replaced, not patched, so print what is about to be overwritten.
-    let previous_content = memory.content.clone();
-    let content_replaced = content.as_ref().is_some_and(|new| *new != memory.content);
-    if content_replaced {
-        db.trash_memory(id, db::OP_UPDATE)?;
-    }
-
-    memory.updated_at = chrono::Utc::now().timestamp();
-
-    if let Some(new_content) = content {
-        memory.content = new_content.clone();
-        // Re-embed
-        let embedding = embedding_service.embed_memory(memory.memory_type, &new_content)?;
-        db.store_embedding(id, &embedding, embedding_service.model_version())?;
-
-        // Auto-generate summary if needed
-        if summary.is_none() && should_auto_summarize(&new_content, memory.summary.as_deref()) {
-            memory.summary = Some(generate_summary(&new_content));
-        }
-    }
-
-    if let Some(imp) = importance {
-        memory.importance = imp.clamp(0.0, 1.0);
-    }
-
-    if let Some(tags_str) = tags {
-        memory.tags = tags_str.split(',').map(|s| s.trim().to_string()).collect();
-    }
-
-    if let Some(sum) = summary {
-        memory.summary = Some(sum);
-    }
-
-    // external_artifacts: None = preserve, Some([]) = clear, Some([...]) = replace
-    if let Some(artifacts) = external_artifacts {
-        if artifacts.is_empty() {
-            memory.external_artifacts = None;
-        } else {
-            memory.external_artifacts = Some(artifacts);
-        }
-    }
-
-    db.update_memory(&memory)?;
-
-    if let Some(dead) = dead {
-        db.set_dead(id, dead, dead_reason)?;
-    }
+    let request = tools::MemoryUpdateRequest {
+        id: id.to_string(),
+        content,
+        sections,
+        importance,
+        tags: tags.map(|tags_str| tags_str.split(',').map(|s| s.trim().to_string()).collect()),
+        summary,
+        pinned: None,
+        dead,
+        dead_reason: dead_reason.map(str::to_string),
+        external_artifacts,
+    };
+    let outcome = tools::update_memory(db, embedding_service, request)?;
 
     println!("Updated memory: {}", id);
-    if content_replaced {
-        println!("\n--- replaced content ---\n{previous_content}\n--- end ---");
+    if outcome.content_replaced {
+        println!(
+            "\n--- replaced content ---\n{}\n--- end ---",
+            outcome.previous.content
+        );
         println!("Recoverable with `engram-cli restore {id}` until the trash is swept.");
     }
     match dead {
