@@ -45,12 +45,14 @@ const TODO_DETAIL_IMPORTANCE: f64 = 0.5;
 pub enum TodoOp {
     /// Open a new todo.
     Add {
+        /// `content` is accepted as an alias: callers reach for it as often as `text`.
+        #[serde(alias = "content")]
         text: String,
         /// Branch this todo belongs to. Omit for a project-wide todo; `"auto"` resolves to
         /// the caller's current branch.
         #[serde(default)]
         branch: Option<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "super::args::deserialize_tags")]
         tags: Vec<String>,
         #[serde(default)]
         importance: Option<f64>,
@@ -59,15 +61,19 @@ pub enum TodoOp {
         #[serde(default)]
         detail: Option<String>,
     },
-    /// Mark a todo finished.
+    /// Mark a todo finished. `complete` is accepted as an alias.
+    #[serde(alias = "complete")]
     Done { id: String },
     /// Close a todo without doing it. The reason is mandatory.
     Drop { id: String, reason: String },
     /// Return a closed todo to the open state.
     Reopen { id: String },
-    /// Rewrite a todo's text.
+    /// Rewrite a todo's text. `update` is accepted as an alias for the op.
+    #[serde(alias = "update")]
     Edit {
         id: String,
+        /// `content` is accepted as an alias: callers reach for it as often as `text`.
+        #[serde(alias = "content")]
         text: String,
         /// A new finding to link, on top of any recorded by earlier edits. Details
         /// accumulate; the todo itself stays a title.
@@ -637,6 +643,30 @@ pub fn list_todos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn todo_op_accepts_complete_as_alias_for_done() {
+        let op: TodoOp =
+            serde_json::from_value(serde_json::json!({"op": "complete", "id": "mem_x"})).unwrap();
+        assert!(matches!(op, TodoOp::Done { id } if id == "mem_x"));
+    }
+
+    #[test]
+    fn todo_op_accepts_update_as_alias_for_edit() {
+        let op: TodoOp = serde_json::from_value(
+            serde_json::json!({"op": "update", "id": "mem_x", "text": "new text"}),
+        )
+        .unwrap();
+        assert!(matches!(op, TodoOp::Edit { id, text, .. } if id == "mem_x" && text == "new text"));
+    }
+
+    #[test]
+    fn todo_op_add_accepts_content_as_alias_for_text() {
+        let op: TodoOp =
+            serde_json::from_value(serde_json::json!({"op": "add", "content": "do the thing"}))
+                .unwrap();
+        assert!(matches!(op, TodoOp::Add { text, .. } if text == "do the thing"));
+    }
 
     #[test]
     fn title_is_the_first_line() {

@@ -6,6 +6,7 @@
 #![allow(unused_imports)]
 
 mod adr;
+pub mod args;
 pub mod cluster;
 pub mod curation;
 mod handler;

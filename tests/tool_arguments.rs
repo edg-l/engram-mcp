@@ -87,15 +87,31 @@ fn batch_items_accept_the_type_alias() {
 }
 
 #[test]
-fn missing_field_error_lists_received_fields() {
+fn missing_type_defaults_to_fact_and_is_reported() {
     let (h, _dir) = setup();
 
-    let err = h
+    let result = h
         .handle_tool(
             "memory_store",
             json!({"content": "No type anywhere", "kind": "fact", "tags": []}),
         )
-        .expect_err("a genuinely absent type must be rejected");
+        .expect("a genuinely absent type must default to fact rather than error");
+
+    assert_eq!(result["type_defaulted"], json!(true));
+    let id = result["id"].as_str().unwrap();
+    let stored = h.database().get_memory(id).unwrap().unwrap();
+    assert_eq!(stored.memory_type.as_str(), "fact");
+}
+
+#[test]
+fn missing_field_error_lists_received_fields() {
+    let (h, _dir) = setup();
+
+    // `content` has no default, unlike `type`, so it is still a genuine "missing
+    // field" case.
+    let err = h
+        .handle_tool("memory_store", json!({"kind": "fact", "tags": []}))
+        .expect_err("a genuinely absent content must be rejected");
 
     match err {
         MemoryError::InvalidArguments {
@@ -105,11 +121,11 @@ fn missing_field_error_lists_received_fields() {
         } => {
             assert_eq!(tool, "memory_store");
             assert!(message.contains("missing field"), "message: {message}");
+            assert!(message.contains("content"), "message: {message}");
             // The received list is what makes the error diagnosable: the caller
-            // can see `type` really was not among the fields sent.
-            assert!(received.contains("content"), "received: {received}");
+            // can see `content` really was not among the fields sent.
             assert!(received.contains("kind"), "received: {received}");
-            assert!(!received.contains("type"), "received: {received}");
+            assert!(!received.contains("content"), "received: {received}");
         }
         other => panic!("expected InvalidArguments, got {other:?}"),
     }

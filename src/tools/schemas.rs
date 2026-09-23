@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
-use crate::memory::{HandoffSections, HandoffSectionsPatch};
+use crate::memory::{
+    HandoffSections, HandoffSectionsPatch, deserialize_opt_joined_string,
+    deserialize_opt_string_list,
+};
+use crate::tools::args::{deserialize_opt_tags, deserialize_tags};
 
 // ============================================
 // ToolProfile
@@ -175,11 +179,12 @@ fn default_proposed_status() -> String {
 #[derive(Debug, Deserialize)]
 pub struct MemoryStoreInput {
     pub content: String,
-    /// Memory type. `memory_type` is accepted as an alias: callers reach for it
-    /// often enough that rejecting it reads as the server losing the field.
-    #[serde(rename = "type", alias = "memory_type")]
-    pub memory_type: String,
-    #[serde(default)]
+    /// Memory type, defaulting to `fact` when omitted (the result reports the default so
+    /// the caller can see it happened). `memory_type` is accepted as an alias: callers
+    /// reach for it often enough that rejecting it reads as the server losing the field.
+    #[serde(rename = "type", alias = "memory_type", default)]
+    pub memory_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Vec<String>,
     #[serde(default = "default_importance")]
     pub importance: f64,
@@ -247,6 +252,7 @@ pub struct MemoryUpdateInput {
     /// leave it ambiguous which one wins.
     pub sections: Option<HandoffSectionsPatch>,
     pub importance: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_opt_tags")]
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
     pub pinned: Option<bool>,
@@ -444,7 +450,9 @@ pub struct MemoryStatsInput {
 
 #[derive(Debug, Deserialize)]
 pub struct MemoryContextInput {
-    /// The context or conversation to find relevant memories for
+    /// The context or conversation to find relevant memories for. `task`,
+    /// `task_description`, and `query` are accepted as aliases.
+    #[serde(alias = "task", alias = "task_description", alias = "query")]
     pub context: String,
     /// Maximum number of memories to return (default: 5)
     #[serde(default = "default_context_limit")]
@@ -503,8 +511,10 @@ pub struct MemoryDedupInput {
 pub struct HandoffCreateInput {
     /// Git branch to scope this handoff to. Defaults to the current branch.
     pub branch: Option<String>,
-    /// Structured session sections.
-    pub sections: HandoffSections,
+    /// Structured session sections. When omitted, the section fields below (given at
+    /// the top level of the arguments instead of nested under `sections`) are used.
+    #[serde(default)]
+    pub sections: Option<HandoffSections>,
     /// Importance score in [0, 1]. Default 0.85.
     #[serde(default = "default_handoff_importance")]
     pub importance: f64,
@@ -517,6 +527,26 @@ pub struct HandoffCreateInput {
     /// Project to operate on. `None` = the server's own project.
     #[serde(default)]
     pub project: Option<String>,
+    // --- Flat fallback fields, used only when `sections` is omitted. Same names and
+    // tolerance as the corresponding `HandoffSections` fields. ---
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
+    pub summary: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
+    pub decisions: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
+    pub todos: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
+    pub blockers: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
+    pub tried: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
+    pub mental_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
+    pub next_steps: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub continues_from: Option<String>,
 }
 
 /// Input for the `handoff_resume` MCP tool.
@@ -1208,4 +1238,75 @@ pub fn get_tool_definitions() -> Vec<Tool> {
             })),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_store_input_defaults_type_when_omitted() {
+        let input: MemoryStoreInput =
+            serde_json::from_value(json!({"content": "x", "importance": 0.7, "tags": ["a"]}))
+                .unwrap();
+        assert_eq!(input.memory_type, None);
+        assert_eq!(input.tags, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn memory_store_input_accepts_explicit_type_and_memory_type_alias() {
+        let a: MemoryStoreInput =
+            serde_json::from_value(json!({"content": "x", "type": "decision"})).unwrap();
+        assert_eq!(a.memory_type.as_deref(), Some("decision"));
+
+        let b: MemoryStoreInput =
+            serde_json::from_value(json!({"content": "x", "memory_type": "pattern"})).unwrap();
+        assert_eq!(b.memory_type.as_deref(), Some("pattern"));
+    }
+
+    #[test]
+    fn memory_store_input_tags_accepts_comma_separated_string() {
+        let input: MemoryStoreInput = serde_json::from_value(json!({
+            "content": "x",
+            "tags": "ffmarket, censored-demand, newsvendor"
+        }))
+        .unwrap();
+        assert_eq!(
+            input.tags,
+            vec!["ffmarket", "censored-demand", "newsvendor"]
+        );
+    }
+
+    #[test]
+    fn memory_context_input_accepts_task_alias() {
+        let input: MemoryContextInput = serde_json::from_value(json!({"task": "x"})).unwrap();
+        assert_eq!(input.context, "x");
+    }
+
+    #[test]
+    fn memory_context_input_accepts_task_description_and_query_aliases() {
+        let a: MemoryContextInput =
+            serde_json::from_value(json!({"task_description": "x"})).unwrap();
+        assert_eq!(a.context, "x");
+
+        let b: MemoryContextInput = serde_json::from_value(json!({"query": "x"})).unwrap();
+        assert_eq!(b.context, "x");
+    }
+
+    #[test]
+    fn handoff_create_input_sections_optional_with_flat_fallback() {
+        let input: HandoffCreateInput = serde_json::from_value(json!({
+            "branch": "main",
+            "summary": "did stuff",
+            "decisions": ["a"],
+            "blockers": [],
+            "tried": [],
+            "mental_model": "m",
+            "next_steps": ["n"]
+        }))
+        .unwrap();
+        assert!(input.sections.is_none());
+        assert_eq!(input.summary.as_deref(), Some("did stuff"));
+        assert_eq!(input.decisions, Some(vec!["a".to_string()]));
+    }
 }

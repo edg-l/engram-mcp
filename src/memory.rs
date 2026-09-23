@@ -1,8 +1,122 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::fmt;
 use std::str::FromStr;
 
 use crate::error::MemoryError;
+
+// ============================================
+// Tolerant deserialization for handoff sections
+// ============================================
+//
+// Agents send a plain string where a section is declared as a list (or an array where
+// it is declared as a string) often enough that rejecting it costs a retry for something
+// the caller clearly meant unambiguously. One helper per direction covers every
+// list-shaped and string-shaped field on both `HandoffSections` and
+// `HandoffSectionsPatch`, plus the flattened top-level fields `HandoffCreateInput` falls
+// back to when `sections` is omitted.
+
+/// A string becomes list items by taking the lines that start with `- ` or `* ` (prefix
+/// stripped); a string with no such line becomes a single item.
+fn split_list_string(s: &str) -> Vec<String> {
+    let bulleted: Vec<String> = s
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    if !bulleted.is_empty() {
+        return bulleted;
+    }
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        vec![trimmed.to_string()]
+    }
+}
+
+fn list_from_value(value: Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::Array(_) => serde_json::from_value(value).map_err(|e| e.to_string()),
+        Value::String(s) => Ok(split_list_string(&s)),
+        other => Err(format!(
+            "expected an array of strings or a string, got {other}"
+        )),
+    }
+}
+
+/// A string is used as-is; an array of strings is joined with newlines.
+fn string_from_value(value: Value) -> Result<String, String> {
+    match value {
+        Value::String(s) => Ok(s),
+        Value::Array(_) => {
+            let items: Vec<String> = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            Ok(items.join("\n"))
+        }
+        other => Err(format!(
+            "expected a string or an array of strings, got {other}"
+        )),
+    }
+}
+
+/// Deserializes a list-shaped section (`decisions`, `blockers`, `tried`, `next_steps`,
+/// `todos`), tolerating a plain string in place of the declared array.
+pub(crate) fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    list_from_value(value).map_err(serde::de::Error::custom)
+}
+
+/// `Option<Vec<String>>` counterpart of [`deserialize_string_list`], for
+/// `HandoffSectionsPatch` and the flattened fallback fields on `HandoffCreateInput`.
+pub(crate) fn deserialize_opt_string_list<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    list_from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+/// Deserializes a string-shaped section (`summary`, `mental_model`, `notes`), tolerating
+/// an array of strings in place of the declared string, joined with newlines.
+pub(crate) fn deserialize_joined_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    string_from_value(value).map_err(serde::de::Error::custom)
+}
+
+/// `Option<String>` counterpart of [`deserialize_joined_string`].
+pub(crate) fn deserialize_opt_joined_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    string_from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -229,27 +343,29 @@ pub struct TodoItem {
 #[allow(dead_code)] // Used by handoff create/resume/search tools (Phase 3)
 pub struct HandoffSections {
     /// High-level summary of the session's work. The only required section.
+    #[serde(deserialize_with = "deserialize_joined_string")]
     pub summary: String,
     /// Key decisions made during the session (each item is one decision).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub decisions: Vec<String>,
     /// Within-session work the next agent should pick up immediately. Concrete, ready-to-execute items.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub todos: Vec<String>,
     /// Things preventing forward motion right now (missing access, failing dependency, unanswered question).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub blockers: Vec<String>,
     /// Approaches attempted and abandoned, each with the reason it failed, so the next
     /// session does not pay to rediscover the same dead end.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub tried: Vec<String>,
     /// Mental model: architecture, invariants, or context the next session needs.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_joined_string")]
     pub mental_model: String,
     /// Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub next_steps: Vec<String>,
     /// Freeform notes that don't fit the other sections (optional).
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
     pub notes: Option<String>,
     /// ID of the handoff this one continues from (optional, sidecar-only chain link).
     pub continues_from: Option<String>,
@@ -480,12 +596,19 @@ impl HandoffSections {
 /// not a handoff section, matching `handoff_create`'s rejection of the same field.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HandoffSectionsPatch {
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
     pub summary: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
     pub decisions: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
     pub blockers: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
     pub tried: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
     pub mental_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_list")]
     pub next_steps: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
     pub notes: Option<String>,
 }
 
@@ -977,6 +1100,63 @@ mod tests {
             }
             other => panic!("expected InvalidArguments for missing summary, got {other:?}"),
         }
+    }
+
+    /// Every list field accepts a plain string, split on `- `/`* ` prefixed lines when
+    /// any exist, else treated as one item.
+    #[test]
+    fn handoff_sections_deserializes_string_sections_as_lists() {
+        let v = serde_json::json!({
+            "summary": "Fixed the flaky test",
+            "decisions": "one string",
+            "mental_model": "Single string mental model",
+            "tried": "- attempt one\n- attempt two",
+            "next_steps": "just one next step",
+            "blockers": "the blocker",
+        });
+        let s: HandoffSections = serde_json::from_value(v).unwrap();
+        assert_eq!(s.decisions, vec!["one string".to_string()]);
+        assert_eq!(s.mental_model, "Single string mental model");
+        assert_eq!(
+            s.tried,
+            vec!["attempt one".to_string(), "attempt two".to_string()]
+        );
+        assert_eq!(s.next_steps, vec!["just one next step".to_string()]);
+        assert_eq!(s.blockers, vec!["the blocker".to_string()]);
+    }
+
+    /// Every string field accepts an array of strings, joined with newlines; an array in
+    /// a list field is used as-is.
+    #[test]
+    fn handoff_sections_deserializes_array_sections_as_strings() {
+        let v = serde_json::json!({
+            "summary": "Fixed the flaky test",
+            "decisions": ["a"],
+            "mental_model": ["x", "y"],
+            "tried": ["t"],
+            "next_steps": ["n"],
+            "blockers": ["b"],
+        });
+        let s: HandoffSections = serde_json::from_value(v).unwrap();
+        assert_eq!(s.decisions, vec!["a".to_string()]);
+        assert_eq!(s.mental_model, "x\ny");
+        assert_eq!(s.tried, vec!["t".to_string()]);
+        assert_eq!(s.next_steps, vec!["n".to_string()]);
+        assert_eq!(s.blockers, vec!["b".to_string()]);
+    }
+
+    /// `HandoffSectionsPatch` gets the same tolerance, through the same helpers, for
+    /// `memory_update`'s `sections` patch.
+    #[test]
+    fn handoff_sections_patch_deserializes_mixed_string_and_array_fields() {
+        let v = serde_json::json!({
+            "decisions": "one string",
+            "mental_model": ["x", "y"],
+        });
+        let p: HandoffSectionsPatch = serde_json::from_value(v).unwrap();
+        assert_eq!(p.decisions, Some(vec!["one string".to_string()]));
+        assert_eq!(p.mental_model, Some("x\ny".to_string()));
+        assert_eq!(p.summary, None);
     }
 
     #[test]

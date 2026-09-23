@@ -13,8 +13,8 @@ use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::export::{self, ExportData, ExportedMemory, HandoffSidecar, ImportMode, ImportStats};
 use crate::memory::{
-    AdrSections, AdrStatus, Memory, MemoryType, MemoryWithScore, ProjectStats, RelationType,
-    Relationship,
+    AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, MemoryWithScore, ProjectStats,
+    RelationType, Relationship,
 };
 use crate::summarize::{generate_summary, should_auto_summarize};
 
@@ -119,6 +119,24 @@ pub struct MemoryStoreResult {
     /// consumed, redirected to its survivor.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub redirected_links: Vec<Redirect>,
+    /// True when `type` was omitted and defaulted to `fact`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub type_defaulted: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Resolves an optional `type`/`memory_type` argument, defaulting to `fact` when absent.
+/// Shared by `memory_store` and every `memory_store_batch` item so the two cannot drift.
+fn resolve_memory_type(raw: &Option<String>) -> Result<(MemoryType, bool), MemoryError> {
+    let defaulted = raw.is_none();
+    let type_str = raw.clone().unwrap_or_else(|| "fact".to_string());
+    let memory_type = type_str
+        .parse()
+        .map_err(|_| MemoryError::InvalidType(type_str.clone()))?;
+    Ok((memory_type, defaulted))
 }
 
 #[derive(Debug, Serialize)]
@@ -361,10 +379,7 @@ impl ToolHandler {
         let input: MemoryStoreInput = parse_args("memory_store", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
 
-        let memory_type: MemoryType = input
-            .memory_type
-            .parse()
-            .map_err(|_| MemoryError::InvalidType(input.memory_type.clone()))?;
+        let (memory_type, type_defaulted) = resolve_memory_type(&input.memory_type)?;
 
         // Resolve every related_to/supersedes id before anything is written. A dedup
         // merge between when the caller last saw an id and this call does not make the
@@ -585,6 +600,7 @@ impl ToolHandler {
             superseded,
             possible_supersedes,
             redirected_links,
+            type_defaulted,
         }))
     }
 
@@ -1247,14 +1263,13 @@ impl ToolHandler {
         // memory in the batch has stored successfully.
         let mut link_specs: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
         let mut redirected_links: Vec<Redirect> = Vec::new();
+        // Ids of memories whose `type` was omitted and defaulted to `fact`.
+        let mut defaulted_type_ids: Vec<String> = Vec::new();
 
         // Prepare all memories and embeddings
         let mut contents: Vec<String> = Vec::new();
         for mem_input in &input.memories {
-            let memory_type: MemoryType = mem_input
-                .memory_type
-                .parse()
-                .map_err(|_| MemoryError::InvalidType(mem_input.memory_type.clone()))?;
+            let (memory_type, _) = resolve_memory_type(&mem_input.memory_type)?;
             contents.push(format!("{}: {}", memory_type.as_str(), mem_input.content));
         }
 
@@ -1262,12 +1277,12 @@ impl ToolHandler {
         let all_embeddings = self.embedding.embed_batch(contents)?;
 
         for (i, mem_input) in input.memories.into_iter().enumerate() {
-            let memory_type: MemoryType = mem_input
-                .memory_type
-                .parse()
-                .map_err(|_| MemoryError::InvalidType(mem_input.memory_type.clone()))?;
+            let (memory_type, type_defaulted) = resolve_memory_type(&mem_input.memory_type)?;
 
             let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+            if type_defaulted {
+                defaulted_type_ids.push(id.clone());
+            }
 
             // Resolve related_to/supersedes ids before anything is written, same as
             // memory_store: a dedup merge can consume an id between when the caller last
@@ -1398,6 +1413,9 @@ impl ToolHandler {
         });
         if !redirected_links.is_empty() {
             result["redirected_links"] = json!(redirected_links);
+        }
+        if !defaulted_type_ids.is_empty() {
+            result["defaulted_type_ids"] = json!(defaulted_type_ids);
         }
         Ok(result)
     }
@@ -2763,6 +2781,21 @@ impl ToolHandler {
     }
 
     fn todo_write(&self, arguments: Value) -> Result<Value, MemoryError> {
+        // A caller sending `todos` instead of `ops` gets a generic "missing field `ops`"
+        // from serde otherwise, which does not say what shape is expected.
+        if let Some(obj) = arguments.as_object()
+            && obj.contains_key("todos")
+            && !obj.contains_key("ops")
+        {
+            return Err(MemoryError::InvalidArguments {
+                tool: "todo_write".to_string(),
+                message: "todo_write takes `ops`, a list of operations, not `todos`. \
+                          e.g. [{\"op\":\"add\",\"text\":…},{\"op\":\"done\",\"id\":…}]"
+                    .to_string(),
+                received: obj.keys().cloned().collect::<Vec<_>>().join(", "),
+            });
+        }
+
         let input: TodoWriteInput = parse_args("todo_write", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
         let result = crate::tools::todo::write_todos(
@@ -2813,11 +2846,37 @@ impl ToolHandler {
         let input: HandoffCreateInput = parse_args("handoff_create", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
 
+        // Some callers flatten the payload rather than nesting it under `sections`;
+        // build the sections from the top-level fields when `sections` itself is absent.
+        let sections = match input.sections {
+            Some(sections) => sections,
+            None => {
+                let summary = input.summary.ok_or_else(|| MemoryError::InvalidArguments {
+                    tool: "handoff_create".to_string(),
+                    message: "`summary` is required, either inside `sections` or at the \
+                              top level of the arguments when `sections` is omitted"
+                        .to_string(),
+                    received: "sections".to_string(),
+                })?;
+                HandoffSections {
+                    summary,
+                    decisions: input.decisions.unwrap_or_default(),
+                    todos: input.todos.unwrap_or_default(),
+                    blockers: input.blockers.unwrap_or_default(),
+                    tried: input.tried.unwrap_or_default(),
+                    mental_model: input.mental_model.unwrap_or_default(),
+                    next_steps: input.next_steps.unwrap_or_default(),
+                    notes: input.notes,
+                    continues_from: input.continues_from,
+                }
+            }
+        };
+
         // Open work lives in the todo list, which is what handoff_resume reads. The field
         // survives on `HandoffSections` so handoffs written before the split still parse,
         // but accepting it here would give the caller two homes for one concept and lose
         // whichever one nobody read. Rejecting beats dropping it silently.
-        if !input.sections.todos.is_empty() {
+        if !sections.todos.is_empty() {
             return Err(MemoryError::InvalidType(
                 "handoff_create no longer accepts a `todos` section; open work belongs in \
                  the todo list. Add the items with todo_write instead — handoff_resume \
@@ -2844,7 +2903,7 @@ impl ToolHandler {
             &self.embedding,
             &project,
             resolved_branch,
-            input.sections,
+            sections,
             input.importance,
             input.pinned,
             input.auto_link,
@@ -3087,7 +3146,7 @@ mod tests {
         create_handoff, resume_handoff_with_vec, search_handoffs_with_vec,
     };
     use super::{Database, EmbeddingService, MemoryError, RelationType, SearchMode, ToolHandler};
-    use crate::memory::{HandoffSections, Memory, MemoryType};
+    use crate::memory::{HandoffSections, Memory, MemoryType, TodoStatus};
     use crate::tools::test_utils::{dummy_vec, insert_test_handoff};
 
     fn test_sections(summary: &str, continues_from: Option<String>) -> HandoffSections {
@@ -4655,5 +4714,229 @@ mod tests {
             count_after_first, count_after_failed,
             "failed supersede must not leave an orphan ADR"
         );
+    }
+
+    /// Covers Phase C1's argument tolerance: `sections` omitted with flat top-level
+    /// fields, and `sections` present with a mix of string-shaped and array-shaped list
+    /// fields, both through the same dispatch path a real MCP call takes.
+    #[test]
+    fn handoff_create_accepts_flat_fields_and_mixed_section_shapes() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "handoff-tolerance-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        // `sections` omitted: the section fields at the top level are used instead.
+        let result = handler
+            .handle_tool(
+                "handoff_create",
+                json!({
+                    "branch": "main",
+                    "summary": "Worked on argument tolerance",
+                    "decisions": ["Use one shared deserializer per direction"],
+                    "blockers": [],
+                    "tried": [],
+                    "mental_model": "Two helpers: list-or-string, string-or-list",
+                    "next_steps": ["Add tests"]
+                }),
+            )
+            .expect("flat fields must be accepted when `sections` is omitted");
+        let id = result["id"].as_str().unwrap();
+        let (sections, _) = db.get_handoff_sections(id).unwrap().unwrap();
+        assert_eq!(sections.summary, "Worked on argument tolerance");
+        assert_eq!(
+            sections.decisions,
+            vec!["Use one shared deserializer per direction".to_string()]
+        );
+        assert_eq!(sections.next_steps, vec!["Add tests".to_string()]);
+
+        // `sections` present, mixing string-shaped and array-shaped list fields.
+        let result2 = handler
+            .handle_tool(
+                "handoff_create",
+                json!({
+                    "branch": "main",
+                    "sections": {
+                        "summary": "Second session",
+                        "decisions": "one string decision",
+                        "mental_model": ["Point one", "Point two"],
+                        "tried": ["already an array"],
+                        "next_steps": "one next step",
+                        "blockers": []
+                    }
+                }),
+            )
+            .expect("mixed string/array section shapes must be accepted");
+        let id2 = result2["id"].as_str().unwrap();
+        let (sections2, _) = db.get_handoff_sections(id2).unwrap().unwrap();
+        assert_eq!(sections2.decisions, vec!["one string decision".to_string()]);
+        assert_eq!(sections2.mental_model, "Point one\nPoint two");
+        assert_eq!(sections2.tried, vec!["already an array".to_string()]);
+        assert_eq!(sections2.next_steps, vec!["one next step".to_string()]);
+    }
+
+    /// `type` omitted defaults to `fact` and the result says so.
+    #[test]
+    fn memory_store_defaults_type_and_reports_it() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "store-type-default-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let result = handler
+            .handle_tool(
+                "memory_store",
+                json!({"content": "some fact", "importance": 0.7, "tags": ["a"]}),
+            )
+            .unwrap();
+        assert_eq!(result["type_defaulted"], json!(true));
+        let id = result["id"].as_str().unwrap();
+        let memory = db.get_memory(id).unwrap().unwrap();
+        assert_eq!(memory.memory_type, MemoryType::Fact);
+
+        let explicit = handler
+            .handle_tool(
+                "memory_store",
+                json!({"content": "some decision", "type": "decision"}),
+            )
+            .unwrap();
+        assert!(explicit.get("type_defaulted").is_none());
+    }
+
+    /// `memory_store`'s `tags` accepts a comma-separated string, matching an observed
+    /// rejected payload.
+    #[test]
+    fn memory_store_tags_accepts_comma_separated_string() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "store-tags-string-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let result = handler
+            .handle_tool(
+                "memory_store",
+                json!({
+                    "content": "market design notes",
+                    "type": "fact",
+                    "tags": "ffmarket, censored-demand, newsvendor"
+                }),
+            )
+            .unwrap();
+        let id = result["id"].as_str().unwrap();
+        let memory = db.get_memory(id).unwrap().unwrap();
+        assert_eq!(
+            memory.tags,
+            vec!["ffmarket", "censored-demand", "newsvendor"]
+        );
+    }
+
+    /// `memory_context` accepts `task` as an alias for `context`.
+    #[test]
+    fn memory_context_accepts_task_alias() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "context-alias-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let result = handler.handle_tool("memory_context", json!({"task": "auth refactor"}));
+        assert!(
+            result.is_ok(),
+            "task alias must be accepted, got {result:?}"
+        );
+    }
+
+    /// `todo_write` accepts the `complete`/`update` op aliases.
+    #[test]
+    fn todo_write_accepts_op_aliases() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "todo-alias-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let added = handler
+            .handle_tool(
+                "todo_write",
+                json!({"ops": [{"op": "add", "text": "do it"}]}),
+            )
+            .unwrap();
+        let id = added["results"][0]["id"].as_str().unwrap().to_string();
+
+        let done = handler
+            .handle_tool("todo_write", json!({"ops": [{"op": "complete", "id": id}]}))
+            .unwrap();
+        assert_eq!(done["results"][0]["error"], json!(null));
+        assert_eq!(db.get_todo(&id).unwrap().unwrap().status, TodoStatus::Done);
+    }
+
+    /// Arguments carrying `todos` instead of `ops` fail with a message naming the `ops`
+    /// shape, rather than a bare "missing field `ops`".
+    #[test]
+    fn todo_write_rejects_todos_without_ops() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "todo-shape-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let err = handler.handle_tool(
+            "todo_write",
+            json!({"todos": [{"content": "x", "status": "pending"}], "merge": true}),
+        );
+        match err {
+            Err(MemoryError::InvalidArguments { message, .. }) => {
+                assert!(
+                    message.contains("\"op\":\"add\""),
+                    "message should show the ops shape: {message}"
+                );
+            }
+            other => panic!("expected InvalidArguments naming the ops shape, got {other:?}"),
+        }
     }
 }
