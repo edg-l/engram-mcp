@@ -74,6 +74,47 @@ pub struct TodoDuplicate {
     pub similarity: f32,
 }
 
+/// A todo reduced to what a compact renderer needs: enough to display and close it without
+/// a second lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenTodoItem {
+    pub id: String,
+    pub title: String,
+}
+
+/// Cap, in characters, on a derived todo title. Long enough to keep the lead sentence of a
+/// typical todo intact, short enough that a hundred of them stay skimmable in one list.
+const TODO_TITLE_MAX_CHARS: usize = 160;
+
+/// Derive a short display title from a todo's full text.
+///
+/// The single title source for every compact todo renderer (`handoff_resume`'s
+/// `open_todos`, `todo_list`'s compact mode, `engram-cli todo list`'s default), so they
+/// cannot disagree about what a todo is called. Takes the first line, cut at the first
+/// sentence end ("`. `") when that falls before the char cap — a natural stopping point
+/// rather than a mid-sentence fragment — otherwise hard-truncated at the cap with a
+/// trailing "…".
+pub fn todo_title(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or("").trim();
+    let chars: Vec<char> = first_line.chars().collect();
+
+    let sentence_end = first_line.find(". ").and_then(|byte_idx| {
+        let char_idx = first_line[..byte_idx].chars().count();
+        (char_idx < TODO_TITLE_MAX_CHARS).then_some(char_idx)
+    });
+
+    if let Some(idx) = sentence_end {
+        return chars[..=idx].iter().collect();
+    }
+
+    if chars.len() > TODO_TITLE_MAX_CHARS {
+        let truncated: String = chars[..TODO_TITLE_MAX_CHARS].iter().collect();
+        format!("{truncated}…")
+    } else {
+        first_line.to_string()
+    }
+}
+
 /// Result returned by `todo_write`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TodoWriteResult {
@@ -94,21 +135,42 @@ pub struct TodoListResult {
     pub open_count: usize,
     pub done_count: usize,
     pub dropped_count: usize,
+    /// Echoes the request's `full_text` so the compact text renderer, which only sees this
+    /// JSON, knows whether to print each todo's full text or its derived title. `todos`
+    /// itself always carries the full `TodoItem`s regardless.
+    pub full_text: bool,
 }
 
-/// Open todos for a branch, as plain text, newest first.
+/// Open todos for a branch, as `{id, title}` items ordered by importance descending, then
+/// by most recently updated — the items most worth a resuming agent's attention first.
 ///
 /// This is the single source of open work for `handoff_resume`. `branch` follows the
 /// "branch plus project-wide" shape: a todo with no branch applies everywhere.
-pub fn open_todo_texts(
+pub fn open_todo_titles(
     db: &Database,
     project_id: &str,
     branch: Option<&str>,
     limit: usize,
-) -> Result<Vec<String>, MemoryError> {
+) -> Result<Vec<OpenTodoItem>, MemoryError> {
     let filter = Some(branch);
-    let todos = db.list_todos(project_id, Some(TodoStatus::Open), filter, limit)?;
-    Ok(todos.into_iter().map(|t| t.text).collect())
+    // The DB orders by creation time, so the importance ordering needs every open todo
+    // before `limit` applies; capping first would drop an old, important todo unseen.
+    let total = db.count_open_todos(project_id, filter)?;
+    let mut todos = db.list_todos(project_id, Some(TodoStatus::Open), filter, total)?;
+    todos.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    Ok(todos
+        .into_iter()
+        .take(limit)
+        .map(|t| OpenTodoItem {
+            title: todo_title(&t.text),
+            id: t.id,
+        })
+        .collect())
 }
 
 /// Existing open todos similar to `text`, most similar first.
@@ -350,12 +412,16 @@ fn edit_todo(
 }
 
 /// List todos for a project.
+///
+/// `full_text` only affects how a compact text renderer displays `todos`; the returned
+/// `TodoItem`s themselves always carry their full text.
 pub fn list_todos(
     db: &Database,
     project_id: &str,
     status: Option<TodoStatus>,
     branch: Option<Option<&str>>,
     limit: usize,
+    full_text: bool,
 ) -> Result<TodoListResult, MemoryError> {
     let todos = db.list_todos(project_id, status, branch, limit)?;
     let (open_count, done_count, dropped_count) = db.todo_counts(project_id)?;
@@ -366,5 +432,50 @@ pub fn list_todos(
         open_count,
         done_count,
         dropped_count,
+        full_text,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_is_the_first_line() {
+        assert_eq!(
+            todo_title("Migrate the legacy subscriptions\nDetails below."),
+            "Migrate the legacy subscriptions"
+        );
+    }
+
+    #[test]
+    fn title_cuts_at_the_first_sentence_end() {
+        assert_eq!(
+            todo_title("Migrate the subscriptions. Also check the billing job for stragglers."),
+            "Migrate the subscriptions."
+        );
+    }
+
+    #[test]
+    fn title_keeps_a_short_line_with_no_sentence_end_intact() {
+        assert_eq!(todo_title("Fix the flaky test"), "Fix the flaky test");
+    }
+
+    #[test]
+    fn title_hard_truncates_past_the_cap_with_an_ellipsis() {
+        let long = "x".repeat(200);
+        let title = todo_title(&long);
+        assert_eq!(title.chars().count(), TODO_TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('…'));
+    }
+
+    /// A sentence end past the cap does not count as "earlier": the line still gets a hard
+    /// truncation with an ellipsis rather than a title longer than the cap.
+    #[test]
+    fn title_ignores_a_sentence_end_beyond_the_cap() {
+        let long = format!("{}. tail", "x".repeat(200));
+        let title = todo_title(&long);
+        assert_eq!(title.chars().count(), TODO_TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('…'));
+    }
 }

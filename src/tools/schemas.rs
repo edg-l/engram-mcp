@@ -319,6 +319,10 @@ pub struct TodoListInput {
     pub branch_mode: String,
     #[serde(default = "default_todo_limit")]
     pub limit: usize,
+    /// Render each todo's full text instead of its derived title. Default false: a
+    /// project with a long-lived list otherwise dumps hundreds of characters per line.
+    #[serde(default)]
+    pub full_text: bool,
     /// Project to operate on. `None` = the server's own project.
     #[serde(default)]
     pub project: Option<String>,
@@ -994,19 +998,20 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "todo_list",
-            "List the project's durable todos. Defaults to open todos for the current branch plus project-wide ones. Returns counts for every lifecycle state, so a filtered call still reveals that closed work exists.",
+            "List the project's durable todos. Defaults to open todos for the current branch plus project-wide ones. Returns counts for every lifecycle state, so a filtered call still reveals that closed work exists. Each todo renders compactly by default (`- [ ] <title> (<id>)`, title derived from the text); set `full_text` to render the text in full.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "status": {"type": "string", "enum": ["open", "done", "dropped", "all"], "description": "Lifecycle filter. Default \"open\"."},
                     "branch_mode": {"type": "string", "description": "\"current\" (default: this branch plus project-wide), \"project\" (project-wide only), \"all\" (every branch), or a literal branch name."},
-                    "limit": {"type": "integer", "minimum": 1, "description": "Maximum todos to return (default 100)."}
+                    "limit": {"type": "integer", "minimum": 1, "description": "Maximum todos to return (default 100)."},
+                    "full_text": {"type": "boolean", "description": "Render each todo's full text instead of its derived title. Default false."}
                 }
             })),
         ),
         Tool::new(
             "handoff_resume",
-            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.\n\nAlways returns `open_todos`: the project's live open todo list for this branch, independent of the handoff sections and of whether any handoff exists. Check it, work from it, and reconcile it via todo_write as you go — mark done what you finish and drop with a reason what no longer applies.",
+            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.\n\nAlways returns `open_todos`: the project's live open todo list for this branch as `{id, title}` items, ordered importance descending then most-recently-updated first, independent of the handoff sections and of whether any handoff exists. `open_todo_count` is the true total, since the rendered list is capped. Check it, work from it, and reconcile it via todo_write as you go — mark done what you finish and drop with a reason what no longer applies.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {

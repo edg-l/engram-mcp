@@ -229,6 +229,42 @@ impl Database {
         Ok(())
     }
 
+    /// Count of open todos matching a branch filter, ignoring `limit`.
+    ///
+    /// `handoff_resume` renders only a capped slice of the open list but still needs the
+    /// true total to report, so this mirrors `list_todos`'s branch filter without the cap.
+    pub fn count_open_todos(
+        &self,
+        project_id: &str,
+        branch: Option<Option<&str>>,
+    ) -> Result<usize, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = "SELECT COUNT(*) FROM todo_items t
+             JOIN memories m ON m.id = t.memory_id
+             WHERE m.project_id = ?1 AND t.status = ?2"
+            .to_string();
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(project_id.to_string()),
+            Box::new(TodoStatus::Open.as_str().to_string()),
+        ];
+        match branch {
+            None => {}
+            Some(None) => sql.push_str(" AND m.branch IS NULL"),
+            Some(Some(b)) => {
+                args.push(Box::new(b.to_string()));
+                sql.push_str(&format!(
+                    " AND (m.branch = ?{} OR m.branch IS NULL)",
+                    args.len()
+                ));
+            }
+        }
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let count: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
     /// Count of todos per lifecycle state for a project.
     pub fn todo_counts(&self, project_id: &str) -> Result<(usize, usize, usize), MemoryError> {
         let conn = self.conn.lock().unwrap();

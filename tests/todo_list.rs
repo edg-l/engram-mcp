@@ -3,7 +3,9 @@
 use engram_mcp::db::Database;
 use engram_mcp::embedding::EmbeddingService;
 use engram_mcp::memory::{MemoryType, TodoStatus};
-use engram_mcp::tools::{TodoOp, create_handoff, list_todos, resume_handoff, write_todos};
+use engram_mcp::tools::{
+    TodoOp, create_handoff, list_todos, open_todo_titles, resume_handoff, write_todos,
+};
 
 fn setup(project: &str) -> (Database, EmbeddingService) {
     let db = Database::open_in_memory().expect("in-memory DB must open");
@@ -11,6 +13,17 @@ fn setup(project: &str) -> (Database, EmbeddingService) {
         .expect("project creation must succeed");
     let embedding = EmbeddingService::new().expect("embedding model must be available");
     (db, embedding)
+}
+
+/// Overwrite `memories.updated_at` directly, for a deterministic ordering test that does
+/// not depend on wall-clock second granularity between calls in the same test.
+fn set_updated_at(db_path: &std::path::Path, memory_id: &str, ts: i64) {
+    let conn = rusqlite::Connection::open(db_path).expect("open db for direct write");
+    conn.execute(
+        "UPDATE memories SET updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![ts, memory_id],
+    )
+    .expect("set updated_at");
 }
 
 fn add(text: &str, branch: Option<&str>) -> TodoOp {
@@ -181,6 +194,7 @@ fn branch_scoping_matches_memory_semantics() {
         Some(TodoStatus::Open),
         Some(Some("feat/parser")),
         100,
+        false,
     )
     .unwrap();
     let texts: Vec<&str> = on_parser.todos.iter().map(|t| t.text.as_str()).collect();
@@ -191,10 +205,11 @@ fn branch_scoping_matches_memory_semantics() {
         "another branch's todo must not leak in, got {texts:?}"
     );
 
-    let project_only = list_todos(&db, project, Some(TodoStatus::Open), Some(None), 100).unwrap();
+    let project_only =
+        list_todos(&db, project, Some(TodoStatus::Open), Some(None), 100, false).unwrap();
     assert_eq!(project_only.todos.len(), 1);
 
-    let everything = list_todos(&db, project, Some(TodoStatus::Open), None, 100).unwrap();
+    let everything = list_todos(&db, project, Some(TodoStatus::Open), None, 100, false).unwrap();
     assert_eq!(everything.todos.len(), 3);
 }
 
@@ -261,11 +276,13 @@ fn resume_reads_open_todos_with_no_handoff() {
     .expect("resume must succeed with no handoffs");
 
     assert!(result.latest_handoff_id.is_none(), "no handoff exists");
+    let titles: Vec<&str> = result.open_todos.iter().map(|t| t.title.as_str()).collect();
     assert_eq!(
-        result.open_todos,
-        vec!["Wire up the retry budget".to_string()],
+        titles,
+        vec!["Wire up the retry budget"],
         "open todos must surface without a handoff to hang them on"
     );
+    assert_eq!(result.open_todo_count, 1);
 }
 
 /// A finished todo drops out of resume; a still-open one survives regardless of ranking.
@@ -332,9 +349,10 @@ fn resume_reflects_todo_state_not_handoff_snapshots() {
     )
     .unwrap();
 
+    let titles: Vec<&str> = result.open_todos.iter().map(|t| t.title.as_str()).collect();
     assert_eq!(
-        result.open_todos,
-        vec!["Still open: migrate subscriptions".to_string()],
+        titles,
+        vec!["Still open: migrate subscriptions"],
         "resume must show live open todos only"
     );
     assert_eq!(
@@ -410,4 +428,145 @@ fn a_different_task_on_the_same_subject_is_not_a_duplicate() {
             result.results[0].possible_duplicates
         );
     }
+}
+
+/// `open_todo_titles` ranks by importance descending, then most-recently-updated first: the
+/// items most worth a resuming agent's attention lead the list rather than trailing behind
+/// whatever was inserted last.
+#[test]
+fn open_todo_titles_orders_by_importance_then_recency() {
+    let project = "todo-open-order";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(&db_path).expect("db must open");
+    db.get_or_create_project(project, project).unwrap();
+    let embedding = EmbeddingService::new().expect("embedding model must be available");
+
+    let add_with_importance = |text: &str, importance: f64| TodoOp::Add {
+        text: text.to_string(),
+        branch: None,
+        tags: vec![],
+        importance: Some(importance),
+    };
+
+    let low = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![add_with_importance("Low importance, touched last", 0.2)],
+    )
+    .unwrap()
+    .results[0]
+        .id
+        .clone();
+    let high_old = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![add_with_importance("High importance, touched first", 0.9)],
+    )
+    .unwrap()
+    .results[0]
+        .id
+        .clone();
+    let high_new = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![add_with_importance("High importance, touched last", 0.9)],
+    )
+    .unwrap()
+    .results[0]
+        .id
+        .clone();
+
+    set_updated_at(&db_path, &low, 300);
+    set_updated_at(&db_path, &high_old, 100);
+    set_updated_at(&db_path, &high_new, 200);
+
+    let items = open_todo_titles(&db, project, None, 100).unwrap();
+    let ids: Vec<&str> = items.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![high_new.as_str(), high_old.as_str(), low.as_str()],
+        "importance descending must win over recency, which only breaks ties among equals"
+    );
+}
+
+/// The limit applies after the importance ordering: the oldest-created todo is still the
+/// one returned when it is the most important, even with a limit smaller than the list.
+#[test]
+fn open_todo_titles_limit_applies_after_ordering() {
+    let project = "todo-open-limit-order";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(&db_path).expect("db must open");
+    db.get_or_create_project(project, project).unwrap();
+    let embedding = EmbeddingService::new().expect("embedding model must be available");
+
+    let ops: Vec<TodoOp> = [
+        ("Oldest but most important", 0.9),
+        ("Newer minor one", 0.3),
+        ("Newest minor one", 0.3),
+    ]
+    .into_iter()
+    .map(|(text, importance)| TodoOp::Add {
+        text: text.to_string(),
+        branch: None,
+        tags: vec![],
+        importance: Some(importance),
+    })
+    .collect();
+    let ids: Vec<String> = write_todos(&db, &embedding, project, None, ops)
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for direct write");
+    for (i, id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![100 + i as i64, id],
+        )
+        .expect("set created_at");
+    }
+
+    let items = open_todo_titles(&db, project, None, 1).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, ids[0]);
+}
+
+/// `open_todo_count` reports the true total for the branch filter, not just how many made
+/// it into the (capped) `open_todos` array.
+#[test]
+fn open_todo_count_reflects_the_true_total_not_the_rendered_slice() {
+    let project = "todo-open-count";
+    let (db, embedding) = setup(project);
+
+    let ops: Vec<TodoOp> = (0..5).map(|i| add(&format!("Todo {i}"), None)).collect();
+    write_todos(&db, &embedding, project, None, ops).unwrap();
+
+    let items = open_todo_titles(&db, project, None, 3).unwrap();
+    assert_eq!(items.len(), 3, "the fetch limit still caps the array");
+
+    let result = resume_handoff(
+        &db,
+        &embedding,
+        project,
+        None,
+        Some("anything"),
+        5,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        result.open_todo_count, 5,
+        "the count must reflect every open todo, not the 100-item fetch cap"
+    );
 }

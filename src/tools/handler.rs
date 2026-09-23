@@ -2806,8 +2806,14 @@ impl ToolHandler {
             literal => Some(Some(literal)),
         };
 
-        let result =
-            crate::tools::todo::list_todos(&self.db, &project, status, branch_filter, input.limit)?;
+        let result = crate::tools::todo::list_todos(
+            &self.db,
+            &project,
+            status,
+            branch_filter,
+            input.limit,
+            input.full_text,
+        )?;
         Ok(json!(result))
     }
 

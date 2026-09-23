@@ -28,4 +28,7 @@ pub use schemas::{
 };
 pub use scoring::{SearchMode, compute_hybrid_score, compute_tag_boost};
 pub use store::{StoreOutcome, store_with_dedup};
-pub use todo::{TodoListResult, TodoOp, TodoWriteResult, list_todos, open_todo_texts, write_todos};
+pub use todo::{
+    OpenTodoItem, TodoListResult, TodoOp, TodoWriteResult, list_todos, open_todo_titles,
+    todo_title, write_todos,
+};

@@ -18,7 +18,7 @@ mod tools;
 use db::Database;
 use embedding::EmbeddingService;
 use error::MemoryError;
-use format::format_todo;
+use format::{format_todo, format_todo_compact};
 use hooks::HookEvent;
 use memory::{
     AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, RelationType, Relationship,
@@ -368,6 +368,9 @@ enum TodoCmd {
         /// Maximum results
         #[arg(short, long, default_value = "100")]
         limit: usize,
+        /// Render each todo's full text instead of its derived title
+        #[arg(long)]
+        full: bool,
     },
     /// Mark a todo finished
     Done {
@@ -3182,6 +3185,7 @@ fn cmd_todo(
             status,
             branch_mode,
             limit,
+            full,
         } => {
             let status_filter = match status.as_str() {
                 "all" => None,
@@ -3197,7 +3201,8 @@ fn cmd_todo(
                 "current" => current_branch.map(Some),
                 literal => Some(Some(literal)),
             };
-            let result = tools::list_todos(db, project_id, status_filter, branch_filter, limit)?;
+            let result =
+                tools::list_todos(db, project_id, status_filter, branch_filter, limit, full)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
@@ -3206,7 +3211,11 @@ fn cmd_todo(
                 println!("No todos matched.");
             } else {
                 for todo in &result.todos {
-                    println!("{}", format_todo(todo));
+                    if full {
+                        println!("{}", format_todo(todo));
+                    } else {
+                        println!("{}", format_todo_compact(todo));
+                    }
                 }
             }
             println!(
@@ -3460,9 +3469,9 @@ fn cmd_handoff(
             }
 
             if !result.open_todos.is_empty() {
-                println!("\nOpen todos:");
+                println!("\nOpen todos ({} total):", result.open_todo_count);
                 for todo in &result.open_todos {
-                    println!("  - [ ] {}", todo);
+                    println!("  - [ ] {} ({})", todo.title, todo.id);
                 }
             }
 

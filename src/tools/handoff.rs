@@ -7,7 +7,7 @@ use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::memory::{HandoffSections, Memory, MemoryType, RelationType, Relationship};
 use crate::summarize::{generate_summary, should_auto_summarize};
-use crate::tools::todo::open_todo_texts;
+use crate::tools::todo::{OpenTodoItem, open_todo_titles};
 
 // ============================================
 // Handoff result structs
@@ -63,7 +63,8 @@ pub struct HandoffResumeResult {
     pub chain: Vec<String>,
     /// Top-scoring section excerpts across all handoffs in the chain.
     pub top_sections: Vec<HandoffSectionMatch>,
-    /// The project's live open todos for this branch, from the durable todo list.
+    /// The project's live open todos for this branch, from the durable todo list, ordered
+    /// importance descending then most-recently-updated first.
     ///
     /// Not derived from the handoff sections and not subject to the similarity ranking:
     /// open work outlives the session that recorded it, and a task spanning several
@@ -71,7 +72,12 @@ pub struct HandoffResumeResult {
     /// has been open longest. Present even when no handoff exists, since a project can
     /// have todos before it has a handoff.
     #[serde(default)]
-    pub open_todos: Vec<String>,
+    pub open_todos: Vec<OpenTodoItem>,
+    /// Total open todos for the branch filter, independent of how many are in `open_todos`
+    /// — that array is capped, this count is not, so a caller always knows how much more
+    /// `todo_list` would show.
+    #[serde(default)]
+    pub open_todo_count: usize,
     /// Verbatim `blockers` from the newest handoff, on the same unconditional basis.
     #[serde(default)]
     pub open_blockers: Vec<String>,
@@ -483,7 +489,8 @@ pub fn resume_handoff_with_vec(
 
     // Step 1b: the open todo list. Fetched before the handoff lookup because it is
     // independent of it — a project with todos but no handoff must still get the nudge.
-    let open_todos = open_todo_texts(db, project_id, resolved_branch.as_deref(), 100)?;
+    let open_todos = open_todo_titles(db, project_id, resolved_branch.as_deref(), 100)?;
+    let open_todo_count = db.count_open_todos(project_id, Some(resolved_branch.as_deref()))?;
 
     // Step 2: fetch latest handoffs.
     let latest_list = if fetch_all {
@@ -499,6 +506,7 @@ pub fn resume_handoff_with_vec(
             chain: Vec::new(),
             top_sections: Vec::new(),
             open_todos,
+            open_todo_count,
             open_blockers: Vec::new(),
             linked_memories: Vec::new(),
             message,
@@ -683,6 +691,7 @@ pub fn resume_handoff_with_vec(
         chain: chain_ids,
         top_sections,
         open_todos,
+        open_todo_count,
         open_blockers,
         linked_memories,
         message: final_message,

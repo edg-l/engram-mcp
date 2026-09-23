@@ -238,7 +238,9 @@ pub fn format_memory_content(memory: &Memory, max_len: usize) -> String {
 /// Render one todo as a checkbox line: `- [ ] text` open, `- [x]` done, `- [~]` dropped
 /// with its reason, since a dropped todo without the reason is the thing the reason exists
 /// to prevent.
-pub fn format_todo(todo: &TodoItem) -> String {
+/// Status marker, branch scope suffix, and drop-reason suffix shared by every per-todo
+/// text renderer.
+fn todo_marks(todo: &TodoItem) -> (&'static str, String, String) {
     let (box_mark, suffix) = match todo.status {
         TodoStatus::Open => (" ", String::new()),
         TodoStatus::Done => ("x", String::new()),
@@ -254,9 +256,27 @@ pub fn format_todo(todo: &TodoItem) -> String {
         Some(b) => format!(" [{b}]"),
         None => String::new(),
     };
+    (box_mark, scope, suffix)
+}
+
+pub fn format_todo(todo: &TodoItem) -> String {
+    let (box_mark, scope, suffix) = todo_marks(todo);
     format!(
         "- [{}] {}{}{}  {}",
         box_mark, todo.text, scope, suffix, todo.id
+    )
+}
+
+/// Render a todo as `- [ ] <title> (<id>)`, deriving the title via
+/// `crate::tools::todo::todo_title` — the same fn `compact_todo_list` uses for the MCP
+/// path, so `engram-cli todo list`'s default (non-`--full`) rendering agrees with it.
+#[allow(dead_code)] // Used by the engram-cli binary; not reached by the engram MCP server.
+pub fn format_todo_compact(todo: &TodoItem) -> String {
+    let (box_mark, scope, suffix) = todo_marks(todo);
+    let title = crate::tools::todo::todo_title(&todo.text);
+    format!(
+        "- [{}] {}{}{} ({})",
+        box_mark, title, scope, suffix, todo.id
     )
 }
 
@@ -1096,9 +1116,16 @@ fn compact_projects(result: &Value) -> String {
     out.trim_end().to_string()
 }
 
-/// Lead with open work. The raw serialization buries `open_todos` behind whatever
-/// `linked_memories` happens to contain, and a nudge the caller has to scroll past is not
-/// a nudge — outstanding work is the first thing a resuming agent needs.
+/// Cap on rendered todo bullets in `compact_handoff_resume`. A project with a long-lived
+/// list otherwise dumps its entire todo text before the caller ever reaches blockers,
+/// sections, or linked memories. `open_todo_count` still reports the exact total; only the
+/// bullets are capped.
+const RESUME_TODO_LIMIT: usize = 30;
+
+/// Lead with a one-line count of open work, defer the checklist itself to the end. The raw
+/// serialization buries `open_todos` behind whatever `linked_memories` happens to contain,
+/// and printing the full checklist first pushed blockers and sections out of any preview
+/// truncated to a fixed byte budget.
 fn compact_handoff_resume(result: &Value) -> String {
     let mut out = String::new();
 
@@ -1123,24 +1150,25 @@ fn compact_handoff_resume(result: &Value) -> String {
         out.push_str(&format!("Note: {msg}\n"));
     }
 
-    // Always stated, including the empty case: silence reads as "no list exists" and the
-    // caller stops looking.
     let todos = result
         .get("open_todos")
         .and_then(|v| v.as_array())
         .map(|a| a.as_slice())
         .unwrap_or_default();
-    if todos.is_empty() {
+    let open_todo_count = result
+        .get("open_todo_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(todos.len() as u64) as usize;
+
+    // Always stated, including the empty case: silence reads as "no list exists" and the
+    // caller stops looking. Kept to one line with nothing appended after the count so a
+    // later stale-count suffix has one clear place to land.
+    if open_todo_count == 0 {
         out.push_str(
-            "\nOpen todos: none. Add one with todo_write when work should outlive this session.\n",
+            "\nOpen todos: 0. Add one with todo_write when work should outlive this session.\n",
         );
     } else {
-        out.push_str("\nOpen todos (durable list — reconcile with todo_write as you work):\n");
-        for t in todos {
-            if let Some(text) = t.as_str() {
-                out.push_str(&format!("- [ ] {text}\n"));
-            }
-        }
+        out.push_str(&format!("\nOpen todos: {open_todo_count}\n"));
     }
 
     if let Some(blockers) = result.get("open_blockers").and_then(|v| v.as_array())
@@ -1198,6 +1226,23 @@ fn compact_handoff_resume(result: &Value) -> String {
                 .take(160)
                 .collect();
             out.push_str(&format!("- [{mtype}] {preview}  {id}\n"));
+        }
+    }
+
+    // The checklist itself comes last, and capped: everything a resuming agent needs to
+    // decide what to do next (blockers, sections, linked memories) already came first.
+    if !todos.is_empty() {
+        out.push_str("\nOpen todos (todo_write to reconcile):\n");
+        for t in todos.iter().take(RESUME_TODO_LIMIT) {
+            let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("- [ ] {title} ({id})\n"));
+        }
+        if open_todo_count > RESUME_TODO_LIMIT {
+            out.push_str(&format!(
+                "…and {} more: todo_list\n",
+                open_todo_count - RESUME_TODO_LIMIT
+            ));
         }
     }
 
@@ -1265,6 +1310,13 @@ fn compact_todo_list(result: &Value) -> String {
         return format!("No todos matched. Project totals: {tally}.");
     }
 
+    // Compact by default: full text is 800 chars average in practice, and a caller who
+    // needs it can ask for `full_text` explicitly.
+    let full_text = result
+        .get("full_text")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut out = String::new();
     for t in todos {
         let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -1283,7 +1335,12 @@ fn compact_todo_list(result: &Value) -> String {
             ("dropped", Some(r)) => format!(" (dropped: {r})"),
             _ => String::new(),
         };
-        out.push_str(&format!("- [{mark}] {text}{scope}{reason}  {id}\n"));
+        if full_text {
+            out.push_str(&format!("- [{mark}] {text}{scope}{reason}  {id}\n"));
+        } else {
+            let title = crate::tools::todo::todo_title(text);
+            out.push_str(&format!("- [{mark}] {title}{scope}{reason} ({id})\n"));
+        }
     }
     out.push_str(&format!("Project totals: {tally}."));
     out
@@ -1659,6 +1716,134 @@ mod tests {
         });
         let out = compact_tool_result("memory_context", &context, 300);
         assert!(out.contains("replaces mem_old"), "got: {out}");
+    }
+
+    fn sample_todo(text: &str) -> TodoItem {
+        TodoItem {
+            id: "mem_todo1".to_string(),
+            project_id: "proj".to_string(),
+            text: text.to_string(),
+            status: TodoStatus::Open,
+            reason: None,
+            branch: None,
+            tags: vec![],
+            importance: 0.6,
+            created_at: 0,
+            updated_at: 0,
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn format_todo_prints_the_full_text() {
+        let todo =
+            sample_todo("Investigate the flaky connection pool test. Reproduces under load.");
+        assert_eq!(
+            format_todo(&todo),
+            "- [ ] Investigate the flaky connection pool test. Reproduces under load.  mem_todo1"
+        );
+    }
+
+    #[test]
+    fn format_todo_compact_prints_the_derived_title() {
+        let todo =
+            sample_todo("Investigate the flaky connection pool test. Reproduces under load.");
+        assert_eq!(
+            format_todo_compact(&todo),
+            "- [ ] Investigate the flaky connection pool test. (mem_todo1)"
+        );
+    }
+
+    /// Open work leads with a one-line count; blockers, sections, and linked memories come
+    /// next; the checklist itself is last and capped, with a tail pointing at `todo_list`
+    /// for the rest.
+    #[test]
+    fn handoff_resume_orders_sections_and_caps_the_todo_checklist() {
+        let open_todos: Vec<Value> = (0..35)
+            .map(|i| json!({"id": format!("mem_{i}"), "title": format!("Todo {i}")}))
+            .collect();
+        let result = json!({
+            "branch": "main",
+            "latest_handoff_id": "mem_h1",
+            "chain": ["mem_h1"],
+            "open_todos": open_todos,
+            "open_todo_count": 35,
+            "open_blockers": ["Waiting on prod credentials"],
+            "top_sections": [{"handoff_id": "mem_h1", "section_name": "summary",
+                               "section_text": "Reworked the dispatcher", "score": 0.9}],
+            "linked_memories": [{"id": "mem_dec", "memory_type": "decision",
+                                  "content": "Chose SQLite over Postgres"}],
+        });
+        let out = compact_tool_result("handoff_resume", &result, 300);
+
+        let todos_pos = out.find("Open todos: 35").expect("count line must appear");
+        let blockers_pos = out.find("Open blockers:").expect("blockers must appear");
+        let sections_pos = out.find("Top sections:").expect("sections must appear");
+        let linked_pos = out
+            .find("Linked memories:")
+            .expect("linked memories must appear");
+        let checklist_pos = out
+            .find("Open todos (todo_write to reconcile):")
+            .expect("checklist header must appear");
+        assert!(
+            todos_pos < blockers_pos
+                && blockers_pos < sections_pos
+                && sections_pos < linked_pos
+                && linked_pos < checklist_pos,
+            "sections must appear in order; got:\n{out}"
+        );
+
+        assert_eq!(
+            out.matches("- [ ] Todo ").count(),
+            30,
+            "checklist must cap at RESUME_TODO_LIMIT; got:\n{out}"
+        );
+        assert!(out.contains("…and 5 more: todo_list"), "got: {out}");
+        assert!(out.contains("- [ ] Todo 0 (mem_0)"), "got: {out}");
+    }
+
+    /// The empty case stays an explicit line rather than silence, and the trailing
+    /// checklist section is skipped entirely since there is nothing to list.
+    #[test]
+    fn handoff_resume_states_the_empty_todo_case_explicitly() {
+        let result = json!({
+            "branch": "main",
+            "latest_handoff_id": null,
+            "chain": [],
+            "open_todos": [],
+            "open_todo_count": 0,
+        });
+        let out = compact_tool_result("handoff_resume", &result, 300);
+        assert!(
+            out.contains("Open todos: 0. Add one with todo_write"),
+            "got: {out}"
+        );
+        assert!(!out.contains("(todo_write to reconcile)"), "got: {out}");
+    }
+
+    /// `todo_list` renders compactly by default and only prints full text when `full_text`
+    /// is set — the caller who wants full detail asks for it, everyone else gets a title.
+    #[test]
+    fn todo_list_is_compact_by_default_and_full_text_on_request() {
+        let long = "Investigate the flaky connection pool test. It reproduces under load \
+                     and only on the CI runners, never locally.";
+        let todos = json!([{"id": "mem_1", "text": long, "status": "open", "branch": null}]);
+        let result = json!({
+            "project": "proj", "count": 1, "todos": todos,
+            "open_count": 1, "done_count": 0, "dropped_count": 0, "full_text": false,
+        });
+        let out = compact_tool_result("todo_list", &result, 300);
+        assert!(
+            out.contains("- [ ] Investigate the flaky connection pool test. (mem_1)"),
+            "got: {out}"
+        );
+        assert!(!out.contains("only on the CI runners"), "got: {out}");
+
+        let mut full_result = result.clone();
+        full_result["full_text"] = json!(true);
+        let out = compact_tool_result("todo_list", &full_result, 300);
+        assert!(out.contains(long), "got: {out}");
+        assert!(out.contains("  mem_1"), "got: {out}");
     }
 
     #[test]
