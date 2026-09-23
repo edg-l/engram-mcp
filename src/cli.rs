@@ -345,7 +345,7 @@ enum Commands {
 enum TodoCmd {
     /// Open a new todo
     Add {
-        /// Todo text
+        /// Todo text: a one-line title, capped at 200 chars
         text: String,
         /// Scope to a branch. Omit for a project-wide todo; "auto" uses the current branch
         #[arg(long)]
@@ -356,6 +356,10 @@ enum TodoCmd {
         /// Importance (0.0-1.0, default 0.6)
         #[arg(long)]
         importance: Option<f64>,
+        /// A finding, measurement, or dead end too long for the title. Stored as a linked
+        /// fact memory rather than appended to the title.
+        #[arg(long)]
+        detail: Option<String>,
     },
     /// List todos
     List {
@@ -396,6 +400,10 @@ enum TodoCmd {
         id: String,
         /// New text
         text: String,
+        /// A new finding to link, on top of any recorded by earlier edits. Details
+        /// accumulate; the todo itself stays a title.
+        #[arg(long)]
+        detail: Option<String>,
     },
 }
 
@@ -3218,10 +3226,17 @@ fn cmd_todo(
                     }
                 }
             }
-            println!(
+            let mut tally = format!(
                 "\n{} open, {} done, {} dropped",
                 result.open_count, result.done_count, result.dropped_count
             );
+            if result.stale_todo_count > 0 {
+                tally.push_str(&format!(
+                    ", {} untouched for 30+ active days",
+                    result.stale_todo_count
+                ));
+            }
+            println!("{tally}");
             return Ok(());
         }
         TodoCmd::Add {
@@ -3229,16 +3244,18 @@ fn cmd_todo(
             branch,
             tags,
             importance,
+            detail,
         } => TodoOp::Add {
             text,
             branch,
             tags,
             importance,
+            detail,
         },
         TodoCmd::Done { id } => TodoOp::Done { id },
         TodoCmd::Drop { id, reason } => TodoOp::Drop { id, reason },
         TodoCmd::Reopen { id } => TodoOp::Reopen { id },
-        TodoCmd::Edit { id, text } => TodoOp::Edit { id, text },
+        TodoCmd::Edit { id, text, detail } => TodoOp::Edit { id, text, detail },
     };
 
     let result = tools::write_todos(db, embedding()?, project_id, current_branch, vec![op])?;
@@ -3250,6 +3267,9 @@ fn cmd_todo(
                 std::process::exit(1);
             }
             None => println!("{} ok: {}", r.op, r.id),
+        }
+        if let Some(detail_id) = &r.detail_id {
+            println!("  detail linked: {detail_id}");
         }
         for dup in &r.possible_duplicates {
             println!(

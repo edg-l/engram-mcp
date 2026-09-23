@@ -78,6 +78,14 @@ pub struct HandoffResumeResult {
     /// `todo_list` would show.
     #[serde(default)]
     pub open_todo_count: usize,
+    /// Open todos, within `open_todos`' branch filter, idle for `STALE_TODO_STORE_DAYS`+
+    /// active store-days — old enough that they likely need finishing, editing, or
+    /// dropping rather than sitting untouched.
+    #[serde(default)]
+    pub stale_todo_count: usize,
+    /// Ids of the stalest open todos, oldest-updated first, capped at 5.
+    #[serde(default)]
+    pub stale_todo_ids: Vec<String>,
     /// Verbatim `blockers` from the newest handoff, on the same unconditional basis.
     #[serde(default)]
     pub open_blockers: Vec<String>,
@@ -491,6 +499,13 @@ pub fn resume_handoff_with_vec(
     // independent of it — a project with todos but no handoff must still get the nudge.
     let open_todos = open_todo_titles(db, project_id, resolved_branch.as_deref(), 100)?;
     let open_todo_count = db.count_open_todos(project_id, Some(resolved_branch.as_deref()))?;
+    let store_days = db.get_store_day_index(project_id)?;
+    let stale = crate::tools::todo::stale_todos(
+        db,
+        project_id,
+        Some(resolved_branch.as_deref()),
+        &store_days,
+    )?;
 
     // Step 2: fetch latest handoffs.
     let latest_list = if fetch_all {
@@ -507,6 +522,8 @@ pub fn resume_handoff_with_vec(
             top_sections: Vec::new(),
             open_todos,
             open_todo_count,
+            stale_todo_count: stale.count,
+            stale_todo_ids: stale.ids,
             open_blockers: Vec::new(),
             linked_memories: Vec::new(),
             message,
@@ -692,6 +709,8 @@ pub fn resume_handoff_with_vec(
         top_sections,
         open_todos,
         open_todo_count,
+        stale_todo_count: stale.count,
+        stale_todo_ids: stale.ids,
         open_blockers,
         linked_memories,
         message: final_message,

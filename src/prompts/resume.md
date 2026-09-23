@@ -12,7 +12,8 @@ You are resuming a work session. Call `handoff_resume` to load context from the 
    ```
 
 2. Read the result carefully:
-   - `open_todos`: the project's live open todo list for this branch, from the durable store rather than any handoff — `{id, title}` per item, ordered by importance then recency. This is the authoritative record of outstanding work. Present even when no handoff exists. The rendered checklist is capped at 30 items; `open_todo_count` is the true total, and `todo_list` shows the rest.
+   - `open_todos`: the project's live open todo list for this branch, from the durable store rather than any handoff — `{id, title}` per item, ordered by importance then recency. `title` is a one-line summary; if a todo needs a longer finding recorded, it goes in `detail` via `todo_write`, not in `title`. This is the authoritative record of outstanding work. Present even when no handoff exists. The rendered checklist is capped at 30 items; `open_todo_count` is the true total, and `todo_list` shows the rest.
+   - `stale_todo_count`/`stale_todo_ids`: open todos untouched for 30+ active store-days (oldest first, capped at 5). Call these out specifically — finish, edit, or drop them with a reason rather than letting them accumulate.
    - `open_blockers`: the newest handoff's unresolved blockers verbatim, outside the similarity ranking.
    - `top_sections`: the most relevant section excerpts from recent handoffs, ranked by similarity to the session summary.
    - `chain`: the ordered list of handoff IDs from oldest to newest. If the chain has multiple entries, the work has spanned multiple sessions.

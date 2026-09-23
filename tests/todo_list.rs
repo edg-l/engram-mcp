@@ -2,9 +2,10 @@
 
 use engram_mcp::db::Database;
 use engram_mcp::embedding::EmbeddingService;
-use engram_mcp::memory::{MemoryType, TodoStatus};
+use engram_mcp::memory::{MemoryType, RelationType, TodoStatus};
 use engram_mcp::tools::{
-    TodoOp, create_handoff, list_todos, open_todo_titles, resume_handoff, write_todos,
+    TODO_TEXT_MAX, TodoOp, create_handoff, list_todos, open_todo_titles, resume_handoff,
+    write_todos,
 };
 
 fn setup(project: &str) -> (Database, EmbeddingService) {
@@ -32,6 +33,7 @@ fn add(text: &str, branch: Option<&str>) -> TodoOp {
         branch: branch.map(str::to_string),
         tags: vec![],
         importance: None,
+        detail: None,
     }
 }
 
@@ -447,6 +449,7 @@ fn open_todo_titles_orders_by_importance_then_recency() {
         branch: None,
         tags: vec![],
         importance: Some(importance),
+        detail: None,
     };
 
     let low = write_todos(
@@ -518,6 +521,7 @@ fn open_todo_titles_limit_applies_after_ordering() {
         branch: None,
         tags: vec![],
         importance: Some(importance),
+        detail: None,
     })
     .collect();
     let ids: Vec<String> = write_todos(&db, &embedding, project, None, ops)
@@ -569,4 +573,216 @@ fn open_todo_count_reflects_the_true_total_not_the_rendered_slice() {
         result.open_todo_count, 5,
         "the count must reflect every open todo, not the 100-item fetch cap"
     );
+}
+
+/// Text over the cap is refused with a message pointing at `detail`, and no todo is
+/// created for the failed op.
+#[test]
+fn add_text_over_the_cap_is_refused() {
+    let project = "todo-text-cap";
+    let (db, embedding) = setup(project);
+
+    let long_text = "x".repeat(TODO_TEXT_MAX + 1);
+    let result = write_todos(&db, &embedding, project, None, vec![add(&long_text, None)]).unwrap();
+
+    let error = result.results[0]
+        .error
+        .as_ref()
+        .expect("oversized text must be refused");
+    assert!(
+        error.contains("detail"),
+        "the error must point the caller at `detail`, got: {error}"
+    );
+    assert_eq!(result.open_count, 0, "a refused add must not create a todo");
+
+    // Editing an existing todo past the cap is refused the same way, leaving its text
+    // untouched.
+    let added = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![add("Short title", None)],
+    )
+    .unwrap();
+    let id = added.results[0].id.clone();
+    let edit_result = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![TodoOp::Edit {
+            id: id.clone(),
+            text: long_text,
+            detail: None,
+        }],
+    )
+    .unwrap();
+    assert!(edit_result.results[0].error.is_some());
+    assert_eq!(db.get_todo(&id).unwrap().unwrap().text, "Short title");
+}
+
+/// `detail` on add is stored as a linked fact memory, reported as `detail_id`, and the
+/// todo itself keeps only the title.
+#[test]
+fn add_detail_is_stored_as_a_linked_fact() {
+    let project = "todo-detail-add";
+    let (db, embedding) = setup(project);
+
+    let op = TodoOp::Add {
+        text: "Investigate the flaky pool test".to_string(),
+        branch: None,
+        tags: vec!["ci".to_string()],
+        importance: None,
+        detail: Some("Reproduces only under load; likely a race in teardown.".to_string()),
+    };
+    let result = write_todos(&db, &embedding, project, None, vec![op]).unwrap();
+    let r = &result.results[0];
+    assert!(r.error.is_none());
+    let detail_id = r.detail_id.clone().expect("detail must be linked");
+
+    let detail_mem = db
+        .get_memory(&detail_id)
+        .unwrap()
+        .expect("detail memory must exist");
+    assert_eq!(detail_mem.memory_type, MemoryType::Fact);
+    assert_eq!(detail_mem.tags, vec!["ci".to_string()]);
+    assert_eq!(
+        detail_mem.content,
+        "Reproduces only under load; likely a race in teardown."
+    );
+
+    let todo = db.get_todo(&r.id).unwrap().unwrap();
+    assert_eq!(
+        todo.text, "Investigate the flaky pool test",
+        "the todo stays a title, unaffected by the detail"
+    );
+
+    let rels = db.get_relationships_from(&r.id).unwrap();
+    assert!(
+        rels.iter()
+            .any(|rel| rel.target_id == detail_id && rel.relation_type == RelationType::RelatesTo),
+        "the todo must link to its detail via relates_to, got {rels:?}"
+    );
+}
+
+/// Details accumulate across edits: each carries its own finding rather than overwriting
+/// the last, and the todo's own text stays a title throughout.
+#[test]
+fn edit_detail_accumulates_separate_findings() {
+    let project = "todo-detail-edit";
+    let (db, embedding) = setup(project);
+
+    let added = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![add("Investigate timeout", None)],
+    )
+    .unwrap();
+    let id = added.results[0].id.clone();
+
+    let edit_op = |detail: &str| TodoOp::Edit {
+        id: id.clone(),
+        text: "Investigate timeout".to_string(),
+        detail: Some(detail.to_string()),
+    };
+
+    let r1 = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![edit_op("First finding: retries are unbounded.")],
+    )
+    .unwrap();
+    let r2 = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![edit_op("Second finding: pool exhausts under 50 conns.")],
+    )
+    .unwrap();
+
+    let d1 = r1.results[0].detail_id.clone().expect("first detail");
+    let d2 = r2.results[0].detail_id.clone().expect("second detail");
+    assert_ne!(d1, d2, "each edit's detail is a separate finding");
+
+    let rels = db.get_relationships_from(&id).unwrap();
+    assert_eq!(
+        rels.iter()
+            .filter(|r| r.relation_type == RelationType::RelatesTo)
+            .count(),
+        2,
+        "both details must remain linked, got {rels:?}"
+    );
+}
+
+/// A todo untouched across 30+ store-days is flagged stale in both `list_todos` and
+/// `handoff_resume`, regardless of the caller's status filter or the similarity ranking.
+#[test]
+fn stale_count_reflects_store_day_inactivity() {
+    let project = "todo-stale-list";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(&db_path).expect("db must open");
+    db.get_or_create_project(project, project).unwrap();
+    let embedding = EmbeddingService::new().expect("embedding model must be available");
+
+    let added = write_todos(
+        &db,
+        &embedding,
+        project,
+        None,
+        vec![add("Old todo nobody touched", None)],
+    )
+    .unwrap();
+    let old_id = added.results[0].id.clone();
+    // Anchor the old todo's own store-day at 0, distinct from every store-day that
+    // follows it.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE memories SET created_at = 0, updated_at = 0 WHERE id = ?1",
+        rusqlite::params![old_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Thirty distinct later store-days: one todo per day is enough to advance the clock.
+    for day in 1..=30i64 {
+        let r = write_todos(
+            &db,
+            &embedding,
+            project,
+            None,
+            vec![add(&format!("filler {day}"), None)],
+        )
+        .unwrap();
+        let id = r.results[0].id.clone();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![day * engram_mcp::db::SECONDS_PER_DAY, id],
+        )
+        .unwrap();
+    }
+
+    let listed = list_todos(&db, project, Some(TodoStatus::Open), None, 100, false).unwrap();
+    assert_eq!(listed.stale_todo_count, 1);
+
+    let resume = resume_handoff(
+        &db,
+        &embedding,
+        project,
+        None,
+        Some("anything"),
+        5,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(resume.stale_todo_count, 1);
+    assert_eq!(resume.stale_todo_ids, vec![old_id]);
 }

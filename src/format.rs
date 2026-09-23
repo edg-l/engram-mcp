@@ -1159,14 +1159,28 @@ fn compact_handoff_resume(result: &Value) -> String {
         .get("open_todo_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(todos.len() as u64) as usize;
+    let stale_todo_count = result
+        .get("stale_todo_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let stale_todo_ids: Vec<&str> = result
+        .get("stale_todo_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
 
     // Always stated, including the empty case: silence reads as "no list exists" and the
-    // caller stops looking. Kept to one line with nothing appended after the count so a
-    // later stale-count suffix has one clear place to land.
+    // caller stops looking.
     if open_todo_count == 0 {
         out.push_str(
             "\nOpen todos: 0. Add one with todo_write when work should outlive this session.\n",
         );
+    } else if stale_todo_count > 0 {
+        out.push_str(&format!(
+            "\nOpen todos: {open_todo_count} ({stale_todo_count} untouched for 30+ active \
+             days: {} — finish, edit or drop them)\n",
+            stale_todo_ids.join(", ")
+        ));
     } else {
         out.push_str(&format!("\nOpen todos: {open_todo_count}\n"));
     }
@@ -1304,7 +1318,17 @@ fn compact_todo_list(result: &Value) -> String {
         .get("dropped_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let tally = format!("{open} open, {done} done, {dropped} dropped");
+    let stale = result
+        .get("stale_todo_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tally = if stale > 0 {
+        format!(
+            "{open} open, {done} done, {dropped} dropped, {stale} untouched for 30+ active days"
+        )
+    } else {
+        format!("{open} open, {done} done, {dropped} dropped")
+    };
 
     if todos.is_empty() {
         return format!("No todos matched. Project totals: {tally}.");
@@ -1802,6 +1826,43 @@ mod tests {
         assert!(out.contains("- [ ] Todo 0 (mem_0)"), "got: {out}");
     }
 
+    /// A non-zero stale count appends a suffix naming the idle ids on the count line;
+    /// with none stale, the line stays exactly as it was before staleness existed.
+    #[test]
+    fn handoff_resume_appends_a_stale_suffix_when_todos_are_idle() {
+        let result = json!({
+            "branch": "main",
+            "latest_handoff_id": "mem_h1",
+            "chain": ["mem_h1"],
+            "open_todos": [{"id": "mem_1", "title": "Migrate subscriptions"}],
+            "open_todo_count": 1,
+            "stale_todo_count": 1,
+            "stale_todo_ids": ["mem_1"],
+        });
+        let out = compact_tool_result("handoff_resume", &result, 300);
+        assert!(
+            out.contains(
+                "Open todos: 1 (1 untouched for 30+ active days: mem_1 — finish, edit or drop them)"
+            ),
+            "got: {out}"
+        );
+
+        let fresh = json!({
+            "branch": "main",
+            "latest_handoff_id": "mem_h1",
+            "chain": ["mem_h1"],
+            "open_todos": [{"id": "mem_1", "title": "Migrate subscriptions"}],
+            "open_todo_count": 1,
+            "stale_todo_count": 0,
+            "stale_todo_ids": [],
+        });
+        let out = compact_tool_result("handoff_resume", &fresh, 300);
+        assert!(
+            out.contains("Open todos: 1\n") && !out.contains("untouched for"),
+            "no stale todos must render the plain count line; got: {out}"
+        );
+    }
+
     /// The empty case stays an explicit line rather than silence, and the trailing
     /// checklist section is skipped entirely since there is nothing to list.
     #[test]
@@ -1844,6 +1905,29 @@ mod tests {
         let out = compact_tool_result("todo_list", &full_result, 300);
         assert!(out.contains(long), "got: {out}");
         assert!(out.contains("  mem_1"), "got: {out}");
+    }
+
+    /// `todo_list`'s tally states the stale count when present, and stays exactly as
+    /// before when there is nothing stale.
+    #[test]
+    fn todo_list_tally_states_the_stale_count_when_present() {
+        let todos = json!([{"id": "mem_1", "text": "Old todo", "status": "open", "branch": null}]);
+        let result = json!({
+            "project": "proj", "count": 1, "todos": todos,
+            "open_count": 1, "done_count": 0, "dropped_count": 0,
+            "stale_todo_count": 1, "full_text": false,
+        });
+        let out = compact_tool_result("todo_list", &result, 300);
+        assert!(
+            out.contains("1 open, 0 done, 0 dropped, 1 untouched for 30+ active days"),
+            "got: {out}"
+        );
+
+        let mut fresh = result.clone();
+        fresh["stale_todo_count"] = json!(0);
+        let out = compact_tool_result("todo_list", &fresh, 300);
+        assert!(out.contains("1 open, 0 done, 0 dropped."), "got: {out}");
+        assert!(!out.contains("untouched for"), "got: {out}");
     }
 
     #[test]

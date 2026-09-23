@@ -83,7 +83,11 @@ Use `handoff_create` at session end and `handoff_resume` at session start to pre
 
 Outstanding work belongs in the durable todo list, not in a handoff: `todo_write` to add, finish (`done`), or abandon (`drop`, with a mandatory reason) items, and `todo_list` to read them. Todos never decay and survive across sessions.
 
+A todo's `text` is a one-line title, capped at 200 chars — not a note. Put findings, measurements, and dead ends in `detail` on add or edit; each is stored as a linked fact memory (reported as `detail_id`) rather than appended to the title, and edits accumulate details rather than replacing them.
+
 `handoff_resume` returns the live open list as `open_todos` (`{id, title}` per item), which is the nudge to check it — do that at session start, and reconcile as you work rather than only at the end. The id is included so you can call `todo_write` on it directly, no lookup needed. Add a todo when work should be picked up by a *later* session; do not mirror your in-session task list here. Omit `branch` for work that applies to the whole project, and scope to a branch only when the work is genuinely branch-specific, since a branch-scoped todo is invisible elsewhere.
+
+`handoff_resume` and `todo_list` also flag stale todos: open items untouched for 30+ active store-days (`stale_todo_count`, `stale_todo_ids`). A stale todo is not necessarily wrong, but it has gone unconsidered for a long stretch of active work — finish it, edit it, or drop it with a reason rather than leaving it to accumulate.
 
 Section semantics: **blockers** — Things preventing forward motion right now (missing access, failing dependency, unanswered question). **next_steps** — Post-session follow-ups beyond the current thread. Future-facing, not for immediate pickup.
 

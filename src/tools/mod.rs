@@ -29,6 +29,6 @@ pub use schemas::{
 pub use scoring::{SearchMode, compute_hybrid_score, compute_tag_boost};
 pub use store::{StoreOutcome, store_with_dedup};
 pub use todo::{
-    OpenTodoItem, TodoListResult, TodoOp, TodoWriteResult, list_todos, open_todo_titles,
-    todo_title, write_todos,
+    OpenTodoItem, STALE_TODO_STORE_DAYS, TODO_TEXT_MAX, TodoListResult, TodoOp, TodoWriteResult,
+    list_todos, open_todo_titles, stale_todos, todo_title, write_todos,
 };

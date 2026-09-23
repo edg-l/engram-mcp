@@ -960,7 +960,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Todo tools ===
         Tool::new(
             "todo_write",
-            "Apply changes to the project's durable todo list: add, done, drop, reopen, edit. Todos survive across sessions and never decay, so this is the right home for work that outlives one conversation.\n\nOps are applied in order and reported individually — one bad id does not discard the rest of the batch. `drop` requires a reason: closing a todo without one is indistinguishable from forgetting it. Adding reports `possible_duplicates` (existing open todos at very high similarity) but never merges, since two similar todos can be separate work.\n\nDo NOT mirror the in-session task list here. Add a todo when work should be picked up by a *later* session.",
+            "Apply changes to the project's durable todo list: add, done, drop, reopen, edit. Todos survive across sessions and never decay, so this is the right home for work that outlives one conversation.\n\nA todo's `text` is a one-line title, capped at 200 chars — not a note. Put findings, measurements, and dead ends in `detail`; add/edit report the linked memory as `detail_id`. Ops are applied in order and reported individually — one bad id does not discard the rest of the batch. `drop` requires a reason: closing a todo without one is indistinguishable from forgetting it. Adding reports `possible_duplicates` (existing open todos at very high similarity) but never merges, since two similar todos can be separate work.\n\nDo NOT mirror the in-session task list here. Add a todo when work should be picked up by a *later* session.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -972,7 +972,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                             "properties": {
                                 "op": {"type": "string", "enum": ["add", "done", "drop", "reopen", "edit"], "description": "Which change to make."},
                                 "id": {"type": "string", "description": "Todo id. Required for done/drop/reopen/edit."},
-                                "text": {"type": "string", "description": "Todo text. Required for add and edit. One concrete, ready-to-execute item; name the file, function, or command where one exists."},
+                                "text": {"type": "string", "maxLength": 200, "description": "Todo text. Required for add and edit. A one-line title (≤200 chars), not a note: name the concrete, ready-to-execute item, e.g. the file, function, or command where one exists. Findings, measurements, and dead ends go in `detail`, not here — text over the cap is rejected with a message pointing at `detail`."},
+                                "detail": {"type": "string", "description": "add/edit only. A finding, measurement, or dead end too long for the title. Stored as a linked fact memory rather than appended to the text, so the todo stays a title; on edit, each detail is a new linked finding rather than a replacement."},
                                 "reason": {"type": "string", "description": "Why the todo was dropped. Required for drop."},
                                 "branch": {"type": "string", "description": "add only. Omit for a todo that applies to the whole project; pass \"auto\" for the current branch, or a literal branch name. Branch-scoped todos are only surfaced on that branch, so prefer omitting unless the work is genuinely branch-specific."},
                                 "tags": {"type": "array", "items": {"type": "string"}, "description": "add only. Short lowercase topic tags."},
@@ -998,7 +999,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "todo_list",
-            "List the project's durable todos. Defaults to open todos for the current branch plus project-wide ones. Returns counts for every lifecycle state, so a filtered call still reveals that closed work exists. Each todo renders compactly by default (`- [ ] <title> (<id>)`, title derived from the text); set `full_text` to render the text in full.",
+            "List the project's durable todos. Defaults to open todos for the current branch plus project-wide ones. Returns counts for every lifecycle state, so a filtered call still reveals that closed work exists, plus `stale_todo_count` for open todos idle 30+ active store-days. Each todo renders compactly by default (`- [ ] <title> (<id>)`, title derived from the text); set `full_text` to render the text in full.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1011,7 +1012,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "handoff_resume",
-            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.\n\nAlways returns `open_todos`: the project's live open todo list for this branch as `{id, title}` items, ordered importance descending then most-recently-updated first, independent of the handoff sections and of whether any handoff exists. `open_todo_count` is the true total, since the rendered list is capped. Check it, work from it, and reconcile it via todo_write as you go — mark done what you finish and drop with a reason what no longer applies.",
+            "Resume a session by retrieving the most relevant sections from recent handoffs on the current (or specified) branch, plus linked decisions/patterns/debug notes.\n\nAlways returns `open_todos`: the project's live open todo list for this branch as `{id, title}` items, ordered importance descending then most-recently-updated first, independent of the handoff sections and of whether any handoff exists. `open_todo_count` is the true total, since the rendered list is capped. `stale_todo_count`/`stale_todo_ids` (oldest first, capped at 5) flag open todos idle 30+ active store-days — finish, edit, or drop them rather than leaving them to accumulate. Check it, work from it, and reconcile it via todo_write as you go — mark done what you finish and drop with a reason what no longer applies.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
