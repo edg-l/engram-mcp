@@ -265,14 +265,20 @@ impl ToolHandler {
     }
 
     /// Resolve the project a tool call operates on: the call's `project` argument
-    /// when present, otherwise the server's own project. An unknown project is
-    /// rejected so a mistyped ID cannot silently read or write the wrong store.
+    /// when present, otherwise the server's own project. Accepts a short name
+    /// (a known id's last path segment) or a legacy absolute path in addition to
+    /// an exact id; see `Database::resolve_known_project`. Anything that still
+    /// doesn't resolve is rejected so a mistyped ID cannot silently read or
+    /// write the wrong store.
     fn resolve_project(&self, requested: Option<&str>) -> Result<String, MemoryError> {
         let Some(requested) = requested.map(str::trim).filter(|p| !p.is_empty()) else {
             return Ok(self.project_id.clone());
         };
-        if requested == self.project_id || self.db.project_exists(requested)? {
-            return Ok(requested.to_string());
+        if let Some(resolved) = self
+            .db
+            .resolve_known_project(requested, Some(&self.project_id))?
+        {
+            return Ok(resolved);
         }
         let known: Vec<String> = self.db.list_projects()?.into_iter().map(|p| p.id).collect();
         Err(MemoryError::UnknownProject {

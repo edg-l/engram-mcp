@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use rusqlite::{OptionalExtension, params};
 
 use crate::decay::{ACCESS_REINFORCEMENT, RELEVANCE_CEILING};
 use crate::error::MemoryError;
 use crate::memory::{Memory, MemoryType, MergeSource, Project, ProjectStats, ProjectSummary};
+use crate::project::{last_path_segment, portable_id_from_legacy};
 
 use super::Database;
 use super::util::{MEMORY_COLUMNS, map_memory_row};
@@ -116,6 +118,56 @@ impl Database {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Resolve a caller-supplied `project` argument (MCP `project` field,
+    /// `engram-cli -p`) against the ids the store actually knows about.
+    /// `current` is the caller's own project id, if any, checked before hitting
+    /// the store so a server whose own project has no rows yet still recognizes
+    /// its own id.
+    ///
+    /// Exact id (or `current`) resolves immediately. Otherwise `requested` is
+    /// expanded: an absolute legacy path is re-derived through
+    /// [`portable_id_from_legacy`] and matched exactly, or `requested` is
+    /// matched case-insensitively against each known id's last `/` segment
+    /// (`git:host/edgar/antworld` and `~/dev/antworld` both match `antworld`).
+    /// Exactly one candidate resolves to it; several is reported as
+    /// `UnknownProject` scoped to just those candidates; none resolves to
+    /// `Ok(None)`, leaving the caller to decide what "unknown" means for its
+    /// own command (MCP always rejects it; the CLI rejects it for reads but
+    /// creates the project verbatim for writes, as before).
+    pub fn resolve_known_project(
+        &self,
+        requested: &str,
+        current: Option<&str>,
+    ) -> Result<Option<String>, MemoryError> {
+        if Some(requested) == current || self.project_exists(requested)? {
+            return Ok(Some(requested.to_string()));
+        }
+
+        let known: Vec<String> = self.list_projects()?.into_iter().map(|p| p.id).collect();
+
+        if Path::new(requested).is_absolute() {
+            let legacy = portable_id_from_legacy(requested);
+            if known.iter().any(|id| id == &legacy) {
+                return Ok(Some(legacy));
+            }
+        }
+
+        let target = requested.to_lowercase();
+        let candidates: Vec<String> = known
+            .into_iter()
+            .filter(|id| last_path_segment(id).to_lowercase() == target)
+            .collect();
+
+        match candidates.len() {
+            0 => Ok(None),
+            1 => Ok(Some(candidates.into_iter().next().unwrap())),
+            _ => Err(MemoryError::UnknownProject {
+                requested: requested.to_string(),
+                known: candidates.join(", "),
+            }),
+        }
     }
 
     // Memory operations

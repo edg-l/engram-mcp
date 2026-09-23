@@ -673,7 +673,7 @@ pub fn make_input_schema(schema: Value) -> Arc<Map<String, Value>> {
 }
 
 /// Description of the shared optional `project` argument.
-const PROJECT_ARG_DESCRIPTION: &str = "Project to operate on. Omit to use the server's own project (derived from its working directory). Pass a project ID from memory_projects to read or write another project's memories. Unknown project IDs are rejected.";
+const PROJECT_ARG_DESCRIPTION: &str = "Project to operate on. Omit to use the server's own project. Accepts a full project ID from memory_projects, or its last path segment (e.g. \"antworld\"); ambiguous or unknown names are rejected.";
 
 /// Build a tool input schema with the shared optional `project` argument added.
 fn project_scoped_schema(schema: Value) -> Arc<Map<String, Value>> {

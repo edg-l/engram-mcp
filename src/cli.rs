@@ -710,7 +710,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = get_db_path(cli.database);
     let project_was_explicit = cli.project.is_some();
-    let project_id = project::resolve_project_id(cli.project);
+    let mut project_id = project::resolve_project_id(cli.project);
 
     // Ensure database directory exists
     if let Some(parent) = db_path.parent() {
@@ -726,6 +726,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db = Database::open(&db_path)?;
+
+    // An explicit --project may be a short name (a known id's last path segment)
+    // or a legacy absolute path; expand it to the full id before anything below
+    // reads or reports it, so a unique match is used the same way for reads and
+    // writes. An ambiguous short name is rejected outright, before read/write
+    // even comes into it.
+    if project_was_explicit {
+        match db.resolve_known_project(&project_id, None) {
+            Ok(Some(resolved)) => project_id = resolved,
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // An explicit --project that reads from a project which does not exist is
     // reported instead of silently returning nothing.

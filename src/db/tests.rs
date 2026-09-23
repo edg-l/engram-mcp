@@ -1537,3 +1537,73 @@ fn wipe_is_recoverable() {
     db.restore_trash_entry(entry.trash_id).unwrap();
     assert!(db.get_memory("mem_new").unwrap().is_some());
 }
+
+#[test]
+fn resolve_known_project_matches_unique_last_segment() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("git:example.com/edgar/antworld", "antworld")
+        .unwrap();
+    db.get_or_create_project("home-project", "home-project")
+        .unwrap();
+
+    let resolved = db.resolve_known_project("antworld", None).unwrap();
+    assert_eq!(resolved.as_deref(), Some("git:example.com/edgar/antworld"));
+}
+
+#[test]
+fn resolve_known_project_matches_case_insensitively() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("git:example.com/edgar/antworld", "antworld")
+        .unwrap();
+
+    let resolved = db.resolve_known_project("AntWorld", None).unwrap();
+    assert_eq!(resolved.as_deref(), Some("git:example.com/edgar/antworld"));
+}
+
+#[test]
+fn resolve_known_project_ambiguous_short_name_lists_only_candidates() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("git:example.com/alice/widget", "widget")
+        .unwrap();
+    db.get_or_create_project("git:example.com/bob/widget", "widget")
+        .unwrap();
+    db.get_or_create_project("home-project", "home-project")
+        .unwrap();
+
+    let err = db.resolve_known_project("widget", None).unwrap_err();
+    match err {
+        MemoryError::UnknownProject { requested, known } => {
+            assert_eq!(requested, "widget");
+            assert!(known.contains("git:example.com/alice/widget"));
+            assert!(known.contains("git:example.com/bob/widget"));
+            assert!(!known.contains("home-project"));
+        }
+        other => panic!("expected UnknownProject, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_known_project_expands_legacy_absolute_path() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("~/dev/antworld", "antworld")
+        .unwrap();
+
+    // Not a real directory, so this falls back to folding the string itself
+    // against a home prefix rather than walking a git root.
+    let resolved = db
+        .resolve_known_project("/home/someoneelse/dev/antworld", None)
+        .unwrap();
+    assert_eq!(resolved.as_deref(), Some("~/dev/antworld"));
+}
+
+#[test]
+fn resolve_known_project_no_match_returns_none() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("home-project", "home-project")
+        .unwrap();
+
+    assert_eq!(
+        db.resolve_known_project("does-not-exist", None).unwrap(),
+        None
+    );
+}

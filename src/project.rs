@@ -210,6 +210,16 @@ pub fn resolve_project_id(explicit: Option<String>) -> String {
     "default".to_string()
 }
 
+/// The last `/`-delimited segment of a project id, after stripping a leading
+/// `git:` or `~/` marker — `git:host/edgar/antworld` and `~/dev/antworld` both
+/// yield `antworld`. A bare verbatim id with no `/` (e.g. `smoke_test_temp`) is
+/// its own last segment.
+pub fn last_path_segment(id: &str) -> &str {
+    let stripped = id.strip_prefix("git:").unwrap_or(id);
+    let stripped = stripped.strip_prefix("~/").unwrap_or(stripped);
+    stripped.rsplit('/').next().unwrap_or(stripped)
+}
+
 /// Re-derive a portable id from a legacy (pre-migration, absolute-path)
 /// project id. If the legacy string is still a real directory,
 /// [`project_id_for_dir`] can discover its git remote; otherwise it is folded
