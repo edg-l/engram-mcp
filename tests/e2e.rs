@@ -717,3 +717,200 @@ fn test_prune_low_relevance_memories() {
     let stats = call(&h, "memory_stats", json!({}));
     assert_eq!(stats["memory_count"].as_u64().unwrap(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: an agent references a memory id from an earlier session, but a
+// dedup merge consumed it in the meantime. related_to/supersedes/memory_link
+// must resolve the id to its survivor rather than failing with a foreign key
+// error against a memory that was already committed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_store_related_to_merged_away_id_links_to_survivor() {
+    let (h, _dir) = setup(None);
+
+    // memory_store_batch never dedups, so this pair is guaranteed to land as two
+    // distinct memories regardless of how similar the embedding model finds them.
+    let batch = call(
+        &h,
+        "memory_store_batch",
+        json!({"memories": [
+            {"content": "The build cache lives under ~/.cache/target", "type": "fact"},
+            {"content": "The release pipeline runs nightly at 2am UTC", "type": "fact"}
+        ]}),
+    );
+    let batch_ids: Vec<String> = batch["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let old_id = batch_ids[0].clone();
+    let survivor_id = batch_ids[1].clone();
+
+    // Simulate a dedup merge having consumed `old_id` hours earlier.
+    h.database()
+        .merge_memories(&survivor_id, &old_id)
+        .expect("merge should succeed");
+
+    let r = call(
+        &h,
+        "memory_store",
+        json!({
+            "content": "The on-call rotation is published in the team calendar",
+            "type": "fact",
+            "related_to": [old_id.clone()]
+        }),
+    );
+    let new_id = r["id"].as_str().unwrap().to_string();
+
+    let redirects = r["redirected_links"]
+        .as_array()
+        .expect("a redirected link should be reported");
+    assert_eq!(redirects.len(), 1);
+    assert_eq!(redirects[0]["from"].as_str().unwrap(), old_id);
+    assert_eq!(redirects[0]["to"].as_str().unwrap(), survivor_id);
+
+    // The relates_to edge should point at the survivor, not the consumed id.
+    let graph = call(&h, "memory_graph", json!({"id": new_id, "depth": 1}));
+    let related_ids: Vec<&str> = graph["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["memory"]["id"].as_str().unwrap())
+        .collect();
+    assert!(related_ids.contains(&survivor_id.as_str()));
+    assert!(!related_ids.contains(&old_id.as_str()));
+}
+
+#[test]
+fn test_store_with_unknown_related_to_id_errors_and_stores_nothing() {
+    let (h, _dir) = setup(None);
+
+    let err = h
+        .handle_tool(
+            "memory_store",
+            json!({
+                "content": "This references a memory that never existed",
+                "type": "fact",
+                "related_to": ["mem_00000000000000000000000000000000"]
+            }),
+        )
+        .expect_err("an unknown related_to id must fail the store");
+    assert!(
+        err.to_string()
+            .contains("mem_00000000000000000000000000000000")
+    );
+    assert!(err.to_string().contains("related_to"));
+
+    let stats = call(&h, "memory_stats", json!({}));
+    assert_eq!(
+        stats["memory_count"].as_u64().unwrap(),
+        0,
+        "a failed store must leave no memory behind"
+    );
+}
+
+#[test]
+fn test_memory_link_resolves_merged_away_target() {
+    let (h, _dir) = setup(None);
+
+    let batch = call(
+        &h,
+        "memory_store_batch",
+        json!({"memories": [
+            {"content": "The load balancer health check hits /healthz every 5s", "type": "fact"},
+            {"content": "Log retention on the ingest cluster is 14 days", "type": "fact"},
+            {"content": "The mobile app targets iOS 16 and above", "type": "fact"}
+        ]}),
+    );
+    let batch_ids: Vec<String> = batch["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let a_id = batch_ids[0].clone();
+    let b_id = batch_ids[1].clone();
+    let c_id = batch_ids[2].clone();
+
+    h.database()
+        .merge_memories(&b_id, &a_id)
+        .expect("merge should succeed");
+
+    let r = call(
+        &h,
+        "memory_link",
+        json!({"source_id": c_id, "target_id": a_id, "relation": "relates_to"}),
+    );
+    let redirects = r["redirected_links"]
+        .as_array()
+        .expect("a redirected link should be reported");
+    assert_eq!(redirects[0]["from"].as_str().unwrap(), a_id);
+    assert_eq!(redirects[0]["to"].as_str().unwrap(), b_id);
+
+    let graph = call(&h, "memory_graph", json!({"id": c_id, "depth": 1}));
+    let related_ids: Vec<&str> = graph["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["memory"]["id"].as_str().unwrap())
+        .collect();
+    assert!(related_ids.contains(&b_id.as_str()));
+}
+
+#[test]
+fn test_store_batch_resolves_merged_away_related_to_id() {
+    let (h, _dir) = setup(None);
+
+    let batch = call(
+        &h,
+        "memory_store_batch",
+        json!({"memories": [
+            {"content": "The staging bucket is versioned and lifecycle-managed", "type": "fact"},
+            {"content": "Deploys require a green run on the smoke test suite", "type": "fact"}
+        ]}),
+    );
+    let batch_ids: Vec<String> = batch["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let old_id = batch_ids[0].clone();
+    let survivor_id = batch_ids[1].clone();
+
+    h.database()
+        .merge_memories(&survivor_id, &old_id)
+        .expect("merge should succeed");
+
+    let r = call(
+        &h,
+        "memory_store_batch",
+        json!({
+            "memories": [
+                {
+                    "content": "Batch item referencing a merged-away id",
+                    "type": "fact",
+                    "related_to": [old_id.clone()]
+                }
+            ]
+        }),
+    );
+    assert_eq!(r["count"].as_u64().unwrap(), 1);
+    let redirects = r["redirected_links"]
+        .as_array()
+        .expect("a redirected link should be reported");
+    assert_eq!(redirects[0]["from"].as_str().unwrap(), old_id);
+    assert_eq!(redirects[0]["to"].as_str().unwrap(), survivor_id);
+
+    let new_id = r["ids"].as_array().unwrap()[0].as_str().unwrap();
+    let graph = call(&h, "memory_graph", json!({"id": new_id, "depth": 1}));
+    let related_ids: Vec<&str> = graph["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["memory"]["id"].as_str().unwrap())
+        .collect();
+    assert!(related_ids.contains(&survivor_id.as_str()));
+}

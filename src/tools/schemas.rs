@@ -806,6 +806,8 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                                 "tags": {"type": "array", "items": {"type": "string"}},
                                 "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                 "summary": {"type": "string"},
+                                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs this relates to. Creates 'relates_to' links."},
+                                "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Memory IDs this one replaces. Those memories stop being returned by search; queries that would have matched them return this one instead."},
                                 "external_artifacts": {
                                     "type": "array",
                                     "items": {"type": "string"},

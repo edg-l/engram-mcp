@@ -26,6 +26,7 @@ use memory::{
 use summarize::{generate_summary, should_auto_summarize};
 use tools::TodoOp;
 use tools::curation::{CurationView, MatchedVia, Resolution, supersession_candidates};
+use tools::links::resolve_link_target;
 
 #[derive(Parser)]
 #[command(name = "engram-cli")]
@@ -886,7 +887,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             relation,
             strength,
         } => {
-            cmd_link(&db, &source, &target, &relation, strength)?;
+            cmd_link(&db, &project_id, &source, &target, &relation, strength)?;
         }
         Commands::Export {
             output,
@@ -1528,11 +1529,18 @@ fn cmd_store(
         .parse()
         .map_err(|_| MemoryError::InvalidType(type_str.to_string()))?;
 
-    // Fail before storing anything if a superseded id is wrong.
-    for old_id in supersedes {
-        db.get_memory(old_id)?
-            .ok_or_else(|| MemoryError::NotFound(old_id.clone()))?;
-    }
+    // Resolve every superseded id before storing anything: a merged-away id still names
+    // real content, just under whatever memory absorbed it.
+    let mut redirects = Vec::new();
+    let supersedes: Vec<String> = supersedes
+        .iter()
+        .map(|raw_id| {
+            let (resolved, redirect) = resolve_link_target(db, project_id, raw_id, "supersedes")?;
+            redirects.extend(redirect);
+            Ok(resolved)
+        })
+        .collect::<Result<_, MemoryError>>()?;
+    let supersedes = supersedes.as_slice();
 
     let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
     let now = chrono::Utc::now().timestamp();
@@ -1635,6 +1643,12 @@ fn cmd_store(
         println!(
             "Merged with near-duplicate {merged_with} (similarity {similarity:.2}); its full \
              content is kept in this memory's provenance and in the trash."
+        );
+    }
+    for redirect in &redirects {
+        println!(
+            "Note: {} was merged away; supersedes now points at its survivor {}.",
+            redirect.from, redirect.to
         );
     }
     for old_id in supersedes {
@@ -1779,6 +1793,7 @@ fn cmd_update(
 
 fn cmd_link(
     db: &Database,
+    project_id: &str,
     source: &str,
     target: &str,
     relation: &str,
@@ -1788,25 +1803,30 @@ fn cmd_link(
         .parse()
         .map_err(|_| MemoryError::InvalidRelation(relation.to_string()))?;
 
-    // Verify both exist
-    db.get_memory(source)?
-        .ok_or_else(|| MemoryError::NotFound(source.to_string()))?;
-    db.get_memory(target)?
-        .ok_or_else(|| MemoryError::NotFound(target.to_string()))?;
+    // Resolve both ends before creating the edge: a merged-away id still names a memory,
+    // just one that moved to its survivor.
+    let (source_id, source_redirect) = resolve_link_target(db, project_id, source, "source_id")?;
+    let (target_id, target_redirect) = resolve_link_target(db, project_id, target, "target_id")?;
 
     let rel = Relationship {
         id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
-        source_id: source.to_string(),
-        target_id: target.to_string(),
+        source_id: source_id.clone(),
+        target_id: target_id.clone(),
         relation_type,
         strength: strength.clamp(0.0, 1.0),
         created_at: chrono::Utc::now().timestamp(),
     };
 
     db.create_relationship(&rel)?;
+    for redirect in source_redirect.into_iter().chain(target_redirect) {
+        println!(
+            "Note: {} was merged away; using its survivor {}.",
+            redirect.from, redirect.to
+        );
+    }
     println!(
         "Created relationship: {} -> {} ({})",
-        source, target, relation
+        source_id, target_id, relation
     );
 
     Ok(())

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::decay::{ACCESS_REINFORCEMENT, RELEVANCE_CEILING};
 use crate::error::MemoryError;
@@ -838,6 +838,34 @@ impl Database {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Find the memory that absorbed `consumed_id` via a dedup merge, if any.
+    ///
+    /// `merged_from` is a JSON array of [`crate::memory::MergeSource`], one per consumed
+    /// memory; `instr()` does a plain substring search rather than `LIKE`, so the `_` in
+    /// every `mem_` id is not treated as a single-character wildcard. Scoped to
+    /// `project_id` plus global memories — the same visibility `store_with_dedup` itself
+    /// uses when finding candidates to merge, so a project can never resolve into a
+    /// survivor it could not otherwise see.
+    pub fn find_merge_survivor(
+        &self,
+        project_id: &str,
+        consumed_id: &str,
+    ) -> Result<Option<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let needle = format!("\"id\":\"{consumed_id}\"");
+        conn.query_row(
+            "SELECT id FROM memories
+             WHERE (project_id = ?1 OR global = 1)
+               AND merged_from IS NOT NULL
+               AND instr(merged_from, ?2) > 0
+             LIMIT 1",
+            params![project_id, needle],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(MemoryError::from)
     }
 
     /// Count hook-captured memories stored today (UTC) for the given project.

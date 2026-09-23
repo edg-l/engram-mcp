@@ -23,6 +23,7 @@ use super::curation::{
     CurationView, MatchedVia, Resolution, SupersessionCandidate, supersession_candidates,
 };
 use super::handoff::{create_handoff, handoff_section_key_texts, resume_handoff, search_handoffs};
+use super::links::{Redirect, resolve_link_target};
 use super::schemas::{
     AdrCreateInput, AdrExportInput, AdrListInput, AdrShowInput, AdrUpdateStatusInput,
     HandoffCreateInput, HandoffResumeInput, HandoffSearchInput, MemoryContextInput,
@@ -113,6 +114,10 @@ pub struct MemoryStoreResult {
     /// to merge. Reported so the caller can supersede one deliberately; never automatic.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub possible_supersedes: Vec<SupersessionCandidate>,
+    /// `related_to`/`supersedes` ids that named a memory a dedup merge had since
+    /// consumed, redirected to its survivor.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub redirected_links: Vec<Redirect>,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +365,33 @@ impl ToolHandler {
             .parse()
             .map_err(|_| MemoryError::InvalidType(input.memory_type.clone()))?;
 
+        // Resolve every related_to/supersedes id before anything is written. A dedup
+        // merge between when the caller last saw an id and this call does not make the
+        // id garbage — it names a memory that moved to its survivor — and resolving it
+        // here is what keeps that case from failing with a foreign key error against a
+        // memory that was already committed.
+        let mut redirected_links: Vec<Redirect> = Vec::new();
+        let related_to: Vec<String> = input
+            .related_to
+            .iter()
+            .map(|raw_id| {
+                let (resolved, redirect) =
+                    resolve_link_target(&self.db, &project, raw_id, "related_to")?;
+                redirected_links.extend(redirect);
+                Ok(resolved)
+            })
+            .collect::<Result<_, MemoryError>>()?;
+        let supersedes: Vec<String> = input
+            .supersedes
+            .iter()
+            .map(|raw_id| {
+                let (resolved, redirect) =
+                    resolve_link_target(&self.db, &project, raw_id, "supersedes")?;
+                redirected_links.extend(redirect);
+                Ok(resolved)
+            })
+            .collect::<Result<_, MemoryError>>()?;
+
         let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
         let now = chrono::Utc::now().timestamp();
 
@@ -417,11 +449,12 @@ impl ToolHandler {
         // Pass None for embedding_service to skip dedup for handoffs.
         let dedup_thr = dedup_threshold();
         // Memories the caller has explicitly tied to this one are distinct from it by
-        // assertion, so dedup must not collapse them together.
-        let dedup_exempt: HashSet<String> = input
-            .related_to
+        // assertion, so dedup must not collapse them together. Exempt the resolved ids:
+        // a merged-away id's survivor is the one that would actually be a dedup
+        // candidate.
+        let dedup_exempt: HashSet<String> = related_to
             .iter()
-            .chain(input.supersedes.iter())
+            .chain(supersedes.iter())
             .cloned()
             .collect();
         let outcome = if memory_type != MemoryType::Handoff {
@@ -470,7 +503,7 @@ impl ToolHandler {
         };
 
         // Create relationships to related memories
-        for related_id in input.related_to {
+        for related_id in related_to {
             let rel = Relationship {
                 id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
                 source_id: final_id.clone(),
@@ -483,12 +516,10 @@ impl ToolHandler {
         }
 
         // Record what this memory replaces. The edge is the only record of supersession;
-        // retrieval reads it to redirect the superseded memory's matches here.
+        // retrieval reads it to redirect the superseded memory's matches here. Ids were
+        // already resolved and validated above.
         let mut superseded: Vec<String> = Vec::new();
-        for old_id in &input.supersedes {
-            if self.db.get_memory(old_id)?.is_none() {
-                return Err(MemoryError::NotFound(old_id.clone()));
-            }
+        for old_id in &supersedes {
             let rel = Relationship {
                 id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
                 source_id: final_id.clone(),
@@ -552,6 +583,7 @@ impl ToolHandler {
             merge_info,
             superseded,
             possible_supersedes,
+            redirected_links,
         }))
     }
 
@@ -1145,25 +1177,26 @@ impl ToolHandler {
 
     fn memory_link(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryLinkInput = parse_args("memory_link", arguments)?;
-        self.resolve_project(input.project.as_deref())?;
+        let project = self.resolve_project(input.project.as_deref())?;
 
         let relation_type: RelationType = input
             .relation
             .parse()
             .map_err(|_| MemoryError::InvalidRelation(input.relation.clone()))?;
 
-        // Verify both memories exist
-        self.db
-            .get_memory(&input.source_id)?
-            .ok_or_else(|| MemoryError::NotFound(input.source_id.clone()))?;
-        self.db
-            .get_memory(&input.target_id)?
-            .ok_or_else(|| MemoryError::NotFound(input.target_id.clone()))?;
+        // Resolve both ends before creating the edge: a merged-away id still names a
+        // memory, just one that moved to its survivor.
+        let (source_id, source_redirect) =
+            resolve_link_target(&self.db, &project, &input.source_id, "source_id")?;
+        let (target_id, target_redirect) =
+            resolve_link_target(&self.db, &project, &input.target_id, "target_id")?;
+        let redirected_links: Vec<Redirect> =
+            source_redirect.into_iter().chain(target_redirect).collect();
 
         let rel = Relationship {
             id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
-            source_id: input.source_id,
-            target_id: input.target_id,
+            source_id,
+            target_id,
             relation_type,
             strength: input.strength.clamp(0.0, 1.0),
             created_at: chrono::Utc::now().timestamp(),
@@ -1171,7 +1204,12 @@ impl ToolHandler {
 
         self.db.create_relationship(&rel)?;
 
-        Ok(json!({"success": true, "id": rel.id, "message": "Relationship created successfully"}))
+        let mut result =
+            json!({"success": true, "id": rel.id, "message": "Relationship created successfully"});
+        if !redirected_links.is_empty() {
+            result["redirected_links"] = json!(redirected_links);
+        }
+        Ok(result)
     }
 
     fn memory_graph(&self, arguments: Value) -> Result<Value, MemoryError> {
@@ -1309,6 +1347,10 @@ impl ToolHandler {
         let mut memories: Vec<Memory> = Vec::new();
         let mut embeddings: Vec<(String, Vec<f32>, String)> = Vec::new();
         let mut ids: Vec<String> = Vec::new();
+        // (owner id, resolved related_to ids, resolved supersedes ids), applied once every
+        // memory in the batch has stored successfully.
+        let mut link_specs: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+        let mut redirected_links: Vec<Redirect> = Vec::new();
 
         // Prepare all memories and embeddings
         let mut contents: Vec<String> = Vec::new();
@@ -1330,6 +1372,31 @@ impl ToolHandler {
                 .map_err(|_| MemoryError::InvalidType(mem_input.memory_type.clone()))?;
 
             let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+
+            // Resolve related_to/supersedes ids before anything is written, same as
+            // memory_store: a dedup merge can consume an id between when the caller last
+            // saw it and this call, and the id still names real content.
+            let related_to: Vec<String> = mem_input
+                .related_to
+                .iter()
+                .map(|raw_id| {
+                    let (resolved, redirect) =
+                        resolve_link_target(&self.db, &project, raw_id, "related_to")?;
+                    redirected_links.extend(redirect);
+                    Ok(resolved)
+                })
+                .collect::<Result<_, MemoryError>>()?;
+            let supersedes: Vec<String> = mem_input
+                .supersedes
+                .iter()
+                .map(|raw_id| {
+                    let (resolved, redirect) =
+                        resolve_link_target(&self.db, &project, raw_id, "supersedes")?;
+                    redirected_links.extend(redirect);
+                    Ok(resolved)
+                })
+                .collect::<Result<_, MemoryError>>()?;
+            link_specs.push((id.clone(), related_to, supersedes));
 
             // Auto-generate summary if needed
             let summary = if should_auto_summarize(&mem_input.content, mem_input.summary.as_deref())
@@ -1384,6 +1451,31 @@ impl ToolHandler {
         let stored = self.db.store_memories_batch(&memories)?;
         self.db.store_embeddings_batch(&embeddings)?;
 
+        // Create related_to/supersedes edges now that every memory in the batch exists,
+        // using the ids resolved before the batch was stored.
+        for (owner_id, related_to, supersedes) in &link_specs {
+            for related_id in related_to {
+                self.db.create_relationship(&Relationship {
+                    id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
+                    source_id: owner_id.clone(),
+                    target_id: related_id.clone(),
+                    relation_type: RelationType::RelatesTo,
+                    strength: 1.0,
+                    created_at: now,
+                })?;
+            }
+            for old_id in supersedes {
+                self.db.create_relationship(&Relationship {
+                    id: format!("rel_{}", uuid::Uuid::new_v4().simple()),
+                    source_id: owner_id.clone(),
+                    target_id: old_id.clone(),
+                    relation_type: RelationType::Supersedes,
+                    strength: 1.0,
+                    created_at: now,
+                })?;
+            }
+        }
+
         // Assign each new memory to a cluster
         for (i, mem) in memories.iter().enumerate() {
             let _ = self.assign_to_cluster(
@@ -1401,13 +1493,17 @@ impl ToolHandler {
             self.refresh_relevance(&project);
         }
 
-        Ok(json!({
+        let mut result = json!({
             "success": true,
             "count": stored,
             "project": project,
             "ids": ids,
             "message": format!("{} memories stored successfully", stored)
-        }))
+        });
+        if !redirected_links.is_empty() {
+            result["redirected_links"] = json!(redirected_links);
+        }
+        Ok(result)
     }
 
     fn memory_delete_batch(&self, arguments: Value) -> Result<Value, MemoryError> {
