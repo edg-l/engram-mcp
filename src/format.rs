@@ -309,21 +309,26 @@ fn format_memory_content_with_db(memory: &Memory, db: &Database, max_len: usize)
     }
 }
 
-/// Format handoff memory content from raw JSON fields, without a full `Memory` struct.
+/// Format handoff or ADR memory content from raw JSON fields, without a full `Memory`
+/// struct.
 ///
 /// Used by JSON-based formatters when a `Database` is available to load the sidecar.
-/// Builds a minimal `Memory` and delegates to `format_memory_content_with_db`.
+/// Builds a minimal `Memory` and delegates to `format_memory_content_with_db`, which for
+/// an ADR reads the number and status from `adr_sections` rather than trusting whatever
+/// heading is baked into `content` — the sidecar is renumbered on merge, `content` is not.
 fn format_memory_content_from_json_with_db(
     id: &str,
     content: &str,
+    mem_type: &str,
     importance: f64,
     max_len: usize,
     db: &Database,
 ) -> String {
+    let memory_type = mem_type.parse().unwrap_or(crate::memory::MemoryType::Fact);
     let memory = Memory {
         id: id.to_string(),
         project_id: String::new(),
-        memory_type: crate::memory::MemoryType::Handoff,
+        memory_type,
         content: content.to_string(),
         summary: None,
         tags: vec![],
@@ -372,7 +377,7 @@ pub fn compact_tool_result(tool_name: &str, result: &Value, content_length: usiz
         "memory_update" => compact_update(result, content_length),
         "memory_delete" => compact_delete(result, content_length),
         "memory_delete_batch" => compact_delete_batch(result, content_length),
-        "memory_list" => compact_list(result),
+        "memory_list" => compact_list(result, None),
         "memory_trash" => compact_trash(result),
         "handoff_resume" => compact_handoff_resume(result),
         "todo_write" => compact_todo_write(result),
@@ -405,7 +410,7 @@ pub fn compact_tool_result_with_db(
         "memory_update" => compact_update(result, content_length),
         "memory_delete" => compact_delete(result, content_length),
         "memory_delete_batch" => compact_delete_batch(result, content_length),
-        "memory_list" => compact_list(result),
+        "memory_list" => compact_list(result, Some(db)),
         "memory_trash" => compact_trash(result),
         "handoff_resume" => compact_handoff_resume(result),
         "todo_write" => compact_todo_write(result),
@@ -538,10 +543,18 @@ fn compact_query(result: &Value, content_length: usize, db: Option<&Database>) -
                 .unwrap_or("");
             out.push_str(&format!("replaces {}: {}\n", superseded_id, preview));
         }
-        // Section-aware rendering for handoffs via DB sidecar; plain content for other types.
-        let formatted_content = if mem_type == "handoff" {
+        // Section-aware rendering for handoffs and ADRs via DB sidecar; plain content
+        // for other types.
+        let formatted_content = if matches!(mem_type, "handoff" | "adr") {
             if let Some(db) = db {
-                format_memory_content_from_json_with_db(id, content, importance, content_length, db)
+                format_memory_content_from_json_with_db(
+                    id,
+                    content,
+                    mem_type,
+                    importance,
+                    content_length,
+                    db,
+                )
             } else {
                 truncate_str(content, content_length)
             }
@@ -613,10 +626,18 @@ fn compact_context(result: &Value, content_length: usize, db: Option<&Database>)
                 .unwrap_or("?");
             out.push_str(&format!("replaces {}\n", superseded_id));
         }
-        // Section-aware rendering for handoffs via DB sidecar; plain content for other types.
-        let formatted_content = if mem_type == "handoff" {
+        // Section-aware rendering for handoffs and ADRs via DB sidecar; plain content
+        // for other types.
+        let formatted_content = if matches!(mem_type, "handoff" | "adr") {
             if let Some(db) = db {
-                format_memory_content_from_json_with_db(id, content, importance, content_length, db)
+                format_memory_content_from_json_with_db(
+                    id,
+                    content,
+                    mem_type,
+                    importance,
+                    content_length,
+                    db,
+                )
             } else {
                 truncate_str(content, content_length)
             }
@@ -901,7 +922,7 @@ fn compact_delete_batch(result: &Value, content_length: usize) -> String {
     out
 }
 
-fn compact_list(result: &Value) -> String {
+fn compact_list(result: &Value, db: Option<&Database>) -> String {
     let Some(rows) = result.get("memories").and_then(|v| v.as_array()) else {
         return "No memories.".to_string();
     };
@@ -920,10 +941,32 @@ fn compact_list(result: &Value) -> String {
         let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let mem_type = row.get("type").and_then(|v| v.as_str()).unwrap_or("?");
         let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let importance = row
+            .get("importance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let relevance = row
             .get("relevance_score")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
+        // The row's `content` is already truncated server-side; an ADR is re-rendered
+        // from its sidecar rather than trusting the heading baked into that content,
+        // which is stale once the ADR has been renumbered by a project merge.
+        let content = if mem_type == "adr"
+            && let Some(db) = db
+        {
+            format_memory_content_from_json_with_db(
+                id,
+                content,
+                mem_type,
+                importance,
+                content.chars().count(),
+                db,
+            )
+        } else {
+            content.to_string()
+        };
+        let content = content.as_str();
 
         let mut marks = String::new();
         if row.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -1942,5 +1985,145 @@ mod tests {
             "got: {out}"
         );
         assert!(out.contains("Recoverable in trash: 4"), "got: {out}");
+    }
+
+    /// A renumbered ADR (project merge, or an import collision — see CLAUDE.md
+    /// **ADRs**/**Sync**) keeps its original number baked into `memories.content`'s
+    /// `# N. Title` heading; only `adr_sections.adr_number` changes. Every text render
+    /// of an ADR must show the current sidecar number, not the stale one in `content`.
+    fn renumbered_adr(project_a: &str, project_b: &str) -> (Database, String, i64) {
+        use crate::embedding::EmbeddingService;
+        use crate::memory::AdrSections;
+
+        let db = Database::open_in_memory().unwrap();
+        db.get_or_create_project(project_a, project_a).unwrap();
+        db.get_or_create_project(project_b, project_b).unwrap();
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let sections = AdrSections {
+            title: "Use SQLite".to_string(),
+            context: "Some context".to_string(),
+            decision: "The decision".to_string(),
+            consequences: "Some consequences".to_string(),
+        };
+        let combined = format!(
+            "{}\n{}\n{}\n{}",
+            sections.title, sections.context, sections.decision, sections.consequences
+        );
+        let vec_a = embedding
+            .embed_memory(crate::memory::MemoryType::Adr, &combined)
+            .unwrap();
+        let vec_b = vec_a.clone();
+        let now = chrono::Utc::now().timestamp();
+
+        // Both projects own an ADR, so merging renumbers past #1 in each — this is
+        // what `merge_projects_in` does on a real `projects merge` or reconciliation.
+        db.store_adr_atomic(
+            "mem_other_adr",
+            project_a,
+            &sections,
+            crate::memory::AdrStatus::Proposed,
+            0.7,
+            true,
+            &vec_a,
+            embedding.model_version(),
+            now,
+            None,
+        )
+        .unwrap();
+        db.store_adr_atomic(
+            "mem_target_adr",
+            project_b,
+            &sections,
+            crate::memory::AdrStatus::Proposed,
+            0.7,
+            true,
+            &vec_b,
+            embedding.model_version(),
+            now + 1,
+            None,
+        )
+        .unwrap();
+        db.merge_project(project_a, project_b, true).unwrap();
+
+        let (number, _, _) = db.get_adr_sections("mem_target_adr").unwrap().unwrap();
+        assert_eq!(number, 2, "the later ADR must have been renumbered");
+        let content = db.get_memory("mem_target_adr").unwrap().unwrap().content;
+        assert!(
+            content.starts_with("# 0001. "),
+            "the stored heading must still say the pre-merge number: {content}"
+        );
+        (db, content, number as i64)
+    }
+
+    #[test]
+    fn compact_query_renders_adr_number_from_sidecar_not_stale_content() {
+        let (db, content, number) = renumbered_adr("query-a", "query-b");
+        let result = json!({
+            "memories": [{
+                "memory": {
+                    "id": "mem_target_adr",
+                    "memory_type": "adr",
+                    "content": content,
+                    "importance": 0.7,
+                    "tags": [],
+                },
+                "score": 0.9,
+            }]
+        });
+        let out = compact_query(&result, 500, Some(&db));
+        assert!(
+            out.contains(&format!("[adr-{number:04}")),
+            "expected the sidecar number in output: {out}"
+        );
+        assert!(!out.contains("[adr-0001"), "got stale number: {out}");
+    }
+
+    #[test]
+    fn compact_context_renders_adr_number_from_sidecar_not_stale_content() {
+        let (db, content, number) = renumbered_adr("ctx-a", "ctx-b");
+        let result = json!({
+            "memories": [{
+                "id": "mem_target_adr",
+                "type": "adr",
+                "content": content,
+                "importance": 0.7,
+                "tags": [],
+                "similarity": 0.9,
+            }]
+        });
+        let out = compact_context(&result, 500, Some(&db));
+        assert!(
+            out.contains(&format!("[adr-{number:04}")),
+            "expected the sidecar number in output: {out}"
+        );
+        assert!(!out.contains("[adr-0001"), "got stale number: {out}");
+    }
+
+    #[test]
+    fn compact_list_renders_adr_number_from_sidecar_not_stale_content() {
+        let (db, content, number) = renumbered_adr("list-a", "list-b");
+        let result = json!({
+            "status": "live",
+            "total": 1,
+            "memories": [{
+                "id": "mem_target_adr",
+                "type": "adr",
+                "content": content,
+                "importance": 0.7,
+                "relevance_score": 1.0,
+            }]
+        });
+        let out = compact_list(&result, Some(&db));
+        assert!(
+            out.contains(&format!("[adr-{number:04}")),
+            "expected the sidecar number in output: {out}"
+        );
+        assert!(!out.contains("[adr-0001"), "got stale number: {out}");
+
+        // Without a `Database`, there is nothing to re-render from, so the caller
+        // still gets the (possibly stale) raw content rather than an empty result.
+        let out_no_db = compact_list(&result, None);
+        assert!(out_no_db.contains(&content), "got: {out_no_db}");
     }
 }

@@ -205,6 +205,67 @@ fn projects_merge_dry_run_then_confirm() {
     assert!(itself.stderr.contains("into itself"), "{}", itself.stderr);
 }
 
+/// `engram-cli -p <id>` (an explicit override, resolved through
+/// `Database::resolve_known_project` the same way MCP's `project` argument is).
+fn run_explicit(db: &Path, cwd: &Path, id: &str, args: &[&str]) -> Run {
+    let mut full_args = vec!["-p", id];
+    full_args.extend_from_slice(args);
+    run(db, cwd, None, &full_args)
+}
+
+/// An explicit `-p <merged-away id>` write must land in the survivor instead of
+/// recreating the dead project under its old id — the same resolution MCP's
+/// `project` argument goes through.
+#[test]
+fn writing_to_a_merged_away_project_lands_in_the_survivor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let cwd = dir.path();
+    ok(run_explicit(
+        &db,
+        cwd,
+        "old",
+        &["store", "Old fact", "-t", "fact"],
+    ));
+    ok(run_explicit(
+        &db,
+        cwd,
+        "new",
+        &["store", "New fact", "-t", "fact"],
+    ));
+    ok(run_explicit(
+        &db,
+        cwd,
+        "new",
+        &["projects", "merge", "old", "new", "--confirm"],
+    ));
+    assert_eq!(count_of(&projects(&db, cwd), "old"), None);
+
+    // Still naming the merged-away id: must resolve to "new", not recreate "old".
+    // Content is deliberately unrelated to the earlier facts so semantic dedup
+    // cannot merge it into one of them and mask what this test checks.
+    let after_merge = ok(run_explicit(
+        &db,
+        cwd,
+        "old",
+        &[
+            "store",
+            "Zebras migrate across the savanna every dry season",
+            "-t",
+            "fact",
+        ],
+    ));
+    assert!(
+        after_merge.stdout.contains("Memory stored"),
+        "expected a plain store, not a dedup merge: {}",
+        after_merge.stdout
+    );
+
+    let after = projects(&db, cwd);
+    assert_eq!(count_of(&after, "old"), None, "{after:?}");
+    assert_eq!(count_of(&after, "new"), Some(3), "{after:?}");
+}
+
 #[test]
 fn import_of_a_merged_away_project_lands_in_the_survivor() {
     let dir = tempfile::tempdir().unwrap();
@@ -298,4 +359,153 @@ fn import_of_a_merged_away_project_lands_in_the_survivor() {
         .collect();
     numbers.sort_unstable();
     assert_eq!(numbers, vec![1, 2, 3]);
+}
+
+/// Two machines that never merged anything can still independently create an ADR
+/// numbered 1 in what is, to both of them, the same project. Importing one's export
+/// into the other must renumber the incoming ADR rather than drop it — the same
+/// next-free-number handling a redirected (merged-away) row already gets.
+#[test]
+fn import_renumbers_an_adr_number_collision_with_no_merge_involved() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    let adr = |db: &Path, project: &str, title: &str| {
+        ok(run(
+            db,
+            cwd,
+            Some(project),
+            &[
+                "adr",
+                "create",
+                "--non-interactive",
+                "--title",
+                title,
+                "--decision",
+                "Decided",
+            ],
+        ))
+    };
+
+    let source = dir.path().join("source.db");
+    adr(&source, "shared", "Source ADR");
+    let payload = dir.path().join("payload.json");
+    ok(run(
+        &source,
+        cwd,
+        Some("shared"),
+        &["export", "--embeddings", "-o", payload.to_str().unwrap()],
+    ));
+
+    let local = dir.path().join("local.db");
+    adr(&local, "shared", "Local ADR");
+
+    let imported = ok(run(
+        &local,
+        cwd,
+        Some("shared"),
+        &["import", payload.to_str().unwrap()],
+    ));
+    assert!(
+        !imported.stderr.contains("skipping imported ADR"),
+        "{}",
+        imported.stderr
+    );
+
+    let adrs = ok(run(&local, cwd, Some("shared"), &["--json", "adr", "list"]));
+    let value: serde_json::Value = serde_json::from_str(&adrs.stdout).unwrap();
+    let mut by_number: Vec<(u64, String)> = value["adrs"]
+        .as_array()
+        .expect("adrs array")
+        .iter()
+        .map(|a| {
+            (
+                a["number"].as_u64().unwrap(),
+                a["title"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    by_number.sort_by_key(|(n, _)| *n);
+    assert_eq!(
+        by_number,
+        vec![(1, "Local ADR".to_string()), (2, "Source ADR".to_string()),]
+    );
+}
+
+/// Renumbering a collision only applies to a brand-new ADR. Re-importing a later
+/// export of an ADR the target already holds (same memory id) is an update, and must
+/// take the normal last-write-wins path — keeping its number — never the collision
+/// renumbering, even though the peer's own copy is sitting at that same number.
+#[test]
+fn import_of_an_existing_adr_takes_the_lww_path_not_the_renumber_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+
+    let source = dir.path().join("source.db");
+    ok(run(
+        &source,
+        cwd,
+        Some("shared"),
+        &[
+            "adr",
+            "create",
+            "--non-interactive",
+            "--title",
+            "Shared ADR",
+            "--decision",
+            "Decided",
+        ],
+    ));
+    let export_at = |db: &Path, payload: &Path| {
+        ok(run(
+            db,
+            cwd,
+            Some("shared"),
+            &["export", "--embeddings", "-o", payload.to_str().unwrap()],
+        ))
+    };
+
+    // First import: brand new to the peer, created under the same number 1.
+    let payload_1 = dir.path().join("payload_1.json");
+    export_at(&source, &payload_1);
+    let peer = dir.path().join("peer.db");
+    ok(run(
+        &peer,
+        cwd,
+        Some("shared"),
+        &["import", payload_1.to_str().unwrap()],
+    ));
+
+    // A later edit on the source, then a second export/import of the *same* memory id.
+    // `updated_at` has one-second resolution, so force it past the create's timestamp —
+    // otherwise a tie keeps the peer's copy (LWW: ties keep local) and this would test
+    // nothing.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    ok(run(
+        &source,
+        cwd,
+        Some("shared"),
+        &["adr", "update-status", "1", "accepted"],
+    ));
+    let payload_2 = dir.path().join("payload_2.json");
+    export_at(&source, &payload_2);
+    let imported = ok(run(
+        &peer,
+        cwd,
+        Some("shared"),
+        &["import", payload_2.to_str().unwrap()],
+    ));
+    assert!(
+        !imported.stderr.contains("skipping imported ADR"),
+        "{}",
+        imported.stderr
+    );
+    // Proves the LWW-update branch ran (`is_update`), not a fresh insert — the
+    // collision/renumber branch this test guards against is `!is_update`-only.
+    assert!(imported.stdout.contains("1 updated"), "{}", imported.stdout);
+
+    let adrs = ok(run(&peer, cwd, Some("shared"), &["--json", "adr", "list"]));
+    let value: serde_json::Value = serde_json::from_str(&adrs.stdout).unwrap();
+    let rows = value["adrs"].as_array().expect("adrs array");
+    assert_eq!(rows.len(), 1, "the update must not create a second ADR");
+    assert_eq!(rows[0]["number"].as_u64(), Some(1));
 }

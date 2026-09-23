@@ -2128,28 +2128,25 @@ fn import_export_data(
         };
 
         // For ADR memories with a known number, pre-check the number BEFORE storing
-        // the memory row.  If the number is already taken, skip the entire memory
-        // (memory row + embedding + sidecar) to keep them consistent. Only applies to
-        // brand-new ADRs; an existing ADR being updated already owns its number.
+        // the memory row. Only applies to brand-new ADRs; an existing ADR being updated
+        // (`is_update`) already owns its number and is left alone.
+        //
+        // A collision here is always against a *different* memory: `is_update` is false,
+        // so this memory's own id was not found locally, meaning whatever already holds
+        // this number belongs to someone else. That happens two ways — an ADR redirected
+        // into a merge survivor was numbered in the merged-away project's sequence, which
+        // the survivor has already renumbered past (`alias_target.is_some()`); or two
+        // machines independently created an ADR with the same number in a project neither
+        // side ever merged. Either way the incoming number carries no meaning in the
+        // target project, so the row takes the next free one rather than being dropped —
+        // ADR numbers are a per-machine display convenience, not a synced identity.
         let mut adr_number = adr_number;
         if !is_update
             && memory.memory_type == MemoryType::Adr
             && let Some(num) = adr_number
             && db.get_adr_by_number(&target_project_id, num)?.is_some()
         {
-            // An ADR redirected into a merge survivor was numbered in the merged-away
-            // project's sequence, which the survivor has already renumbered past; its
-            // number carries no meaning here, so it takes the next free one.
-            if alias_target.is_some() {
-                adr_number = Some(db.next_adr_number(&target_project_id)?);
-            } else {
-                skipped += 1;
-                eprintln!(
-                    "Warning: skipping imported ADR {} — number {} already exists in project",
-                    memory.id, num
-                );
-                continue;
-            }
+            adr_number = Some(db.next_adr_number(&target_project_id)?);
         }
 
         if is_update {

@@ -1608,6 +1608,92 @@ fn resolve_known_project_no_match_returns_none() {
     );
 }
 
+#[test]
+fn resolve_known_project_follows_alias_to_survivor() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("old", "old").unwrap();
+    db.get_or_create_project("new", "new").unwrap();
+
+    db.merge_project("old", "new", true).unwrap();
+
+    // The merged-away id has no `projects` row and no memories left, so without
+    // alias resolution this would fall through to `Ok(None)` (or, for a write path
+    // that treats `None` as "create it"), recreating the dead project.
+    assert!(!db.project_exists("old").unwrap());
+    assert_eq!(
+        db.resolve_known_project("old", None).unwrap().as_deref(),
+        Some("new")
+    );
+}
+
+#[test]
+fn resolve_known_project_alias_resolution_beats_fuzzy_matching() {
+    let db = Database::open_in_memory().unwrap();
+    // A project whose last path segment happens to equal the merged-away id.
+    db.get_or_create_project("git:example.com/someone/old", "old")
+        .unwrap();
+    db.get_or_create_project("old", "old").unwrap();
+    db.get_or_create_project("new", "new").unwrap();
+
+    db.merge_project("old", "new", true).unwrap();
+
+    // Without alias-first resolution this would be ambiguous (or silently pick the
+    // fuzzy match) instead of following the exact alias to its real survivor.
+    assert_eq!(
+        db.resolve_known_project("old", None).unwrap().as_deref(),
+        Some("new")
+    );
+}
+
+#[test]
+fn resolve_known_project_follows_alias_chain() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("c", "c").unwrap();
+    let now = chrono::Utc::now().timestamp();
+    // Insert a two-hop chain directly: `merge_projects_in` always collapses an
+    // existing alias to the new target at merge time, so a live chain longer than
+    // one hop is not otherwise reachable through the public API.
+    let conn = db.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO project_aliases (alias, project_id, merged_at) VALUES ('a', 'b', ?1)",
+        params![now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO project_aliases (alias, project_id, merged_at) VALUES ('b', 'c', ?1)",
+        params![now],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        db.resolve_known_project("a", None).unwrap().as_deref(),
+        Some("c")
+    );
+}
+
+#[test]
+fn resolve_known_project_alias_cycle_does_not_hang() {
+    let db = Database::open_in_memory().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let conn = db.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO project_aliases (alias, project_id, merged_at) VALUES ('a', 'b', ?1)",
+        params![now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO project_aliases (alias, project_id, merged_at) VALUES ('b', 'a', ?1)",
+        params![now],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Corrupt data with no sane target; must terminate rather than loop, and must
+    // not be mistaken for a valid resolution.
+    assert_eq!(db.resolve_known_project("a", None).unwrap(), None);
+}
+
 // ---- Project merge and directory reconciliation ----
 
 fn store_fact(db: &Database, id: &str, project_id: &str) {

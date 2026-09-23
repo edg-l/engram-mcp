@@ -126,7 +126,13 @@ impl Database {
     /// the store so a server whose own project has no rows yet still recognizes
     /// its own id.
     ///
-    /// Exact id (or `current`) resolves immediately. Otherwise `requested` is
+    /// An exact `project_aliases` match (a merged-away id) resolves to its surviving
+    /// target first, ahead of everything else: the alias's own `projects` row and
+    /// memories are gone, so a caller still naming it would otherwise fall through to
+    /// the fuzzy matches below, or a write path would recreate it under the dead id and
+    /// re-split what the merge joined.
+    ///
+    /// Otherwise, exact id (or `current`) resolves immediately. Otherwise `requested` is
     /// expanded: an absolute legacy path is re-derived through
     /// [`portable_id_from_legacy`] and matched exactly, or `requested` is
     /// matched case-insensitively against each known id's last `/` segment
@@ -141,6 +147,10 @@ impl Database {
         requested: &str,
         current: Option<&str>,
     ) -> Result<Option<String>, MemoryError> {
+        if let Some(target) = self.resolve_alias(requested)? {
+            return Ok(Some(target));
+        }
+
         if Some(requested) == current || self.project_exists(requested)? {
             return Ok(Some(requested.to_string()));
         }
@@ -167,6 +177,39 @@ impl Database {
                 requested: requested.to_string(),
                 known: candidates.join(", "),
             }),
+        }
+    }
+
+    /// Follow `project_aliases` from `id` to its current surviving project, or `None`
+    /// if `id` is not an alias. Chains are followed (a merge target can itself later be
+    /// merged away) with a cycle guard, even though `merge_projects_in` repoints every
+    /// existing alias to the new target at merge time, so a live chain longer than one
+    /// hop should not occur in practice.
+    fn resolve_alias(&self, id: &str) -> Result<Option<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut current = id.to_string();
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                // A cycle means the alias data is corrupt; there is no sane target.
+                return Ok(None);
+            }
+            let next: Option<String> = conn
+                .query_row(
+                    "SELECT project_id FROM project_aliases WHERE alias = ?1",
+                    params![current],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match next {
+                Some(target) => current = target,
+                None => break,
+            }
+        }
+        if current == id {
+            Ok(None)
+        } else {
+            Ok(Some(current))
         }
     }
 
