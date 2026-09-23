@@ -179,35 +179,59 @@ pub fn home_relative(path: &str) -> String {
     path.to_string()
 }
 
-/// Derive a project id for `dir`: the normalized git remote of its git root
-/// if it has one, else the git root's home-relative path, else `dir`'s own
-/// home-relative path if there is no git root at all.
-pub fn project_id_for_dir(dir: &Path) -> String {
-    if let Some(git_root) = find_git_root_from(dir) {
-        if let Some(id) = git_remote_url(&git_root).and_then(|url| normalize_remote_url(&url)) {
-            return id;
-        }
-        return home_relative(&git_root.to_string_lossy());
-    }
-    home_relative(&dir.to_string_lossy())
+/// A resolved project id, plus the directory it was derived from when it was
+/// derived rather than given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectIdentity {
+    pub id: String,
+    /// [`home_relative`] form of the git root (or of the directory itself when
+    /// there is no git root). `None` for an explicit `--project` or
+    /// `ENGRAM_PROJECT` id: those name a project, not a place, so they must
+    /// never claim a directory or trigger reconciliation against one.
+    pub root: Option<String>,
 }
 
-/// Resolve the project id for this invocation: `explicit` wins outright, else
-/// a non-empty `ENGRAM_PROJECT`, else [`project_id_for_dir`] of the current
-/// directory, else `"default"`.
-pub fn resolve_project_id(explicit: Option<String>) -> String {
+/// Derive the project identity for `dir`: the id is the normalized git remote
+/// of its git root if it has one, else the git root's home-relative path, else
+/// `dir`'s own home-relative path if there is no git root at all. The root is
+/// always recorded, since the directory outlives any one remote URL.
+pub fn project_identity_for_dir(dir: &Path) -> ProjectIdentity {
+    let git_root = find_git_root_from(dir);
+    let root = home_relative(&git_root.as_deref().unwrap_or(dir).to_string_lossy());
+    let id = git_root
+        .as_deref()
+        .and_then(git_remote_url)
+        .and_then(|url| normalize_remote_url(&url))
+        .unwrap_or_else(|| root.clone());
+    ProjectIdentity {
+        id,
+        root: Some(root),
+    }
+}
+
+/// The id part of [`project_identity_for_dir`].
+pub fn project_id_for_dir(dir: &Path) -> String {
+    project_identity_for_dir(dir).id
+}
+
+/// Resolve the project for this invocation: `explicit` wins outright, else a
+/// non-empty `ENGRAM_PROJECT`, else [`project_identity_for_dir`] of the
+/// current directory, else `"default"`. Only the directory-derived case
+/// carries a root.
+pub fn resolve_project(explicit: Option<String>) -> ProjectIdentity {
+    let named = |id: String| ProjectIdentity { id, root: None };
     if let Some(project) = explicit {
-        return project;
+        return named(project);
     }
     if let Ok(project) = env::var("ENGRAM_PROJECT")
         && !project.is_empty()
     {
-        return project;
+        return named(project);
     }
     if let Ok(cwd) = env::current_dir() {
-        return project_id_for_dir(&cwd);
+        return project_identity_for_dir(&cwd);
     }
-    "default".to_string()
+    named("default".to_string())
 }
 
 /// The last `/`-delimited segment of a project id, after stripping a leading

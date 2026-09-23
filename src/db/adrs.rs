@@ -1,15 +1,30 @@
 use std::str::FromStr;
 
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 
 use crate::error::MemoryError;
 use crate::memory::{AdrSections, AdrStatus};
 
 use super::Database;
 
+/// The number the next ADR created in `project_id` gets: one past the highest in use.
+fn next_adr_number_in(conn: &Connection, project_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(adr_number),0)+1 FROM adr_sections WHERE project_id = ?1",
+        params![project_id],
+        |r| r.get(0),
+    )
+}
+
 #[allow(dead_code)] // Used by ADR MCP tools (Phase 3)
 impl Database {
+    /// See [`next_adr_number_in`].
+    pub fn next_adr_number(&self, project_id: &str) -> Result<u32, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(next_adr_number_in(&conn, project_id)? as u32)
+    }
+
     /// Store an ADR memory, its embedding, and the `adr_sections` sidecar row atomically.
     ///
     /// Content is rendered internally from `sections`; the caller does not supply it.
@@ -40,12 +55,7 @@ impl Database {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        // Allocate the next ADR number within this project.
-        let next: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(adr_number),0)+1 FROM adr_sections WHERE project_id = ?1",
-            params![project_id],
-            |r| r.get(0),
-        )?;
+        let next = next_adr_number_in(&tx, project_id)?;
         debug_assert!(next > 0 && next <= u32::MAX as i64);
 
         // Render the canonical markdown content.

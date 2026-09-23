@@ -5,6 +5,7 @@ use rusqlite::params;
 use crate::error::MemoryError;
 
 use super::Database;
+use super::projects::merge_projects_in;
 
 impl Database {
     /// Add branch column to memories table if it doesn't exist.
@@ -415,131 +416,11 @@ impl Database {
                 };
 
                 let tx = conn.transaction()?;
-
-                // Task 2.3(a): negative-temporary ADR renumbering, grouped by the
-                // post-migration target project id. Only groups fed by more than one
-                // distinct legacy project id can collide under
-                // UNIQUE(project_id, adr_number); single-source groups are left alone so
-                // their existing numbering (and any gaps from prior deletions) survives.
-                {
-                    let mut stmt = tx.prepare(
-                        "SELECT memory_id, project_id, adr_number, created_at FROM adr_sections",
-                    )?;
-                    let rows: Vec<(String, String, i64, i64)> = stmt
-                        .query_map([], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(stmt);
-
-                    let mut groups: BTreeMap<String, Vec<(String, String, i64, i64)>> =
-                        BTreeMap::new();
-                    for (memory_id, project_id, adr_number, created_at) in rows {
-                        let target = target_of(&project_id);
-                        groups
-                            .entry(target)
-                            .or_default()
-                            .push((memory_id, project_id, adr_number, created_at));
-                    }
-
-                    for group in groups.values_mut() {
-                        let distinct_sources: BTreeSet<&String> =
-                            group.iter().map(|(_, pid, _, _)| pid).collect();
-                        if distinct_sources.len() < 2 {
-                            continue;
-                        }
-                        group.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
-                        for (k, (memory_id, _, _, _)) in group.iter().enumerate() {
-                            tx.execute(
-                                "UPDATE adr_sections SET adr_number = ?1 WHERE memory_id = ?2",
-                                params![-(k as i64 + 1), memory_id],
-                            )?;
-                        }
-                    }
-                }
-
-                // Task 2.4: rewrite `projects` wholesale rather than per-row, since a
-                // merge would otherwise collide on the primary key mid-rewrite.
-                {
-                    let mut stmt =
-                        tx.prepare("SELECT id, root_path, decay_rate, created_at FROM projects")?;
-                    let rows: Vec<(String, Option<String>, f64, i64)> = stmt
-                        .query_map([], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(stmt);
-
-                    // new_id -> (decay_rate carried from any source row, MIN(created_at))
-                    let mut merged: BTreeMap<String, (f64, i64)> = BTreeMap::new();
-                    for (id, _root_path, decay_rate, created_at) in &rows {
-                        let target = target_of(id);
-                        merged
-                            .entry(target)
-                            .and_modify(|(_, min_created)| {
-                                if *created_at < *min_created {
-                                    *min_created = *created_at;
-                                }
-                            })
-                            .or_insert((*decay_rate, *created_at));
-                    }
-
-                    tx.execute("DELETE FROM projects", [])?;
-                    for (new_id, (decay_rate, created_at)) in &merged {
-                        tx.execute(
-                            "INSERT INTO projects (id, name, root_path, decay_rate, created_at) \
-                             VALUES (?1, ?1, ?1, ?2, ?3)",
-                            params![new_id, decay_rate, created_at],
-                        )?;
-                    }
-                }
-
-                // The four sidecar tables carrying a `project_id` column.
-                for (legacy, new_id) in &map {
-                    for table in [
-                        "memories",
-                        "adr_sections",
-                        "memory_trash",
-                        "memory_clusters",
-                    ] {
-                        tx.execute(
-                            &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
-                            params![new_id, legacy],
-                        )?;
-                    }
-                }
-
-                // Task 2.3(b): final renumber pass, now keyed by the rewritten
-                // project_id. Sorting the temporary negative numbers descending recovers
-                // the original (created_at, memory_id) order, since -1 > -2 > -3 …
-                {
-                    let mut stmt = tx.prepare(
-                        "SELECT memory_id, project_id, adr_number FROM adr_sections \
-                         WHERE adr_number < 0",
-                    )?;
-                    let rows: Vec<(String, String, i64)> = stmt
-                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    drop(stmt);
-
-                    let mut groups: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
-                    for (memory_id, project_id, adr_number) in rows {
-                        groups
-                            .entry(project_id)
-                            .or_default()
-                            .push((memory_id, adr_number));
-                    }
-                    for group in groups.values_mut() {
-                        group.sort_by_key(|a| std::cmp::Reverse(a.1));
-                        for (k, (memory_id, _)) in group.iter().enumerate() {
-                            tx.execute(
-                                "UPDATE adr_sections SET adr_number = ?1 WHERE memory_id = ?2",
-                                params![k as i64 + 1, memory_id],
-                            )?;
-                        }
-                    }
-                }
-
+                merge_projects_in(&tx, &map)?;
+                // Legacy rows carried an absolute path as `name` and `root_path`. Both
+                // become the portable id; for a `~/…` id that is also its directory in
+                // the form `reconcile_project_root` matches against.
+                tx.execute("UPDATE projects SET name = id, root_path = id", [])?;
                 tx.commit()?;
 
                 conn.execute(

@@ -1607,3 +1607,275 @@ fn resolve_known_project_no_match_returns_none() {
         None
     );
 }
+
+// ---- Project merge and directory reconciliation ----
+
+fn store_fact(db: &Database, id: &str, project_id: &str) {
+    let memory = Memory {
+        id: id.to_string(),
+        project_id: project_id.to_string(),
+        memory_type: MemoryType::Fact,
+        content: format!("content of {id}"),
+        summary: None,
+        tags: vec![],
+        importance: 0.5,
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: 0,
+        updated_at: 0,
+        last_accessed_at: 0,
+        branch: None,
+        merged_from: None,
+        external_artifacts: None,
+        pinned: false,
+        global: false,
+    };
+    db.store_memory(&memory).unwrap();
+}
+
+fn project_ids(db: &Database) -> Vec<String> {
+    db.list_projects()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect()
+}
+
+fn memory_count(db: &Database, project_id: &str) -> usize {
+    db.get_project_stats(project_id).unwrap().memory_count
+}
+
+fn root_path(db: &Database, project_id: &str) -> Option<String> {
+    db.get_project(project_id)
+        .unwrap()
+        .and_then(|p| p.root_path)
+}
+
+fn store_adr_at(db: &Database, id: &str, project_id: &str, created_at: i64) -> u32 {
+    db.store_adr_atomic(
+        id,
+        project_id,
+        &make_adr_sections(id),
+        AdrStatus::Proposed,
+        0.7,
+        false,
+        &fake_embedding(),
+        "test",
+        created_at,
+        None,
+    )
+    .unwrap()
+    .1
+}
+
+fn adr_number_of(db: &Database, memory_id: &str) -> i64 {
+    let conn = db.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT adr_number FROM adr_sections WHERE memory_id = ?1",
+        params![memory_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn reconcile_merges_home_relative_id_after_remote_add() {
+    let db = Database::open_in_memory().unwrap();
+    // Before the remote existed, the repo's id was its home-relative directory.
+    db.get_or_create_project("~/dev/gardener", "~/dev/gardener")
+        .unwrap();
+    store_fact(&db, "before-remote", "~/dev/gardener");
+    let derived = "git:example.com/owner/gardener";
+    db.get_or_create_project(derived, derived).unwrap();
+    store_fact(&db, "after-remote", derived);
+
+    let report = db
+        .reconcile_project_root(derived, "~/dev/gardener")
+        .unwrap();
+
+    assert_eq!(report.merges.len(), 1);
+    assert_eq!(report.merges[0].from, "~/dev/gardener");
+    assert_eq!(report.merges[0].to, derived);
+    assert_eq!(report.merges[0].memories, 1);
+    assert!(report.merges[0].project_row);
+    assert_eq!(memory_count(&db, derived), 2);
+    assert_eq!(project_ids(&db), vec![derived.to_string()]);
+    assert_eq!(root_path(&db, derived).as_deref(), Some("~/dev/gardener"));
+    assert_eq!(
+        db.project_aliases()
+            .unwrap()
+            .get("~/dev/gardener")
+            .map(String::as_str),
+        Some(derived)
+    );
+}
+
+#[test]
+fn reconcile_merges_by_root_path_after_remote_change() {
+    let db = Database::open_in_memory().unwrap();
+    let old = "git:example.com/old-owner/repo";
+    let new = "git:example.com/new-owner/repo";
+    // The old remote's id recorded its directory the last time it was derived there.
+    db.reconcile_project_root(old, "~/dev/repo").unwrap();
+    store_fact(&db, "under-old-remote", old);
+
+    let report = db.reconcile_project_root(new, "~/dev/repo").unwrap();
+
+    assert_eq!(report.merges.len(), 1);
+    assert_eq!(report.merges[0].from, old);
+    assert_eq!(memory_count(&db, new), 1);
+    assert!(!db.project_exists(old).unwrap());
+    assert_eq!(root_path(&db, new).as_deref(), Some("~/dev/repo"));
+}
+
+#[test]
+fn reconcile_merges_project_known_only_through_memories() {
+    let db = Database::open_in_memory().unwrap();
+    store_fact(&db, "orphan", "~/dev/norow");
+    let derived = "git:example.com/owner/norow";
+
+    let report = db.reconcile_project_root(derived, "~/dev/norow").unwrap();
+
+    assert_eq!(report.merges.len(), 1);
+    assert!(!report.merges[0].project_row);
+    assert_eq!(memory_count(&db, derived), 1);
+    assert!(!db.project_exists("~/dev/norow").unwrap());
+}
+
+#[test]
+fn merge_renumbers_colliding_adrs_across_the_merged_pair() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("old", "old").unwrap();
+    db.get_or_create_project("new", "new").unwrap();
+    assert_eq!(store_adr_at(&db, "new-early", "new", 50), 1);
+    assert_eq!(store_adr_at(&db, "old-mid", "old", 100), 1);
+    assert_eq!(store_adr_at(&db, "new-late", "new", 200), 2);
+
+    let report = db.merge_project("old", "new", true).unwrap();
+
+    // Chronological across both projects; the earliest keeps its number.
+    assert_eq!(adr_number_of(&db, "new-early"), 1);
+    assert_eq!(adr_number_of(&db, "old-mid"), 2);
+    assert_eq!(adr_number_of(&db, "new-late"), 3);
+    assert_eq!(report.merges[0].adrs, 1);
+    assert_eq!(report.adrs_renumbered, 2);
+    assert_eq!(db.next_adr_number("new").unwrap(), 4);
+}
+
+#[test]
+fn reconcile_is_a_noop_when_nothing_matches() {
+    let db = Database::open_in_memory().unwrap();
+    db.reconcile_project_root("git:example.com/owner/other", "~/dev/other")
+        .unwrap();
+    store_fact(&db, "other-fact", "git:example.com/owner/other");
+    let mine = "git:example.com/owner/mine";
+
+    let first = db.reconcile_project_root(mine, "~/dev/mine").unwrap();
+    assert!(first.is_empty());
+    assert_eq!(root_path(&db, mine).as_deref(), Some("~/dev/mine"));
+    assert_eq!(memory_count(&db, "git:example.com/owner/other"), 1);
+
+    // Once the root is recorded, a repeat run reads and writes nothing.
+    let changes = |db: &Database| -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = changes(&db);
+    let second = db.reconcile_project_root(mine, "~/dev/mine").unwrap();
+    assert!(second.is_empty());
+    assert_eq!(changes(&db), before);
+}
+
+#[test]
+fn explicit_identity_never_reconciles() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("~/dev/pinned", "~/dev/pinned")
+        .unwrap();
+    store_fact(&db, "pinned-fact", "~/dev/pinned");
+
+    let explicit = crate::project::resolve_project(Some("git:example.com/owner/pinned".into()));
+    assert_eq!(explicit.root, None);
+    db.reconcile_identity(&explicit);
+
+    assert_eq!(memory_count(&db, "~/dev/pinned"), 1);
+    assert!(
+        db.get_project("git:example.com/owner/pinned")
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.project_aliases().unwrap().is_empty());
+}
+
+#[test]
+fn merge_dry_run_reports_the_same_counts_and_changes_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("old", "old").unwrap();
+    db.get_or_create_project("new", "new").unwrap();
+    store_fact(&db, "a", "old");
+    store_fact(&db, "b", "old");
+    store_fact(&db, "c", "new");
+
+    let dry = db.merge_project("old", "new", false).unwrap();
+    assert_eq!(memory_count(&db, "old"), 2);
+    assert!(db.get_project("old").unwrap().is_some());
+    assert!(db.project_aliases().unwrap().is_empty());
+
+    let applied = db.merge_project("old", "new", true).unwrap();
+    assert_eq!(dry, applied);
+    assert_eq!(memory_count(&db, "new"), 3);
+}
+
+#[test]
+fn merge_refuses_unknown_ids_and_self_merge() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("known", "known").unwrap();
+
+    assert!(matches!(
+        db.merge_project("known", "known", true),
+        Err(MemoryError::InvalidArguments { .. })
+    ));
+    assert!(matches!(
+        db.merge_project("missing", "known", true),
+        Err(MemoryError::UnknownProject { requested, .. }) if requested == "missing"
+    ));
+    assert!(matches!(
+        db.merge_project("known", "missing", true),
+        Err(MemoryError::UnknownProject { requested, .. }) if requested == "missing"
+    ));
+}
+
+#[test]
+fn merged_trash_restores_into_the_target_project() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("old", "old").unwrap();
+    db.get_or_create_project("new", "new").unwrap();
+    store_fact(&db, "deleted-before-merge", "old");
+    db.delete_memory("deleted-before-merge").unwrap();
+
+    let report = db.merge_project("old", "new", true).unwrap();
+    assert_eq!(report.merges[0].trash, 1);
+
+    let entry = db
+        .latest_trash_for_memory("deleted-before-merge")
+        .unwrap()
+        .unwrap();
+    db.restore_trash_entry(entry.trash_id).unwrap();
+    let restored = db.get_memory("deleted-before-merge").unwrap().unwrap();
+    assert_eq!(restored.project_id, "new");
+    assert!(!db.project_exists("old").unwrap());
+}
+
+#[test]
+fn merge_repoints_aliases_that_named_the_merged_away_project() {
+    let db = Database::open_in_memory().unwrap();
+    for id in ["a", "b", "c"] {
+        db.get_or_create_project(id, id).unwrap();
+    }
+    db.merge_project("a", "b", true).unwrap();
+    db.merge_project("b", "c", true).unwrap();
+
+    let aliases = db.project_aliases().unwrap();
+    assert_eq!(aliases.get("a").map(String::as_str), Some("c"));
+    assert_eq!(aliases.get("b").map(String::as_str), Some("c"));
+}

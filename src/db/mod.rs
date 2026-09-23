@@ -14,6 +14,7 @@ mod embeddings;
 mod handoffs;
 mod memories;
 mod migrations;
+mod projects;
 mod relationships;
 mod status;
 mod sync;
@@ -25,6 +26,8 @@ mod trash;
 #[allow(unused_imports)]
 pub use activity::{CLOCK_ADVANCING_STORE, SECONDS_PER_DAY, StoreDayIndex};
 pub use handoffs::encode_section_embeddings;
+#[allow(unused_imports)]
+pub use projects::{MergeReport, ProjectMerge};
 pub use status::SupersessionMap;
 // Each binary compiles these modules separately, so a re-export used by only one of them
 // reads as unused in the other.
@@ -79,6 +82,16 @@ CREATE TABLE IF NOT EXISTS projects (
     root_path TEXT,
     decay_rate REAL DEFAULT 0.01,
     created_at INTEGER NOT NULL
+);
+
+-- Project ids merged into another project, so an import still labelled with a
+-- merged-away id lands in the survivor. Part of the base schema rather than a numbered
+-- migration because migration 10's merge records into it on stores older than any
+-- migration that could create it.
+CREATE TABLE IF NOT EXISTS project_aliases (
+    alias TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    merged_at INTEGER NOT NULL
 );
 
 -- Indexes

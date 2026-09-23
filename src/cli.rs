@@ -258,8 +258,11 @@ enum Commands {
     },
     /// Show project statistics
     Stats,
-    /// List all projects in the memory store
-    Projects,
+    /// List all projects in the memory store, or merge one into another
+    Projects {
+        #[command(subcommand)]
+        cmd: Option<ProjectsCmd>,
+    },
     /// Run decay algorithm manually
     Decay,
     /// Prune low-relevance memories
@@ -517,6 +520,22 @@ enum HooksCmd {
     Status,
 }
 
+/// Subcommands for `engram-cli projects`.
+#[derive(Subcommand)]
+enum ProjectsCmd {
+    /// Merge every memory, ADR, trash entry and cluster of one project into another
+    /// (dry run by default)
+    Merge {
+        /// Project id to merge away (exact id, see `engram-cli projects`)
+        from: String,
+        /// Project id that receives everything (exact id)
+        to: String,
+        /// Apply the merge; without it, only report what would move
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
 /// Subcommands for `engram-cli adr`.
 #[derive(Subcommand)]
 enum AdrCmd {
@@ -591,7 +610,7 @@ fn supports_json(cmd: &Commands) -> bool {
         Commands::Query { .. }
         | Commands::Context { .. }
         | Commands::Stats
-        | Commands::Projects
+        | Commands::Projects { cmd: None }
         | Commands::List { .. }
         | Commands::Trash { .. }
         | Commands::Show { .. } => true,
@@ -710,7 +729,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = get_db_path(cli.database);
     let project_was_explicit = cli.project.is_some();
-    let mut project_id = project::resolve_project_id(cli.project);
+    let identity = project::resolve_project(cli.project);
+    let mut project_id = identity.id.clone();
 
     // Ensure database directory exists
     if let Some(parent) = db_path.parent() {
@@ -762,6 +782,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Covers `hook-event` too: hooks run through this binary, so every hook event is
+    // reconciled here before `hooks::dispatch` sees the id.
+    db.reconcile_identity(&identity);
     db.get_or_create_project(&project_id, &project_id)?;
 
     // Initialize embedding service once, only if needed (saves ~500ms for commands that don't need it)
@@ -958,8 +981,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Stats => {
             cmd_stats(&db, &project_id, cli.json)?;
         }
-        Commands::Projects => {
+        Commands::Projects { cmd: None } => {
             cmd_projects(&db, &project_id, cli.json)?;
+        }
+        Commands::Projects {
+            cmd: Some(ProjectsCmd::Merge { from, to, confirm }),
+        } => {
+            // Refusals (unknown id, from == to) are the expected failure here; print them
+            // as the message rather than `main`'s Debug rendering of the error.
+            if let Err(error) = cmd_projects_merge(&db, &from, &to, confirm) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
         Commands::Decay => {
             cmd_decay(&db, &project_id)?;
@@ -2027,6 +2060,10 @@ fn import_export_data(
     // once per project rather than only for the CLI's own `-p`/cwd project. Also doubles
     // as the "already ensured" set for `get_or_create_project` in all-projects mode.
     let mut touched_projects: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Projects merged away on this machine. The sending machine may not have merged them
+    // (merges are local), so its payload can still carry the old id; landing those rows
+    // under it would recreate the project the merge folded away.
+    let project_aliases = db.project_aliases()?;
 
     for exported in export_data.memories {
         let mut memory = exported.memory;
@@ -2045,10 +2082,13 @@ fn import_export_data(
         // All-projects payloads keep each memory's own project_id and ignore the CLI's
         // resolved `-p`/cwd project entirely; a single-project payload is re-homed to it,
         // matching the pre-4.4 behavior.
-        let target_project_id = if all_projects {
-            memory.project_id.clone()
-        } else {
-            project_id.to_string()
+        let alias_target = all_projects
+            .then(|| project_aliases.get(&memory.project_id))
+            .flatten();
+        let target_project_id = match alias_target {
+            Some(survivor) => survivor.clone(),
+            None if all_projects => memory.project_id.clone(),
+            None => project_id.to_string(),
         };
         memory.project_id = target_project_id.clone();
         if all_projects && touched_projects.insert(target_project_id.clone()) {
@@ -2091,17 +2131,25 @@ fn import_export_data(
         // the memory row.  If the number is already taken, skip the entire memory
         // (memory row + embedding + sidecar) to keep them consistent. Only applies to
         // brand-new ADRs; an existing ADR being updated already owns its number.
+        let mut adr_number = adr_number;
         if !is_update
             && memory.memory_type == MemoryType::Adr
             && let Some(num) = adr_number
             && db.get_adr_by_number(&target_project_id, num)?.is_some()
         {
-            skipped += 1;
-            eprintln!(
-                "Warning: skipping imported ADR {} — number {} already exists in project",
-                memory.id, num
-            );
-            continue;
+            // An ADR redirected into a merge survivor was numbered in the merged-away
+            // project's sequence, which the survivor has already renumbered past; its
+            // number carries no meaning here, so it takes the next free one.
+            if alias_target.is_some() {
+                adr_number = Some(db.next_adr_number(&target_project_id)?);
+            } else {
+                skipped += 1;
+                eprintln!(
+                    "Warning: skipping imported ADR {} — number {} already exists in project",
+                    memory.id, num
+                );
+                continue;
+            }
         }
 
         if is_update {
@@ -2556,6 +2604,36 @@ fn cmd_sync(
         db.set_push_watermark(target, new_push_wm, now)?;
     }
 
+    Ok(())
+}
+
+fn cmd_projects_merge(
+    db: &Database,
+    from: &str,
+    to: &str,
+    confirm: bool,
+) -> Result<(), MemoryError> {
+    let report = db.merge_project(from, to, confirm)?;
+    let verb = if confirm { "Merged" } else { "Would merge" };
+    println!("{verb} '{from}' into '{to}':");
+    for merge in &report.merges {
+        println!("  memories:        {}", merge.memories);
+        println!("  adr_sections:    {}", merge.adrs);
+        println!("  memory_trash:    {}", merge.trash);
+        println!("  memory_clusters: {}", merge.clusters);
+        println!(
+            "  projects row:    {}",
+            if merge.project_row {
+                "folded into the target"
+            } else {
+                "none"
+            }
+        );
+    }
+    println!("  ADRs renumbered: {}", report.adrs_renumbered);
+    if !confirm {
+        println!("\nDry run. Re-run with --confirm to apply.");
+    }
     Ok(())
 }
 

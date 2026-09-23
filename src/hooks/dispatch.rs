@@ -21,6 +21,12 @@ pub enum DispatchOutcome {
     DryRun(String),
 }
 
+/// Handle one Claude Code hook event for `project_id`.
+///
+/// `project_id` arrives already resolved and reconciled: hooks run as
+/// `engram-cli hook-event`, whose `main` calls `Database::reconcile_identity` before any
+/// command, so a hook fired in a repo whose remote changed never stores under the
+/// split-off id. Nothing here derives a project of its own.
 pub fn dispatch(
     event: HookEvent,
     raw_json: &str,

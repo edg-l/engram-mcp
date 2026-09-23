@@ -873,7 +873,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Determine project ID (from env, git remote, or current directory)
-    let project_id = project::resolve_project_id(None);
+    let identity = project::resolve_project(None);
+    let project_id = identity.id.clone();
+
+    // Reconciled once here, before the background jobs or the first tool call read the
+    // project, so a server started in a repo whose remote changed never writes under a
+    // split id.
+    match Database::open(&db_path) {
+        Ok(db) => db.reconcile_identity(&identity),
+        Err(error) => tracing::warn!("could not open the store to reconcile the project: {error}"),
+    }
 
     // Detect current git branch
     let current_branch = project::current_branch();
