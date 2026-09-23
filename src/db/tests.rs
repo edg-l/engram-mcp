@@ -306,6 +306,69 @@ fn merge_records_the_memory_that_was_actually_consumed() {
     );
 }
 
+/// Merging a composite into another memory carries the composite's provenance along, so
+/// an id it absorbed earlier still resolves to a live memory afterwards.
+#[test]
+fn merging_a_composite_carries_its_provenance_forward() {
+    let db = Database::open_in_memory().unwrap();
+    let project = crate::memory::Project {
+        id: "merge-chain".to_string(),
+        name: "merge-chain".to_string(),
+        root_path: None,
+        decay_rate: 0.01,
+        created_at: 0,
+    };
+    db.create_project(&project).unwrap();
+
+    let base = Memory {
+        id: "mem_a".to_string(),
+        project_id: "merge-chain".to_string(),
+        memory_type: MemoryType::Fact,
+        content: "A".to_string(),
+        summary: None,
+        tags: vec![],
+        importance: 0.5,
+        relevance_score: 1.0,
+        access_count: 0,
+        created_at: 0,
+        updated_at: 0,
+        last_accessed_at: 0,
+        branch: None,
+        merged_from: None,
+        external_artifacts: None,
+        pinned: false,
+        global: false,
+    };
+    for (id, content) in [("mem_a", "A"), ("mem_b", "B"), ("mem_c", "C")] {
+        db.store_memory(&Memory {
+            id: id.to_string(),
+            content: content.to_string(),
+            ..base.clone()
+        })
+        .unwrap();
+    }
+
+    db.merge_memories("mem_b", "mem_a").unwrap();
+    db.merge_memories("mem_c", "mem_b").unwrap();
+
+    let sources: Vec<String> = db
+        .get_memory("mem_c")
+        .unwrap()
+        .unwrap()
+        .merged_from
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(sources, vec!["mem_a".to_string(), "mem_b".to_string()]);
+    assert_eq!(
+        db.find_merge_survivor("merge-chain", "mem_a")
+            .unwrap()
+            .as_deref(),
+        Some("mem_c")
+    );
+}
+
 #[test]
 fn test_cluster_operations() {
     let db = Database::open_in_memory().unwrap();

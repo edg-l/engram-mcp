@@ -4,7 +4,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::decay::{ACCESS_REINFORCEMENT, RELEVANCE_CEILING};
 use crate::error::MemoryError;
-use crate::memory::{Memory, MemoryType, Project, ProjectStats, ProjectSummary};
+use crate::memory::{Memory, MemoryType, MergeSource, Project, ProjectStats, ProjectSummary};
 
 use super::Database;
 use super::util::{MEMORY_COLUMNS, map_memory_row};
@@ -782,12 +782,16 @@ impl Database {
         // Read the consumed memory's own content, tags and importance here rather than
         // accepting them from the caller, so the provenance entry always describes the
         // memory that actually went away regardless of which side of the pair survives.
-        let (consumed_content, old_tags_json, old_importance): (String, String, f64) = tx
-            .query_row(
-                "SELECT content, tags, importance FROM memories WHERE id = ?1",
-                params![consumed_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+        let (consumed_content, old_tags_json, old_importance, consumed_merged_from): (
+            String,
+            String,
+            f64,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT content, tags, importance, merged_from FROM memories WHERE id = ?1",
+            params![consumed_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
         let old_tags: Vec<String> = serde_json::from_str(&old_tags_json).unwrap_or_default();
 
         // Get the survivor's current state
@@ -811,10 +815,16 @@ impl Database {
         let max_importance = new_importance.max(old_importance);
 
         // Build merged_from provenance
-        let mut merge_sources: Vec<crate::memory::MergeSource> = existing_merged_from
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        merge_sources.push(crate::memory::MergeSource::new(
+        let parse_sources = |json: Option<String>| -> Vec<MergeSource> {
+            json.and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        };
+        // A consumed composite's own provenance moves to the survivor. Its row is about to
+        // be deleted, and `merged_from` is the only record of the ids it absorbed; leaving
+        // them behind would make those ids unresolvable and their content unrecoverable.
+        let mut merge_sources = parse_sources(existing_merged_from);
+        merge_sources.extend(parse_sources(consumed_merged_from));
+        merge_sources.push(MergeSource::new(
             consumed_id.to_string(),
             consumed_content,
             now,

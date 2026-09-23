@@ -7,15 +7,17 @@
 //! any write, is what keeps a retry after an unrelated merge from failing with a foreign
 //! key error against a memory that was already committed.
 
+use std::collections::HashSet;
+
 use serde::Serialize;
 
 use crate::db::Database;
 use crate::error::MemoryError;
 
 /// Longest merge chain followed when resolving a caller-supplied id. `merge_memories`
-/// never actually nests — a memory that has already absorbed one merge is excluded from
-/// auto-dedup as a candidate — so this is defensive rather than reachable today, matching
-/// the depth cap `db::status::SupersessionMap` applies to supersession chains.
+/// carries a consumed composite's `merged_from` into the survivor, so every absorbed id
+/// resolves in one hop; the loop still follows a chain wherever a composite was consumed
+/// without that carry-over, and the cap matches the one `db::status::SupersessionMap` applies to supersession chains.
 const MAX_MERGE_DEPTH: usize = 5;
 
 /// A caller-supplied id that resolved to a different, live one.
@@ -47,7 +49,7 @@ pub fn resolve_link_target(
     }
 
     let mut current = id.to_string();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     seen.insert(current.clone());
 
     for _ in 0..MAX_MERGE_DEPTH {
