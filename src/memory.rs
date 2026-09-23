@@ -328,10 +328,40 @@ impl HandoffSections {
 
     /// Parse canonical markdown back into `HandoffSections`.
     ///
-    /// Returns `MemoryError::InvalidType("handoff: malformed sections")` if the
-    /// content cannot be parsed (e.g. missing Summary section).
+    /// Returns `MemoryError::InvalidArguments` naming the canonical headings if the
+    /// content cannot be parsed (e.g. missing Summary section) — this is a caller
+    /// argument problem, not a type mismatch, so it must not read as one.
     pub fn parse_markdown(content: &str) -> Result<HandoffSections, MemoryError> {
-        let malformed = || MemoryError::InvalidType("handoff: malformed sections".to_string());
+        // Order mirrors `render_markdown`; only Summary is required. Building the
+        // parse-failure message from this list keeps it from drifting out of sync with
+        // what the parser below actually recognizes.
+        const CANONICAL_HEADINGS: &[&str] = &[
+            "Summary",
+            "Decisions",
+            "Todos",
+            "Blockers",
+            "Tried",
+            "Mental Model",
+            "Next Steps",
+            "Notes",
+        ];
+
+        let malformed = || {
+            let headings = CANONICAL_HEADINGS
+                .iter()
+                .map(|h| format!("## {h}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            MemoryError::InvalidArguments {
+                tool: "handoff".to_string(),
+                message: format!(
+                    "content is missing the required `## Summary` heading (or it is empty). \
+                     Canonical headings: {headings}. To update a handoff's sections without \
+                     writing markdown, pass `sections` instead of `content`."
+                ),
+                received: "content".to_string(),
+            }
+        };
 
         /// Bullet-list items, tolerating the `- [ ]` / `- [x] ` checkboxes used by Todos.
         fn bullets(body: &str) -> Vec<String> {
@@ -423,6 +453,40 @@ impl HandoffSections {
 
         Ok(out)
     }
+
+    /// Apply a partial section update: fields present in `patch` replace, fields absent
+    /// keep the value already in `self`. `continues_from` is a sidecar chain link set at
+    /// creation, not a content field, so it always carries over from `self` untouched.
+    pub fn merge_patch(&self, patch: HandoffSectionsPatch) -> HandoffSections {
+        HandoffSections {
+            summary: patch.summary.unwrap_or_else(|| self.summary.clone()),
+            decisions: patch.decisions.unwrap_or_else(|| self.decisions.clone()),
+            todos: self.todos.clone(),
+            blockers: patch.blockers.unwrap_or_else(|| self.blockers.clone()),
+            tried: patch.tried.unwrap_or_else(|| self.tried.clone()),
+            mental_model: patch
+                .mental_model
+                .unwrap_or_else(|| self.mental_model.clone()),
+            next_steps: patch.next_steps.unwrap_or_else(|| self.next_steps.clone()),
+            notes: patch.notes.or_else(|| self.notes.clone()),
+            continues_from: self.continues_from.clone(),
+        }
+    }
+}
+
+/// Partial update to a handoff's structured sections, used by `memory_update`. Every
+/// field is optional so a caller can send only what changed; an omitted field keeps the
+/// value already stored. There is no `todos` field — open work belongs in the todo list,
+/// not a handoff section, matching `handoff_create`'s rejection of the same field.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HandoffSectionsPatch {
+    pub summary: Option<String>,
+    pub decisions: Option<Vec<String>>,
+    pub blockers: Option<Vec<String>>,
+    pub tried: Option<Vec<String>>,
+    pub mental_model: Option<String>,
+    pub next_steps: Option<Vec<String>>,
+    pub notes: Option<String>,
 }
 
 /// Structured sections for a `MemoryType::Adr` memory (Nygard-style).
@@ -459,10 +523,30 @@ impl AdrSections {
     /// and `consequences`. Status, number, and date are NOT parsed; they live in
     /// the `adr_sections` sidecar table.
     ///
-    /// Returns `MemoryError::InvalidType("adr: malformed sections")` if Title or
-    /// Decision is empty.
+    /// Returns `MemoryError::InvalidArguments` naming the canonical headings if Title
+    /// or Decision is empty — a caller argument problem, not a type mismatch.
     pub fn parse_markdown(content: &str) -> Result<AdrSections, MemoryError> {
-        let malformed = || MemoryError::InvalidType("adr: malformed sections".to_string());
+        // Order mirrors `render_markdown`'s `##` sections (the title lives in the
+        // top-level `# NNNN. Title` heading, not a `##` section). Building the
+        // parse-failure message from this list keeps it from drifting out of sync with
+        // what the parser below actually recognizes.
+        const CANONICAL_HEADINGS: &[&str] = &["Status", "Context", "Decision", "Consequences"];
+
+        let malformed = || {
+            let headings = CANONICAL_HEADINGS
+                .iter()
+                .map(|h| format!("## {h}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            MemoryError::InvalidArguments {
+                tool: "adr".to_string(),
+                message: format!(
+                    "content is missing the required `# NNNN. Title` heading or a non-empty \
+                     `## Decision` section. Canonical headings: # NNNN. Title, {headings}."
+                ),
+                received: "content".to_string(),
+            }
+        };
 
         let mut title = String::new();
         let mut context = String::new();
@@ -880,10 +964,19 @@ mod tests {
     fn test_parse_markdown_missing_summary_returns_error() {
         let md = "## Decisions\n\n- Some decision\n";
         let result = HandoffSections::parse_markdown(md);
-        assert!(
-            matches!(result, Err(MemoryError::InvalidType(_))),
-            "expected InvalidType error for missing summary"
-        );
+        match result {
+            Err(MemoryError::InvalidArguments { message, .. }) => {
+                assert!(
+                    message.contains("## Summary"),
+                    "message should name the canonical heading: {message}"
+                );
+                assert!(
+                    message.contains("sections"),
+                    "message should suggest `sections`: {message}"
+                );
+            }
+            other => panic!("expected InvalidArguments for missing summary, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1017,10 +1110,15 @@ mod tests {
     fn adr_parse_missing_decision_errors() {
         let md = "# 0001. Some ADR\n\n## Status\n\nproposed\n\n## Context\n\nsome context\n";
         let result = AdrSections::parse_markdown(md);
-        assert!(
-            matches!(result, Err(MemoryError::InvalidType(_))),
-            "expected InvalidType for missing decision"
-        );
+        match result {
+            Err(MemoryError::InvalidArguments { message, .. }) => {
+                assert!(
+                    message.contains("## Decision"),
+                    "message should name the canonical heading: {message}"
+                );
+            }
+            other => panic!("expected InvalidArguments for missing decision, got {other:?}"),
+        }
     }
 
     #[test]

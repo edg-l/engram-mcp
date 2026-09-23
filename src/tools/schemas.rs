@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
-use crate::memory::HandoffSections;
+use crate::memory::{HandoffSections, HandoffSectionsPatch};
 
 // ============================================
 // ToolProfile
@@ -241,6 +241,11 @@ pub struct MemoryQueryInput {
 pub struct MemoryUpdateInput {
     pub id: String,
     pub content: Option<String>,
+    /// Handoff-only partial patch to the structured sections: fields present replace,
+    /// fields omitted keep the stored value. Mutually exclusive with `content` — both
+    /// end up rebuilding `content` and the section embeddings, so sending both would
+    /// leave it ambiguous which one wins.
+    pub sections: Option<HandoffSectionsPatch>,
     pub importance: Option<f64>,
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
@@ -719,12 +724,25 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_update",
-            "Correct or update an existing memory. Use when information has changed (e.g. a version was upgraded, a decision was revised). Only provide fields you want to change. Supports `pinned` to protect a memory from decay/pruning.",
+            "Correct or update an existing memory. Use when information has changed (e.g. a version was upgraded, a decision was revised). Only provide fields you want to change. Supports `pinned` to protect a memory from decay/pruning.\n\nFor handoffs, prefer `sections` over hand-writing `content` markdown: it patches the structured sections (fields present replace, fields omitted keep the stored value) and rebuilds content and section embeddings for you. `sections` and `content` are mutually exclusive, and `sections` is only valid on handoff memories.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Memory ID to update (from a previous query result)."},
-                    "content": {"type": "string", "description": "New content (replaces old, re-indexes for search)."},
+                    "content": {"type": "string", "description": "New content (replaces old, re-indexes for search). For handoffs, prefer `sections`."},
+                    "sections": {
+                        "type": "object",
+                        "description": "Handoff-only. Partial patch to the structured sections: fields present replace, fields omitted keep the stored value. Mutually exclusive with `content`.",
+                        "properties": {
+                            "summary": {"type": "string", "description": "Replace the summary."},
+                            "decisions": {"type": "array", "items": {"type": "string"}, "description": "Replace the decisions list."},
+                            "blockers": {"type": "array", "items": {"type": "string"}, "description": "Replace the blockers list."},
+                            "tried": {"type": "array", "items": {"type": "string"}, "description": "Replace the tried list."},
+                            "mental_model": {"type": "string", "description": "Replace the mental model."},
+                            "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Replace the next steps list."},
+                            "notes": {"type": "string", "description": "Replace the notes."}
+                        }
+                    },
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "New importance level."},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces old)."},
                     "summary": {"type": "string", "description": "New summary (replaces old)."},

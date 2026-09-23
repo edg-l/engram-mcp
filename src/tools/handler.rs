@@ -1001,16 +1001,53 @@ impl ToolHandler {
         let input: MemoryUpdateInput = parse_args("memory_update", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
 
+        // Both end up rebuilding `content` and the section embeddings, so accepting both
+        // would leave it ambiguous which one wins.
+        if input.sections.is_some() && input.content.is_some() {
+            return Err(MemoryError::InvalidArguments {
+                tool: "memory_update".to_string(),
+                message: "`sections` and `content` are mutually exclusive; send one or the \
+                          other, not both"
+                    .to_string(),
+                received: "content, sections".to_string(),
+            });
+        }
+
         let mut memory = self
             .db
             .get_memory(&input.id)?
             .ok_or_else(|| MemoryError::NotFound(input.id.clone()))?;
 
+        if input.sections.is_some() && memory.memory_type != MemoryType::Handoff {
+            return Err(MemoryError::InvalidArguments {
+                tool: "memory_update".to_string(),
+                message: format!(
+                    "`sections` is only valid on handoff memories; {} is a {}",
+                    input.id, memory.memory_type
+                ),
+                received: "sections".to_string(),
+            });
+        }
+
+        // `sections` patches the stored sidecar sections (not the possibly-unparseable
+        // `content` string) and renders the result to markdown, then joins the regular
+        // content-update path below so the sidecar and section embeddings are rebuilt the
+        // same way a direct `content` edit would rebuild them.
+        let sections_markdown = match input.sections {
+            Some(patch) => {
+                let (existing, _) = self.db.get_handoff_sections(&input.id)?.ok_or_else(|| {
+                    MemoryError::NotFound(format!("handoff sections for {}", input.id))
+                })?;
+                Some(existing.merge_patch(patch).render_markdown())
+            }
+            None => None,
+        };
+        let new_content = input.content.or(sections_markdown);
+
         // Content is replaced wholesale, not patched, so the previous version is gone the
         // moment the row is written. Snapshot it and hand it back to the caller.
         let previous = memory.clone();
-        let content_replaced = input
-            .content
+        let content_replaced = new_content
             .as_ref()
             .is_some_and(|new| *new != memory.content);
         if content_replaced {
@@ -1028,14 +1065,13 @@ impl ToolHandler {
         // All three are needed for the atomic update so they are computed together here.
         let handoff_sidecar_update: Option<(HandoffSections, Vec<f32>, Vec<Vec<f32>>)> =
             if memory.memory_type == MemoryType::Handoff {
-                if let Some(ref new_content) = input.content {
+                if let Some(ref content) = new_content {
                     // (a) Re-parse to validate; reject malformed content before touching the DB.
-                    let new_sections = HandoffSections::parse_markdown(new_content)?;
+                    let new_sections = HandoffSections::parse_markdown(content)?;
 
                     // (b) Regenerate full-content embedding.
-                    let full_embedding = self
-                        .embedding
-                        .embed_memory(MemoryType::Handoff, new_content)?;
+                    let full_embedding =
+                        self.embedding.embed_memory(MemoryType::Handoff, content)?;
 
                     // (c) Regenerate per-section embeddings via prefix-free embed.
                     let section_texts = handoff_section_key_texts(&new_sections);
@@ -1052,7 +1088,7 @@ impl ToolHandler {
                 None
             };
 
-        if let Some(ref content) = input.content {
+        if let Some(ref content) = new_content {
             memory.content = content.clone();
             // For non-Handoff types, store the embedding now (Handoff uses the atomic path below).
             if memory.memory_type != MemoryType::Handoff {
@@ -4074,7 +4110,8 @@ mod tests {
 
     /// 3B.6 test 4: handoff_update_malformed_rejects
     /// Call memory_update on a Handoff with non-parseable content.
-    /// Assert MemoryError::InvalidType, original sidecar unchanged, original content unchanged.
+    /// Assert MemoryError::InvalidArguments naming `## Summary`, original sidecar
+    /// unchanged, original content unchanged.
     #[test]
     fn handoff_update_malformed_rejects() {
         let db = Database::open_in_memory().unwrap();
@@ -4130,11 +4167,15 @@ mod tests {
         let malformed = "this is not valid handoff markdown at all !!!";
         let result = handler.memory_update(json!({"id": handoff_id, "content": malformed}));
 
-        assert!(
-            matches!(result, Err(MemoryError::InvalidType(_))),
-            "must return InvalidType for malformed content, got {:?}",
-            result
-        );
+        match result {
+            Err(MemoryError::InvalidArguments { message, .. }) => {
+                assert!(
+                    message.contains("## Summary"),
+                    "message should name the canonical heading: {message}"
+                );
+            }
+            other => panic!("expected InvalidArguments for malformed content, got {other:?}"),
+        }
 
         // Original memory content must be unchanged.
         let stored = db.get_memory(&handoff_id).unwrap().unwrap();
@@ -4157,6 +4198,277 @@ mod tests {
             orig_vecs.len(),
             "sidecar section count must be unchanged"
         );
+    }
+
+    /// `sections` on memory_update rebuilds `content` and the section embeddings the
+    /// same way a direct `content` edit does.
+    #[test]
+    fn handoff_update_sections_rebuilds_content_and_embeddings() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-sections-rebuild-proj";
+        db.get_or_create_project(project_id, "Update Sections Rebuild Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let sections = HandoffSections {
+            summary: "Original summary".to_string(),
+            decisions: vec!["Original decision".to_string()],
+            todos: vec![],
+            blockers: vec![],
+            tried: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let _ = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections,
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed");
+
+        let handoffs = db.list_recent_handoffs(project_id, 1).unwrap();
+        let handoff_id = handoffs[0].id.clone();
+
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        handler
+            .memory_update(json!({
+                "id": handoff_id,
+                "sections": {
+                    "summary": "Updated summary",
+                    "blockers": ["A new blocker"]
+                }
+            }))
+            .expect("sections update must succeed");
+
+        // Content is re-rendered markdown, not the patch object echoed back.
+        let stored = db.get_memory(&handoff_id).unwrap().unwrap();
+        assert!(stored.content.contains("Updated summary"));
+        assert!(stored.content.contains("A new blocker"));
+
+        // Sidecar and section embeddings rebuilt: 3 sections now (summary, decisions, blockers).
+        let (updated_sections, section_vecs) = db
+            .get_handoff_sections(&handoff_id)
+            .unwrap()
+            .expect("sidecar must exist");
+        assert_eq!(updated_sections.summary, "Updated summary");
+        assert_eq!(updated_sections.blockers, vec!["A new blocker"]);
+        assert_eq!(
+            section_vecs.len(),
+            3,
+            "should have 3 section embeddings after update"
+        );
+        for (_, vec) in &section_vecs {
+            assert_eq!(vec.len(), 256, "each section embedding must be 256-dim");
+        }
+    }
+
+    /// A partial `sections` patch replaces only the fields it names; every other section
+    /// keeps the value already stored.
+    #[test]
+    fn handoff_update_sections_partial_merge_keeps_untouched_sections() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-sections-merge-proj";
+        db.get_or_create_project(project_id, "Update Sections Merge Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let sections = HandoffSections {
+            summary: "Original summary".to_string(),
+            decisions: vec!["Original decision".to_string()],
+            todos: vec![],
+            blockers: vec![],
+            tried: vec![],
+            mental_model: "Original mental model".to_string(),
+            next_steps: vec!["Original next step".to_string()],
+            notes: None,
+            continues_from: None,
+        };
+        let _ = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections.clone(),
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed");
+
+        let handoffs = db.list_recent_handoffs(project_id, 1).unwrap();
+        let handoff_id = handoffs[0].id.clone();
+
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        handler
+            .memory_update(json!({
+                "id": handoff_id,
+                "sections": {"blockers": ["A new blocker"]}
+            }))
+            .expect("partial sections update must succeed");
+
+        let (updated, _) = db
+            .get_handoff_sections(&handoff_id)
+            .unwrap()
+            .expect("sidecar must exist");
+        assert_eq!(updated.blockers, vec!["A new blocker"]);
+        assert_eq!(
+            updated.summary, sections.summary,
+            "untouched summary must survive"
+        );
+        assert_eq!(
+            updated.decisions, sections.decisions,
+            "untouched decisions must survive"
+        );
+        assert_eq!(
+            updated.mental_model, sections.mental_model,
+            "untouched mental model must survive"
+        );
+        assert_eq!(
+            updated.next_steps, sections.next_steps,
+            "untouched next steps must survive"
+        );
+    }
+
+    /// `sections` and `content` both end up rebuilding the same fields, so sending both
+    /// is rejected rather than silently picking one.
+    #[test]
+    fn handoff_update_sections_and_content_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-sections-content-conflict-proj";
+        db.get_or_create_project(project_id, "Update Sections Content Conflict Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let sections = HandoffSections {
+            summary: "Original summary".to_string(),
+            decisions: vec![],
+            todos: vec![],
+            blockers: vec![],
+            tried: vec![],
+            mental_model: String::new(),
+            next_steps: vec![],
+            notes: None,
+            continues_from: None,
+        };
+        let _ = create_handoff(
+            &db,
+            &embedding,
+            project_id,
+            Some("main"),
+            sections,
+            0.85,
+            true,
+            false,
+        )
+        .expect("create must succeed");
+
+        let handoffs = db.list_recent_handoffs(project_id, 1).unwrap();
+        let handoff_id = handoffs[0].id.clone();
+
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        let result = handler.memory_update(json!({
+            "id": handoff_id,
+            "content": "some raw markdown",
+            "sections": {"summary": "New summary"}
+        }));
+
+        match result {
+            Err(MemoryError::InvalidArguments { message, .. }) => {
+                assert!(
+                    message.contains("mutually exclusive"),
+                    "message should explain the conflict: {message}"
+                );
+            }
+            other => panic!("expected InvalidArguments for sections+content, got {other:?}"),
+        }
+    }
+
+    /// `sections` only makes sense for handoffs; using it on any other memory type is
+    /// rejected rather than silently ignored.
+    #[test]
+    fn memory_update_sections_on_non_handoff_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-sections-fact-proj";
+        db.get_or_create_project(project_id, "Update Sections Fact Test")
+            .unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+
+        let now = chrono::Utc::now().timestamp();
+        let fact = Memory {
+            id: "mem_fact".to_string(),
+            project_id: project_id.to_string(),
+            memory_type: MemoryType::Fact,
+            content: "The auth service runs on port 8443.".to_string(),
+            summary: None,
+            tags: vec![],
+            importance: 0.5,
+            relevance_score: 1.0,
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            branch: None,
+            merged_from: None,
+            external_artifacts: None,
+            pinned: false,
+            global: false,
+        };
+        db.store_memory(&fact).unwrap();
+
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            Some("main".to_string()),
+            SearchMode::default(),
+        );
+
+        let result = handler.memory_update(json!({
+            "id": "mem_fact",
+            "sections": {"summary": "New summary"}
+        }));
+
+        match result {
+            Err(MemoryError::InvalidArguments { message, .. }) => {
+                assert!(
+                    message.contains("handoff"),
+                    "message should say sections is handoff-only: {message}"
+                );
+            }
+            other => panic!("expected InvalidArguments for sections on a fact, got {other:?}"),
+        }
     }
 
     // ============================================
