@@ -4,7 +4,7 @@
 
 ### Fixed
 - **Most of the server instructions never reached the agent.** Claude Code passes on only the first 4096 characters of an MCP server's instructions, and they were 10,547: guidance on other projects, supersession, deletion, handoffs, todos and ADRs was cut off unseen. The instructions are now a 2,800-character index of when to use which tool; per-tool detail moved into the tool descriptions, which arrive in full, and the long-form guidance is the `engram://guide` resource. A test keeps the instructions under the limit.
-- **Projects that own nothing no longer appear.** A project row is recorded for every directory a session or hook runs in, so `memory_projects` listed about 200 projects, half of them empty, and an empty row made a short name ambiguous: `-p ffrotation` failed because `~/dev/ffrotation` (empty) competed with `git:github.com/XivHub/ffrotation`. Listing, short names and the known-projects list in errors now count only projects with memories.
+- **Projects that own nothing no longer appear.** A project row is recorded for every directory a session or hook runs in, so `memory_projects` listed about 200 projects, half of them empty, and an empty row made a short name ambiguous: `-p payments` failed because `~/dev/payments` (empty) competed with `git:github.com/owner/payments`. Listing, short names and the known-projects list in errors now count only projects with memories.
 - **`adr_list` with no ADRs** says so instead of returning `[]`.
 
 ### Added
