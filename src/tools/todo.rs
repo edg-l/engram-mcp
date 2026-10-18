@@ -97,6 +97,10 @@ pub struct TodoOpResult {
     /// Id of the linked fact memory created from `detail`, if one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail_id: Option<String>,
+    /// Why `detail` could not be stored. The todo itself was written, so the caller
+    /// retries the detail with `edit`, not the whole op.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail_error: Option<String>,
 }
 
 /// An existing open todo similar to one being added.
@@ -340,12 +344,13 @@ fn apply_op(
                 importance,
                 detail,
             ) {
-                Ok((id, dups, detail_id)) => TodoOpResult {
+                Ok((id, dups, detail)) => TodoOpResult {
                     op: name.to_string(),
                     id,
                     error: None,
                     possible_duplicates: dups,
-                    detail_id,
+                    detail_id: detail.as_ref().ok().cloned().flatten(),
+                    detail_error: detail.err().map(|e| e.to_string()),
                 },
                 Err(e) => fail(name, String::new(), e),
             }
@@ -368,13 +373,14 @@ fn apply_op(
         TodoOp::Reopen { id } => transition(db, "reopen", id, TodoStatus::Open, None),
         TodoOp::Edit { id, text, detail } => {
             let name = "edit";
-            match edit_todo(db, embedding, project_id, &id, &text, detail) {
-                Ok(detail_id) => TodoOpResult {
+            match edit_todo(db, embedding, &id, &text, detail) {
+                Ok(detail) => TodoOpResult {
                     op: name.to_string(),
                     id,
                     error: None,
                     possible_duplicates: Vec::new(),
-                    detail_id,
+                    detail_id: detail.as_ref().ok().cloned().flatten(),
+                    detail_error: detail.err().map(|e| e.to_string()),
                 },
                 Err(e) => fail(name, id, e),
             }
@@ -389,6 +395,7 @@ fn fail(op: &str, id: String, e: MemoryError) -> TodoOpResult {
         error: Some(e.to_string()),
         possible_duplicates: Vec::new(),
         detail_id: None,
+        detail_error: None,
     }
 }
 
@@ -407,6 +414,7 @@ fn transition(
                 error: None,
                 possible_duplicates: Vec::new(),
                 detail_id: None,
+                detail_error: None,
             },
             Err(e) => fail(op, id, e),
         },
@@ -434,6 +442,11 @@ fn check_text_len(text: &str) -> Result<(), MemoryError> {
 /// Store `detail` as a `fact` memory linked to `todo_id` via a `relates_to` edge, through
 /// the normal dedup path so a repeated finding merges instead of piling up duplicates.
 /// Returns the id that survived — the new memory, or the existing one it merged into.
+/// The linked detail fact an `add` or `edit` stored, kept apart from the op's own result:
+/// by the time the detail is stored the todo is already written, so a detail failure
+/// must not read as the op failing and invite a retry that duplicates the todo.
+type DetailResult = Result<Option<String>, MemoryError>;
+
 fn store_todo_detail(
     db: &Database,
     embedding: &EmbeddingService,
@@ -512,7 +525,7 @@ fn add_todo(
     tags: Vec<String>,
     importance: Option<f64>,
     detail: Option<String>,
-) -> Result<(String, Vec<TodoDuplicate>, Option<String>), MemoryError> {
+) -> Result<(String, Vec<TodoDuplicate>, DetailResult), MemoryError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(MemoryError::InvalidType(
@@ -558,8 +571,8 @@ fn add_todo(
 
     db.store_todo_atomic(&memory, &vector, embedding.model_version())?;
 
-    let detail_id = match detail {
-        Some(d) if !d.trim().is_empty() => Some(store_todo_detail(
+    let detail = match detail {
+        Some(d) if !d.trim().is_empty() => store_todo_detail(
             db,
             embedding,
             project_id,
@@ -567,21 +580,21 @@ fn add_todo(
             resolved_branch.as_deref(),
             &tags,
             &d,
-        )?),
-        _ => None,
+        )
+        .map(Some),
+        _ => Ok(None),
     };
 
-    Ok((memory.id, duplicates, detail_id))
+    Ok((memory.id, duplicates, detail))
 }
 
 fn edit_todo(
     db: &Database,
     embedding: &EmbeddingService,
-    project_id: &str,
     id: &str,
     text: &str,
     detail: Option<String>,
-) -> Result<Option<String>, MemoryError> {
+) -> Result<DetailResult, MemoryError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(MemoryError::InvalidType(
@@ -592,22 +605,24 @@ fn edit_todo(
     let Some(todo) = db.get_todo(id)? else {
         return Err(MemoryError::InvalidType(format!("{id} is not a todo")));
     };
-    db.update_todo_text(id, text)?;
     let vector = embedding.embed_memory(MemoryType::Todo, text)?;
+    db.update_todo_text(id, text)?;
     db.store_embedding(id, &vector, embedding.model_version())?;
 
-    match detail {
-        Some(d) if !d.trim().is_empty() => Ok(Some(store_todo_detail(
+    // The detail belongs with its todo, which `get_todo` finds in any project.
+    Ok(match detail {
+        Some(d) if !d.trim().is_empty() => store_todo_detail(
             db,
             embedding,
-            project_id,
+            &todo.project_id,
             id,
             todo.branch.as_deref(),
             &todo.tags,
             &d,
-        )?)),
+        )
+        .map(Some),
         _ => Ok(None),
-    }
+    })
 }
 
 /// List todos for a project.

@@ -621,7 +621,7 @@ impl ServerHandler for MemoryServer {
                 chrono::DateTime::from_timestamp(memory.created_at, 0)
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
-                memory.content
+                format::display_content(&memory, &db)
             );
 
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -874,15 +874,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine project ID (from env, git remote, or current directory)
     let identity = project::resolve_project(None);
-    let project_id = identity.id.clone();
 
     // Reconciled once here, before the background jobs or the first tool call read the
-    // project, so a server started in a repo whose remote changed never writes under a
-    // split id.
-    match Database::open(&db_path) {
+    // project, so a server started in a repo whose remote changed, or under an id a
+    // merge has since folded away, never writes under a split id.
+    let project_id = match Database::open(&db_path) {
         Ok(db) => db.reconcile_identity(&identity),
-        Err(error) => tracing::warn!("could not open the store to reconcile the project: {error}"),
-    }
+        Err(error) => {
+            tracing::warn!("could not open the store to reconcile the project: {error}");
+            identity.id.clone()
+        }
+    };
 
     // Detect current git branch
     let current_branch = project::current_branch();

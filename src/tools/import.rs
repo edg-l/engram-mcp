@@ -109,17 +109,22 @@ pub fn import_payload(
             embedding,
             exported,
             &target_project,
+            all_projects,
             options,
             &mut outcome,
         )?;
     }
 
     for rel in data.relationships {
-        let source_exists = db.get_memory(&rel.source_id)?.is_some();
-        let target_exists = db.get_memory(&rel.target_id)?.is_some();
-        if source_exists && target_exists {
+        let source = db.get_memory(&rel.source_id)?;
+        let target = db.get_memory(&rel.target_id)?;
+        if let (Some(source), Some(target)) = (source, target) {
             db.create_relationship(&rel)?;
             outcome.stats.relationships_imported += 1;
+            // A new edge alone can change retrieval (a `supersedes` edge redirects), so
+            // both endpoints' projects count as written even if no memory row changed.
+            outcome.touched_projects.insert(source.project_id);
+            outcome.touched_projects.insert(target.project_id);
         } else {
             outcome.stats.relationships_skipped += 1;
         }
@@ -141,6 +146,7 @@ fn import_memory(
     embedding: &EmbeddingService,
     exported: ExportedMemory,
     target_project: &str,
+    all_projects: bool,
     options: &ImportOptions<'_>,
     outcome: &mut ImportOutcome,
 ) -> Result<(), MemoryError> {
@@ -156,17 +162,30 @@ fn import_memory(
         status,
         todo,
     } = exported;
-    memory.project_id = target_project.to_string();
+    let mut target_project = target_project.to_string();
 
     // Replace mode has already cleared the project, so only merge looks the id up.
     let mut content_differs = false;
     let is_update = if options.mode == ImportMode::Merge {
         match db.get_memory(&memory.id)? {
+            Some(existing) if existing.project_id != target_project && !all_projects => {
+                // A project-scoped import writes to its target only; the id belongs to
+                // another project here, which this import has no business editing.
+                outcome.stats.memories_skipped += 1;
+                outcome.warnings.push(format!(
+                    "skipping {}: it belongs to project '{}', not '{target_project}'",
+                    memory.id, existing.project_id
+                ));
+                return Ok(());
+            }
             Some(existing) if memory.updated_at <= existing.updated_at => {
                 outcome.stats.memories_skipped += 1;
                 return Ok(());
             }
             Some(existing) => {
+                // Import never moves a memory between projects: `project_id` is not an
+                // LWW field, and a payload's id can predate a local project merge.
+                target_project = existing.project_id.clone();
                 content_differs = existing.content != memory.content;
                 if content_differs {
                     db.trash_memory(&memory.id, db::OP_UPDATE)?;
@@ -180,6 +199,8 @@ fn import_memory(
     } else {
         false
     };
+    let target_project = target_project.as_str();
+    memory.project_id = target_project.to_string();
 
     // Only a brand-new ADR can collide: an update already owns its number. A collision is
     // always with a different memory, reached two ways: a row redirected into a merge
@@ -253,9 +274,11 @@ fn import_memory(
         )?;
     }
 
-    // Handoff and ADR sidecars are not LWW-governed fields, so an update leaves the local
-    // sidecar alone and only brand-new rows get one.
-    if !is_update && memory.memory_type == MemoryType::Handoff {
+    // Handoff and ADR sidecars carry the same content as the row in structured form, so
+    // an update that won LWW replaces them along with it; `handoff_resume` and the
+    // compact ADR rendering read the sidecar, not `content`. An ADR keeps its local
+    // number on update.
+    if memory.memory_type == MemoryType::Handoff {
         match (sections, section_embedding_keys, encoded_section_embeddings) {
             (Some(sections), Some(keys), Some(encoded)) => {
                 match export::decode_section_embedding_bytes(&encoded) {
@@ -273,9 +296,11 @@ fn import_memory(
                                 bytes.len(),
                                 expected
                             ));
-                        } else if let Err(e) =
+                        } else if let Err(e) = if is_update {
+                            db.update_handoff_sections(&memory.id, &sections, &keys, &bytes)
+                        } else {
                             db.insert_handoff_sections(&memory.id, &sections, &keys, &bytes)
-                        {
+                        } {
                             outcome.warnings.push(format!(
                                 "failed to import handoff sidecar for {}: {e}",
                                 memory.id
@@ -288,11 +313,22 @@ fn import_memory(
                     )),
                 }
             }
+            _ if is_update => {}
             _ => outcome.warnings.push(format!(
                 "handoff {} imported without sidecar (old export format; sections not available)",
                 memory.id
             )),
         }
+    }
+
+    if is_update
+        && memory.memory_type == MemoryType::Adr
+        && let Some(adr_sections) = &adr_sections
+    {
+        let status = adr_status
+            .as_deref()
+            .and_then(|s| s.parse::<AdrStatus>().ok());
+        db.update_adr_sidecar(&memory.id, status, adr_sections, memory.updated_at)?;
     }
 
     if !is_update

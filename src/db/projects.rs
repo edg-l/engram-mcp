@@ -300,11 +300,16 @@ impl Database {
     }
 
     /// Bind the directory-derived project `id` to its directory `root` (the
-    /// `home_relative` form of its git root, or of the directory itself), merging into
-    /// `id` every other project the same directory was known by: one whose `root_path`
-    /// is `root` (the remote changed) or whose id is `root` (a remote was added to a
-    /// repo that had none). One transaction; prints a one-line note to stderr when
-    /// anything was merged.
+    /// `home_relative` form of its main checkout, or of the directory itself), merging
+    /// into `id` every other project the same directory was known by: one whose
+    /// `root_path` is `root` (the remote changed) or whose id is `root` (a remote was
+    /// added to a repo that had none). One transaction; prints a one-line note to stderr
+    /// when anything was merged.
+    ///
+    /// Only a remote-derived (`git:`) id absorbs anything. A directory with no remote
+    /// carries no evidence that it is the repo previously recorded there: a clone moved
+    /// away, or a worktree removed, leaves its path free for an unrelated folder, which
+    /// would otherwise take over the repo's project.
     ///
     /// Runs on every `engram-cli` invocation and hook event, so the common case is two
     /// reads and no write: a scan of `projects` (one row per project, no index needed)
@@ -321,7 +326,10 @@ impl Database {
             )
             .optional()?;
 
-        let mut others: BTreeSet<String> = {
+        let absorbs = id.starts_with("git:");
+        let mut others: BTreeSet<String> = if !absorbs {
+            BTreeSet::new()
+        } else {
             let mut stmt = conn.prepare(
                 "SELECT id FROM projects WHERE id <> ?1 AND (root_path = ?2 OR id = ?2)",
             )?;
@@ -329,7 +337,7 @@ impl Database {
                 .collect::<rusqlite::Result<_>>()?
         };
         // A project can be known only through its memories, with no `projects` row.
-        if root != id && !others.contains(root) {
+        if absorbs && root != id && !others.contains(root) {
             let has_memories: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM memories WHERE project_id = ?1)",
                 params![root],
@@ -368,23 +376,34 @@ impl Database {
         Ok(report)
     }
 
-    /// The entry point every binary calls after resolving its project: runs
-    /// [`Database::reconcile_project_root`] when the id was derived from a directory,
-    /// and does nothing for an explicit `--project`/`ENGRAM_PROJECT` id, which names a
-    /// project rather than a place.
+    /// The entry point every binary calls after resolving its project. Returns the id to
+    /// use: the resolved one, or the project it was merged into when it is a
+    /// merged-away alias, since creating or writing under an alias would re-split what
+    /// the merge joined. Then runs [`Database::reconcile_project_root`] on that id when
+    /// it was derived from a directory; an explicit `--project`/`ENGRAM_PROJECT` id
+    /// names a project rather than a place and never reconciles.
     ///
     /// A failure is reported on stderr instead of returned: the resolved id is valid
     /// either way, and the next invocation retries.
-    pub fn reconcile_identity(&self, identity: &ProjectIdentity) {
-        let Some(root) = &identity.root else {
-            return;
+    pub fn reconcile_identity(&self, identity: &ProjectIdentity) -> String {
+        let id = match self.resolve_alias(&identity.id) {
+            Ok(alias) => alias.unwrap_or_else(|| identity.id.clone()),
+            Err(error) => {
+                eprintln!(
+                    "[engram] could not look up project aliases for '{}': {error}",
+                    identity.id
+                );
+                identity.id.clone()
+            }
         };
-        if let Err(error) = self.reconcile_project_root(&identity.id, root) {
+        if let Some(root) = &identity.root
+            && let Err(error) = self.reconcile_project_root(&id, root)
+        {
             eprintln!(
-                "[engram] could not reconcile project '{}' with directory '{root}': {error}",
-                identity.id
+                "[engram] could not reconcile project '{id}' with directory '{root}': {error}"
             );
         }
+        id
     }
 
     /// Every merged-away project id mapped to the project it was merged into.

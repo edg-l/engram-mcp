@@ -3,7 +3,7 @@
 ## Current state
 
 `master` holds a set of usability fixes driven by 30 days of Claude Code session logs
-(2,221 engram calls, ~150 failures), from `d4bdf75` through the import-path commit. Each commit passed
+(2,221 engram calls, ~150 failures), from `d4bdf75` through the review-fix commit. Each commit passed
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`. The
 installed binaries and any running `engram` servers predate all of it.
 
@@ -23,23 +23,20 @@ What each commit is meant to contain, for checking completeness:
 | `7ee358b` | project identity: `root_path` recorded, `reconcile_identity` merges a repo's old id into its new one on startup/CLI run, `projects merge`, `project_aliases`, import redirects aliased projects |
 | `f741bbc` | aliases followed on resolve; ADR numbers rendered from the sidecar; import renumbers colliding ADRs |
 | "Route memory_import through the shared import path" | one import path, `import_payload` (`src/tools/import.rs`), for MCP `memory_import`, `engram-cli import` and `sync`; MCP import now merges LWW, preserves source `updated_at`, renumbers colliding ADRs, re-embeds foreign-model vectors; invalid `mode` is an error on both paths |
+| "Fix the final review's findings; release 0.12.0" | reconcile absorbs only into `git:` ids and records a worktree's main checkout; startup ids follow aliases; import never edits another project and applies handoff/ADR sidecars on LWW updates, plus edge projects to the cache; `sections` patch keeps `continues_from` and multi-line items; dedup merge moves the consumed memory's edges to the survivor; ADR content edits rebuild the sidecar; todo `detail` failures reported as `detail_error`, `detail_id` rendered; `handoff_create` rejects empty summary and nested+flat sections; unknown `sections` patch fields rejected; CLI/resource ADR display from the sidecar |
 
 ## Next steps
 
-1. **Final review.** One `code-reviewer` run on Opus over `70bb160..HEAD`, scoped to
-   cross-commit seams (e.g. todo `detail` vs link resolution, argument tolerance vs
-   the `sections` patch, aliases vs short-name resolution vs reconcile) and to the
-   table above as the completeness checklist.
-2. **Install and restart.** `cargo build --release`, install both binaries, restart
+1. **Install and restart.** `cargo build --release`, install both binaries, restart
    every running `engram` server (it resolves its project once at startup).
-3. **Check on the live store.** Run `engram-cli stats` inside `~/dev/Gardener` and
+2. **Check on the live store.** Run `engram-cli stats` inside `~/dev/Gardener` and
    confirm the one-line merge note (`~/dev/Gardener` → `git:github.com/XivHub/Gardener`,
    12 memories). Run `handoff_resume` in antworld and confirm the output fits inline
    (it was ~62 KB, 55 KB of it todos).
-4. **Update the `read-handoffs` skill** (`~/.claude/skills/read-handoffs/SKILL.md`):
+3. **Update the `read-handoffs` skill** (`~/.claude/skills/read-handoffs/SKILL.md`):
    `open_todos` is now `{id, title}` with `open_todo_count` and `stale_todo_count` /
    `stale_todo_ids`; step 5 should say to offer closing or dropping the stale ones.
-5. **Release.** Bump the version and write the release commit once 1–3 are done.
+4. **Release.** Tag `v0.12.0` and publish once 1–2 are done; the version bump and changelog are committed.
 
 ## How to work here
 

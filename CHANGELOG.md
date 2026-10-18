@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.12.0] - 2026-10-18
+
+### Upgrading
+- **Restart every running `engram` server after installing.** A server resolves its project once at startup, and that is also when a repo's earlier ids are folded into its current one.
+- **A directory reused for an unrelated repo with a remote is merged into it.** Delete `~/dev/foo`, clone a different repo there, and the two count as one project; the stderr merge line names both ids, and there is no unmerge. A directory without a remote never absorbs anything.
+
+### Added
+- **Short project names resolve.** `project: "antworld"` (MCP) and `-p antworld` (CLI) match a known id by its last path segment, so `git:192.168.88.248/edgar/antworld` and `~/dev/antworld` both answer to it. Legacy absolute paths are re-derived to their portable id. An ambiguous name fails listing only the candidates.
+- **A repo keeps one project id when its remote is added or changed.** The directory a derived id came from is recorded as `projects.root_path` (a worktree records its main checkout), and every `engram`/`engram-cli` start folds earlier ids for that directory into the current one, printing one `[engram] merged project …` line. `engram-cli projects merge <from> <to>` does the same by hand, dry run by default. Merged-away ids are kept as aliases: `-p`, `project:` and `ENGRAM_PROJECT` naming one resolve to the survivor, and an all-projects import never recreates it.
+- **Todo `detail`.** `todo_write` `add`/`edit` (CLI `--detail`) store a long finding as a linked `fact` memory and report `detail_id`; the todo stays a one-line title. A detail that cannot be stored is reported as `detail_error` on an op that otherwise succeeded, so a retry does not duplicate the todo.
+- **Stale todos.** Todos untouched for 30+ active store-days are counted in `handoff_resume` (`stale_todo_count`, `stale_todo_ids`) and `todo_list`.
+- **`memory_update` takes a partial `sections` patch for handoffs.** Fields given replace, fields omitted keep their stored value, and an unknown field is an error. CLI: `update --sections-json`.
+
+### Changed
+- **`handoff_resume` and `todo_list` render todos compactly.** `open_todos` is now `{id, title}` with `open_todo_count`. The resume output leads with the todo count, blockers, sections and linked memories, and puts the checklist last, capped at 30 lines with an `…and K more` tail. `todo_list` shows titles by default; `full_text: true` (CLI `--full`) shows full text. A project with a long todo list previously produced a ~62 KB resume.
+- **Todo text is capped at 200 characters** on `add` and `edit`; the error points at `detail`.
+- **More argument shapes accepted** (see `CLAUDE.md`, Argument tolerance). `type` on `memory_store` now defaults to `fact`, and an argument error names the tool and the fields it received. `handoff_create` refuses an empty `summary`, and section fields given both inside `sections` and at the top level.
+- **`possible_supersedes` threshold raised from 0.75 to 0.88**, measured on the live store; at 0.75 it fired on most stores.
+- **`engram-cli update` runs the same update path as `memory_update`.**
+- **ADRs display from the `adr_sections` sidecar** in every view, CLI `query`/`show` and `memory://` included, never from the `# NNNN.` heading stored in the content, which goes stale after a renumber.
+- **`memory_import` reports** `project`, `cleared`, `reembedded_from_model` and `warnings`; `model_warning` is gone.
+
+### Fixed
+- **`memory_import` (MCP) follows the same rules as `engram-cli import` and `sync`**, through one shared `import_payload`. It previously skipped any existing id, stamped `updated_at` with the import time, dropped ADRs whose number was taken, and kept foreign-model embeddings. It now merges last-write-wins on `updated_at` (ties keep local), preserves the source's `updated_at`, renumbers colliding ADRs, re-embeds vectors from a different model, and moves an updated memory to a fresh cluster. It never edits a memory of another project.
+- **Import updates the handoff and ADR sidecars** along with a newer copy's content, so `handoff_resume` and ADR views no longer show the old sections. An imported edge clears the search cache of both endpoints' projects.
+- **Link ids are checked before anything is written.** `related_to`, `supersedes` and `memory_link` ids that a dedup merge has consumed follow `merged_from` to the survivor (reported as `redirected_links`); an id that resolves to nothing fails the call before the memory is stored. A retry after an unrelated merge previously failed with a foreign key error against a memory already stored. `memory_store_batch` items now create their links.
+- **A dedup merge keeps the consumed memory's edges** on the survivor. They were deleted with it, unlinking a todo from its detail and un-superseding what the consumed memory had superseded.
+- **A merge keeps the provenance of a consumed composite.** Its `merged_from` entries fold into the survivor, so every absorbed id stays resolvable and its content recorded.
+- **A `sections` patch kept neither `continues_from` nor multi-line items.** The chain link was cleared and every line after an item's first was dropped. List items now keep their continuation lines through render and parse, and a plain-string section with a lead-in line before its bullets keeps that line as an item.
+- **Editing an ADR's content updates its sidecar**, which the compact views render from.
+- **An invalid import `mode` is an error** on both `memory_import` and `engram-cli import`, instead of falling back to merge.
+- **Handoff and ADR content parse failures name the canonical headings** and return `InvalidArguments`, suggesting `sections` for handoffs. A rejected update no longer leaves a trash snapshot.
+- **`engram-cli list` no longer panics** on content with a multi-byte character near the 60th byte.
+
 ## [0.11.0] - 2026-08-31
 
 ### Added

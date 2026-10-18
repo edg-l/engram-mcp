@@ -785,7 +785,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Covers `hook-event` too: hooks run through this binary, so every hook event is
     // reconciled here before `hooks::dispatch` sees the id.
-    db.reconcile_identity(&identity);
+    let canonical_id = db.reconcile_identity(&identity);
+    // An explicit --project was already resolved above, aliases included.
+    if !project_was_explicit {
+        project_id = canonical_id;
+    }
     db.get_or_create_project(&project_id, &project_id)?;
 
     // Initialize embedding service once, only if needed (saves ~500ms for commands that don't need it)
@@ -1303,7 +1307,7 @@ fn cmd_query(
         if let Some(summary) = &memory.summary {
             println!("Summary: {}", summary);
         }
-        println!("Content: {}", memory.content);
+        println!("Content: {}", format::display_content(memory, db));
         if !memory.tags.is_empty() {
             println!("Tags: {}", memory.tags.join(", "));
         }
@@ -1396,7 +1400,7 @@ fn cmd_list(
         let summary = memory
             .summary
             .as_deref()
-            .unwrap_or_else(|| &memory.content[..memory.content.len().min(60)]);
+            .unwrap_or_else(|| &memory.content[..memory.content.floor_char_boundary(60)]);
         let branch_info = memory
             .branch
             .as_ref()
@@ -1552,7 +1556,7 @@ fn cmd_show(db: &Database, id: &str, json: bool) -> Result<(), MemoryError> {
         "Last accessed: {}",
         format_timestamp(memory.last_accessed_at)
     );
-    println!("\nContent:\n{}", memory.content);
+    println!("\nContent:\n{}", format::display_content(&memory, db));
 
     // Show relationships
     let outgoing = db.get_relationships_from(id)?;
@@ -2430,7 +2434,7 @@ fn cmd_insights(db: &Database, project_id: &str) -> Result<(), MemoryError> {
             let preview = memory
                 .summary
                 .as_deref()
-                .unwrap_or_else(|| &memory.content[..memory.content.len().min(60)]);
+                .unwrap_or_else(|| &memory.content[..memory.content.floor_char_boundary(60)]);
             println!(
                 "  [{}] {} ({:?}) - {} accesses",
                 &memory.id[..memory.id.len().min(8)],
@@ -3037,6 +3041,9 @@ fn cmd_todo(
         }
         if let Some(detail_id) = &r.detail_id {
             println!("  detail linked: {detail_id}");
+        }
+        if let Some(err) = &r.detail_error {
+            eprintln!("  detail not stored: {err} (the todo was written; retry with `todo edit`)");
         }
         for dup in &r.possible_duplicates {
             println!(

@@ -16,29 +16,42 @@ use crate::error::MemoryError;
 // `HandoffSectionsPatch`, plus the flattened top-level fields `HandoffCreateInput` falls
 // back to when `sections` is omitted.
 
-/// A string becomes list items by taking the lines that start with `- ` or `* ` (prefix
-/// stripped); a string with no such line becomes a single item.
+/// A string becomes list items split at lines starting with `- ` or `* ` (prefix
+/// stripped). A line without a bullet continues the item before it, and text before the
+/// first bullet is an item of its own, so no line of the caller's text is dropped. A
+/// string with no bullet line becomes a single item.
 fn split_list_string(s: &str) -> Vec<String> {
-    let bulleted: Vec<String> = s
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            line.strip_prefix("- ")
-                .or_else(|| line.strip_prefix("* "))
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-        })
-        .collect();
-    if !bulleted.is_empty() {
-        return bulleted;
+    let mut items: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut saw_bullet = false;
+    for line in s.lines() {
+        let trimmed = line.trim();
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            saw_bullet = true;
+            items.extend(current.take());
+            current = Some(item.trim().to_string());
+        } else if !trimmed.is_empty() {
+            match current.as_mut() {
+                Some(item) if saw_bullet => {
+                    item.push('\n');
+                    item.push_str(trimmed);
+                }
+                _ => {
+                    let lead = current.get_or_insert_with(String::new);
+                    if !lead.is_empty() {
+                        lead.push('\n');
+                    }
+                    lead.push_str(trimmed);
+                }
+            }
+        }
     }
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        vec![trimmed.to_string()]
-    }
+    items.extend(current);
+    items.retain(|item| !item.is_empty());
+    items
 }
 
 fn list_from_value(value: Value) -> Result<Vec<String>, String> {
@@ -372,6 +385,24 @@ pub struct HandoffSections {
 }
 
 #[allow(dead_code)] // Used by handoff create/resume/search tools (Phase 3)
+/// One `## heading` list section. An item's continuation lines are indented under its
+/// bullet, which is how `parse_markdown` tells them apart from the next item.
+fn push_list(out: &mut String, heading: &str, bullet: &str, items: &[String]) {
+    out.push_str(&format!("## {heading}\n\n"));
+    for item in items {
+        let mut lines = item.lines();
+        out.push_str(bullet);
+        out.push_str(lines.next().unwrap_or_default());
+        out.push('\n');
+        for line in lines {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+}
+
 impl HandoffSections {
     /// Render sections into canonical markdown stored in `memories.content`.
     ///
@@ -385,35 +416,19 @@ impl HandoffSections {
         out.push_str("\n\n");
 
         if !self.decisions.is_empty() {
-            out.push_str("## Decisions\n\n");
-            for d in &self.decisions {
-                out.push_str(&format!("- {}\n", d));
-            }
-            out.push('\n');
+            push_list(&mut out, "Decisions", "- ", &self.decisions);
         }
 
         if !self.todos.is_empty() {
-            out.push_str("## Todos\n\n");
-            for t in &self.todos {
-                out.push_str(&format!("- [ ] {}\n", t));
-            }
-            out.push('\n');
+            push_list(&mut out, "Todos", "- [ ] ", &self.todos);
         }
 
         if !self.blockers.is_empty() {
-            out.push_str("## Blockers\n\n");
-            for b in &self.blockers {
-                out.push_str(&format!("- {}\n", b));
-            }
-            out.push('\n');
+            push_list(&mut out, "Blockers", "- ", &self.blockers);
         }
 
         if !self.tried.is_empty() {
-            out.push_str("## Tried\n\n");
-            for t in &self.tried {
-                out.push_str(&format!("- {}\n", t));
-            }
-            out.push('\n');
+            push_list(&mut out, "Tried", "- ", &self.tried);
         }
 
         if !self.mental_model.is_empty() {
@@ -423,11 +438,7 @@ impl HandoffSections {
         }
 
         if !self.next_steps.is_empty() {
-            out.push_str("## Next Steps\n\n");
-            for s in &self.next_steps {
-                out.push_str(&format!("- {}\n", s));
-            }
-            out.push('\n');
+            push_list(&mut out, "Next Steps", "- ", &self.next_steps);
         }
 
         if let Some(notes) = &self.notes
@@ -480,18 +491,29 @@ impl HandoffSections {
         };
 
         /// Bullet-list items, tolerating the `- [ ]` / `- [x] ` checkboxes used by Todos.
+        /// A line without a bullet continues the item above it (`push_list` indents
+        /// them), and one before the first bullet is an item of its own.
         fn bullets(body: &str) -> Vec<String> {
-            body.lines()
-                .filter_map(|l| {
-                    let l = l.trim();
-                    l.strip_prefix("- [ ] ")
-                        .or_else(|| l.strip_prefix("- [x] "))
-                        .or_else(|| l.strip_prefix("- [X] "))
-                        .or_else(|| l.strip_prefix("- "))
-                        .map(|s| s.trim().to_string())
-                })
-                .filter(|s| !s.is_empty())
-                .collect()
+            let mut items: Vec<String> = Vec::new();
+            for line in body.lines() {
+                let l = line.trim();
+                let bullet = l
+                    .strip_prefix("- [ ] ")
+                    .or_else(|| l.strip_prefix("- [x] "))
+                    .or_else(|| l.strip_prefix("- [X] "))
+                    .or_else(|| l.strip_prefix("- "));
+                match (bullet, items.last_mut()) {
+                    (Some(item), _) => items.push(item.trim().to_string()),
+                    (None, _) if l.is_empty() => {}
+                    (None, Some(last)) => {
+                        last.push('\n');
+                        last.push_str(l);
+                    }
+                    (None, None) => items.push(l.to_string()),
+                }
+            }
+            items.retain(|item| !item.is_empty());
+            items
         }
 
         enum Section {
@@ -595,6 +617,7 @@ impl HandoffSections {
 /// value already stored. There is no `todos` field — open work belongs in the todo list,
 /// not a handoff section, matching `handoff_create`'s rejection of the same field.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HandoffSectionsPatch {
     #[serde(default, deserialize_with = "deserialize_opt_joined_string")]
     pub summary: Option<String>,
@@ -997,6 +1020,35 @@ pub struct MemoryCluster {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn list_string_keeps_lead_in_and_continuation_lines() {
+        assert_eq!(
+            split_list_string(
+                "Bulk UPDATE failed:\n- 90s lock\n  on the whole table\n- retry storm"
+            ),
+            vec![
+                "Bulk UPDATE failed:".to_string(),
+                "90s lock\non the whole table".to_string(),
+                "retry storm".to_string(),
+            ]
+        );
+        assert_eq!(
+            split_list_string("one item\nover two lines"),
+            vec!["one item\nover two lines".to_string()]
+        );
+    }
+
+    #[test]
+    fn multi_line_items_survive_render_and_parse() {
+        let mut sections = HandoffSections::parse_markdown("## Summary\n\ns").unwrap();
+        sections.tried = vec![
+            "Bulk UPDATE\nlocked the table for 90s".to_string(),
+            "second".to_string(),
+        ];
+        let parsed = HandoffSections::parse_markdown(&sections.render_markdown()).unwrap();
+        assert_eq!(parsed.tried, sections.tried);
+    }
     use super::*;
 
     fn full_sections() -> HandoffSections {

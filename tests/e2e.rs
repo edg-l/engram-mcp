@@ -727,6 +727,94 @@ fn test_memory_import_renumbers_colliding_adr() {
     );
 }
 
+/// A project-scoped import edits only its target project: an incoming id that names a
+/// memory of another project is skipped, however new the incoming copy is.
+#[test]
+fn test_memory_import_never_edits_another_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.get_or_create_project("test-project", "test-project")
+        .unwrap();
+    db.get_or_create_project("other", "other").unwrap();
+    let h = ToolHandler::new(
+        db,
+        EmbeddingService::new().unwrap(),
+        "test-project".to_string(),
+        None,
+        SearchMode::default(),
+    );
+    call(
+        &h,
+        "memory_store",
+        json!({"content": "The deploy window is Tuesday mornings", "type": "fact"}),
+    );
+    let mut exported = call(&h, "memory_export", json!({}));
+    let updated_at = exported["memories"][0]["updated_at"].as_i64().unwrap() + 60;
+    exported["memories"][0]["updated_at"] = json!(updated_at);
+    exported["memories"][0]["content"] = json!("Overwritten from another project");
+
+    let r = call(
+        &h,
+        "memory_import",
+        json!({"data": exported, "project": "other"}),
+    );
+    assert_eq!(r["stats"]["memories_skipped"].as_u64().unwrap(), 1);
+    assert_eq!(r["stats"]["memories_updated"].as_u64().unwrap(), 0);
+
+    let local = call(&h, "memory_export", json!({}));
+    assert!(
+        local["memories"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Tuesday")
+    );
+}
+
+/// Edited ADR content reaches the sidecar every ADR view reads from, both through
+/// `memory_update` and through an import whose copy wins LWW.
+#[test]
+fn test_adr_content_edits_reach_the_sidecar() {
+    let (h, _dir) = setup(None);
+    let created = call(
+        &h,
+        "adr_create",
+        json!({
+            "title": "Use SQLite",
+            "context": "Local tool.",
+            "decision": "SQLite with WAL.",
+            "consequences": "Single writer."
+        }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let exported = call(&h, "memory_export", json!({"include_embeddings": true}));
+    let content = exported["memories"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    call(
+        &h,
+        "memory_update",
+        json!({"id": id, "content": content.replace("SQLite with WAL.", "SQLite, rollback journal.")}),
+    );
+    let shown = call(&h, "adr_show", json!({"number": 1}));
+    assert_eq!(
+        shown["decision"].as_str().unwrap(),
+        "SQLite, rollback journal."
+    );
+
+    let (h2, _dir2) = setup(None);
+    call(&h2, "memory_import", json!({"data": exported.clone()}));
+    let mut newer = exported;
+    let updated_at = newer["memories"][0]["updated_at"].as_i64().unwrap() + 60;
+    newer["memories"][0]["updated_at"] = json!(updated_at);
+    newer["memories"][0]["content"] = json!(content.replace("SQLite with WAL.", "Postgres."));
+    newer["memories"][0]["adr_sections"]["decision"] = json!("Postgres.");
+    call(&h2, "memory_import", json!({"data": newer}));
+    let shown = call(&h2, "adr_show", json!({"number": 1}));
+    assert_eq!(shown["decision"].as_str().unwrap(), "Postgres.");
+}
+
 #[test]
 fn test_memory_import_rejects_unknown_mode() {
     let (h, _dir) = setup(None);
@@ -735,6 +823,48 @@ fn test_memory_import_rejects_unknown_mode() {
         .handle_tool("memory_import", json!({"data": exported, "mode": "replce"}))
         .unwrap_err();
     assert!(err.to_string().contains("invalid import mode"), "{err}");
+}
+
+/// A `sections` patch replaces only the fields it names: the chain link and the
+/// multi-line items of untouched sections come through unchanged.
+#[test]
+fn test_sections_patch_keeps_chain_link_and_multi_line_items() {
+    let (h, _dir) = setup(Some("main"));
+    let first = call(
+        &h,
+        "handoff_create",
+        json!({"sections": {"summary": "first"}}),
+    );
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let tried = "Bulk UPDATE on memories\nlocked the table for 90s";
+    let second = call(
+        &h,
+        "handoff_create",
+        json!({"sections": {
+            "summary": "second",
+            "tried": [tried],
+            "continues_from": first_id
+        }}),
+    );
+    let second_id = second["id"].as_str().unwrap().to_string();
+
+    call(
+        &h,
+        "memory_update",
+        json!({"id": second_id, "sections": {"blockers": ["waiting on review"]}}),
+    );
+
+    let exported = call(&h, "memory_export", json!({}));
+    let sections = exported["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == json!(second_id))
+        .unwrap()["sections"]
+        .clone();
+    assert_eq!(sections["continues_from"], json!(first_id));
+    assert_eq!(sections["tried"], json!([tried]));
+    assert_eq!(sections["blockers"], json!(["waiting on review"]));
 }
 
 #[test]

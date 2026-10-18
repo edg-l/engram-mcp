@@ -9,7 +9,7 @@
 use crate::db::{Database, OP_UPDATE, encode_section_embeddings};
 use crate::embedding::EmbeddingService;
 use crate::error::MemoryError;
-use crate::memory::{HandoffSections, HandoffSectionsPatch, Memory, MemoryType};
+use crate::memory::{AdrSections, HandoffSections, HandoffSectionsPatch, Memory, MemoryType};
 use crate::summarize::{generate_summary, should_auto_summarize};
 
 use super::handoff::handoff_section_key_texts;
@@ -78,29 +78,30 @@ pub fn update_memory(
     }
 
     // `sections` patches the stored sidecar sections (not the possibly-unparseable
-    // `content` string) and renders the result to markdown, then joins the regular
-    // content-update path below so the sidecar and section embeddings are rebuilt the
-    // same way a direct `content` edit would rebuild them.
-    let sections_markdown = match request.sections {
+    // `content` string). The merged sections become the new sidecar as they are, and
+    // their rendering the new content; re-parsing that rendering would lose what
+    // markdown does not carry, such as `continues_from`.
+    let stored_sections = if memory.memory_type == MemoryType::Handoff {
+        db.get_handoff_sections(&request.id)?
+            .map(|(sections, _)| sections)
+    } else {
+        None
+    };
+    let (new_content, patched_sections) = match request.sections {
         Some(patch) => {
-            let (existing, _) = db.get_handoff_sections(&request.id)?.ok_or_else(|| {
+            let existing = stored_sections.clone().ok_or_else(|| {
                 MemoryError::NotFound(format!("handoff sections for {}", request.id))
             })?;
-            Some(existing.merge_patch(patch).render_markdown())
+            let merged = existing.merge_patch(patch);
+            (Some(merged.render_markdown()), Some(merged))
         }
-        None => None,
+        None => (request.content, None),
     };
-    let new_content = request.content.or(sections_markdown);
 
-    // Content is replaced wholesale, not patched, so the previous version is gone the
-    // moment the row is written. Snapshot it and hand it back to the caller.
     let previous = memory.clone();
     let content_replaced = new_content
         .as_ref()
         .is_some_and(|new| *new != memory.content);
-    if content_replaced {
-        db.trash_memory(&request.id, OP_UPDATE)?;
-    }
 
     memory.updated_at = chrono::Utc::now().timestamp();
 
@@ -113,7 +114,15 @@ pub fn update_memory(
     let handoff_sidecar_update: Option<(HandoffSections, Vec<f32>, Vec<Vec<f32>>)> =
         if memory.memory_type == MemoryType::Handoff {
             if let Some(ref content) = new_content {
-                let new_sections = HandoffSections::parse_markdown(content)?;
+                let new_sections = match patched_sections {
+                    Some(sections) => sections,
+                    None => {
+                        // The chain link lives only in the sidecar, never in markdown.
+                        let mut parsed = HandoffSections::parse_markdown(content)?;
+                        parsed.continues_from = stored_sections.and_then(|s| s.continues_from);
+                        parsed
+                    }
+                };
                 let full_embedding = embedding.embed_memory(MemoryType::Handoff, content)?;
                 let section_texts = handoff_section_key_texts(&new_sections);
                 let mut section_vecs: Vec<Vec<f32>> = Vec::new();
@@ -127,6 +136,21 @@ pub fn update_memory(
         } else {
             None
         };
+
+    // Compact renderers show an ADR from its sidecar, so edited content must reach it.
+    let adr_sections = match &new_content {
+        Some(content) if memory.memory_type == MemoryType::Adr => {
+            Some(AdrSections::parse_markdown(content)?)
+        }
+        _ => None,
+    };
+
+    // Content is replaced wholesale, not patched, so the previous version is gone the
+    // moment the row is written. Snapshot it, after validation so a rejected update
+    // leaves no snapshot, and hand it back to the caller.
+    if content_replaced {
+        db.trash_memory(&request.id, OP_UPDATE)?;
+    }
 
     if let Some(ref content) = new_content {
         memory.content = content.clone();
@@ -189,6 +213,9 @@ pub fn update_memory(
         )?;
     } else {
         db.update_memory(&memory)?;
+    }
+    if let Some(sections) = adr_sections {
+        db.update_adr_sidecar(&memory.id, None, &sections, memory.updated_at)?;
     }
 
     Ok(MemoryUpdateOutcome {

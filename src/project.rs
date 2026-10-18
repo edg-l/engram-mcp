@@ -197,16 +197,44 @@ pub struct ProjectIdentity {
 /// always recorded, since the directory outlives any one remote URL.
 pub fn project_identity_for_dir(dir: &Path) -> ProjectIdentity {
     let git_root = find_git_root_from(dir);
-    let root = home_relative(&git_root.as_deref().unwrap_or(dir).to_string_lossy());
+    let own_dir = home_relative(&git_root.as_deref().unwrap_or(dir).to_string_lossy());
     let id = git_root
         .as_deref()
         .and_then(git_remote_url)
         .and_then(|url| normalize_remote_url(&url))
-        .unwrap_or_else(|| root.clone());
+        .unwrap_or_else(|| own_dir.clone());
+    // Every worktree of a repo records the main checkout as its directory. Recording
+    // the worktree's own path would move the repo's `root_path` to whichever checkout
+    // ran last, and a later folder at a removed worktree's path would claim the repo.
+    let root = git_root
+        .as_deref()
+        .and_then(main_worktree_root)
+        .map(|main| home_relative(&main.to_string_lossy()))
+        .unwrap_or(own_dir);
     ProjectIdentity {
         id,
         root: Some(root),
     }
+}
+
+/// The main checkout of the repo whose working tree is `git_root`, when `git_root` is a
+/// linked worktree (its `.git` is a file pointing into the main repo's `.git/worktrees`).
+/// `None` for a main checkout, or when `git` cannot answer.
+fn main_worktree_root(git_root: &Path) -> Option<PathBuf> {
+    if !git_root.join(".git").is_file() {
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(git_root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    common_dir.parent().map(Path::to_path_buf)
 }
 
 /// The id part of [`project_identity_for_dir`].
@@ -321,6 +349,48 @@ pub fn current_branch() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_records_the_main_checkout_as_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // git reports the common dir with symlinks resolved (macOS's /var is
+        // /private/var), so compare from the resolved path.
+        let base = dir.path().canonicalize().unwrap();
+        let main = base.join("main");
+        let git = |args: &[&str], cwd: &Path| {
+            let status = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        std::fs::create_dir(&main).unwrap();
+        git(&["init", "-q"], &main);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"], &main);
+        git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/owner/repo.git",
+            ],
+            &main,
+        );
+        let worktree = base.join("wt");
+        git(
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+            &main,
+        );
+
+        let from_main = project_identity_for_dir(&main);
+        let from_worktree = project_identity_for_dir(&worktree);
+
+        assert_eq!(from_worktree.id, "git:example.com/owner/repo");
+        assert_eq!(from_worktree.root, from_main.root);
+    }
 
     #[test]
     fn normalize_remote_url_variants_agree() {

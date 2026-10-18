@@ -309,6 +309,19 @@ fn format_memory_content_with_db(memory: &Memory, db: &Database, max_len: usize)
     }
 }
 
+/// A memory's full text for display. An ADR is rendered from its `adr_sections` sidecar,
+/// since the `# NNNN.` heading stored in `content` goes stale when the sidecar is
+/// renumbered (a project merge, an import collision); everything else is `content`.
+pub fn display_content(memory: &Memory, db: &Database) -> String {
+    use crate::memory::MemoryType;
+    if memory.memory_type == MemoryType::Adr
+        && let Ok(Some((number, status, sections))) = db.get_adr_sections(&memory.id)
+    {
+        return sections.render_markdown(number, status, memory.created_at);
+    }
+    memory.content.clone()
+}
+
 /// Format handoff or ADR memory content from raw JSON fields, without a full `Memory`
 /// struct.
 ///
@@ -1326,6 +1339,14 @@ fn compact_todo_write(result: &Value) -> String {
         match r.get("error").and_then(|v| v.as_str()) {
             Some(err) => out.push_str(&format!("{op} failed: {err}\n")),
             None => out.push_str(&format!("{op} ok: {id}\n")),
+        }
+        if let Some(detail_id) = r.get("detail_id").and_then(|v| v.as_str()) {
+            out.push_str(&format!("  detail linked: {detail_id}\n"));
+        }
+        if let Some(err) = r.get("detail_error").and_then(|v| v.as_str()) {
+            out.push_str(&format!(
+                "  detail not stored: {err} (the todo was written; retry the detail with edit)\n"
+            ));
         }
         if let Some(dups) = r.get("possible_duplicates").and_then(|v| v.as_array())
             && !dups.is_empty()

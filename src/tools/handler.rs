@@ -2676,7 +2676,28 @@ impl ToolHandler {
 
         // Some callers flatten the payload rather than nesting it under `sections`;
         // build the sections from the top-level fields when `sections` itself is absent.
+        let flat_given = [
+            input.summary.is_some(),
+            input.decisions.is_some(),
+            input.todos.is_some(),
+            input.blockers.is_some(),
+            input.tried.is_some(),
+            input.mental_model.is_some(),
+            input.next_steps.is_some(),
+            input.notes.is_some(),
+            input.continues_from.is_some(),
+        ]
+        .contains(&true);
         let sections = match input.sections {
+            Some(_) if flat_given => {
+                return Err(MemoryError::InvalidArguments {
+                    tool: "handoff_create".to_string(),
+                    message: "section fields were given both inside `sections` and at the top \
+                              level; pass them in one place"
+                        .to_string(),
+                    received: "sections and top-level section fields".to_string(),
+                });
+            }
             Some(sections) => sections,
             None => {
                 let summary = input.summary.ok_or_else(|| MemoryError::InvalidArguments {
@@ -2699,6 +2720,16 @@ impl ToolHandler {
                 }
             }
         };
+
+        // Every later `sections` patch re-renders through `## Summary`, which an empty
+        // summary would fail, so it is refused here rather than on the first update.
+        if sections.summary.trim().is_empty() {
+            return Err(MemoryError::InvalidArguments {
+                tool: "handoff_create".to_string(),
+                message: "`summary` must not be empty".to_string(),
+                received: "summary".to_string(),
+            });
+        }
 
         // Open work lives in the todo list, which is what handoff_resume reads. The field
         // survives on `HandoffSections` so handoffs written before the split still parse,

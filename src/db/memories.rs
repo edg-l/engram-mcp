@@ -185,7 +185,7 @@ impl Database {
     /// merged away) with a cycle guard, even though `merge_projects_in` repoints every
     /// existing alias to the new target at merge time, so a live chain longer than one
     /// hop should not occur in practice.
-    fn resolve_alias(&self, id: &str) -> Result<Option<String>, MemoryError> {
+    pub(super) fn resolve_alias(&self, id: &str) -> Result<Option<String>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut current = id.to_string();
         let mut seen = HashSet::new();
@@ -935,6 +935,20 @@ impl Database {
         // Snapshot the consumed memory before removing it. `merged_from` records what it
         // said; the trash entry is what makes the merge reversible.
         super::trash::trash_memory_in(&tx, consumed_id, super::OP_MERGE, now)?;
+        // The survivor now speaks for the consumed memory, so it takes over its edges:
+        // deleting the row cascades them away otherwise, unlinking whatever pointed at
+        // it (a todo's detail) and un-superseding what it superseded. `OR IGNORE` leaves
+        // an edge the survivor already has, and one between the pair, to the cascade.
+        tx.execute(
+            "UPDATE OR IGNORE relationships SET source_id = ?1 \
+             WHERE source_id = ?2 AND target_id <> ?1",
+            params![survivor_id, consumed_id],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE relationships SET target_id = ?1 \
+             WHERE target_id = ?2 AND source_id <> ?1",
+            params![survivor_id, consumed_id],
+        )?;
         tx.execute(
             "DELETE FROM handoff_sections WHERE memory_id = ?1",
             params![consumed_id],

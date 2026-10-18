@@ -1,7 +1,10 @@
 use rusqlite::params;
 
 use crate::error::MemoryError;
-use crate::memory::{AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, Project};
+use crate::memory::{
+    AdrSections, AdrStatus, HandoffSections, Memory, MemoryType, Project, RelationType,
+    Relationship,
+};
 
 use super::Database;
 use super::handoffs::{decode_section_embeddings, encode_section_embeddings};
@@ -255,6 +258,36 @@ fn test_merge_memories() {
 /// The survivor is chosen by scope (a global memory beats a local one), so the consumed
 /// memory is not always the older of the pair. Provenance that described the survivor
 /// would point at content that was never lost.
+#[test]
+fn merge_moves_the_consumed_memorys_edges_to_the_survivor() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("p", "p").unwrap();
+    for id in ["todo", "old-detail", "new-detail", "stale"] {
+        store_fact(&db, id, "p");
+    }
+    let edge = |id: &str, source: &str, target: &str, relation_type| Relationship {
+        id: id.to_string(),
+        source_id: source.to_string(),
+        target_id: target.to_string(),
+        relation_type,
+        strength: 1.0,
+        created_at: 0,
+    };
+    db.create_relationship(&edge("e1", "todo", "old-detail", RelationType::RelatesTo))
+        .unwrap();
+    db.create_relationship(&edge("e2", "old-detail", "stale", RelationType::Supersedes))
+        .unwrap();
+
+    db.merge_memories("new-detail", "old-detail").unwrap();
+
+    let from_todo = db.get_relationships_from("todo").unwrap();
+    assert_eq!(from_todo.len(), 1);
+    assert_eq!(from_todo[0].target_id, "new-detail");
+    let to_stale = db.get_relationships_to("stale").unwrap();
+    assert_eq!(to_stale.len(), 1);
+    assert_eq!(to_stale[0].source_id, "new-detail");
+}
+
 #[test]
 fn merge_records_the_memory_that_was_actually_consumed() {
     let db = Database::open_in_memory().unwrap();
@@ -1826,6 +1859,35 @@ fn reconcile_merges_project_known_only_through_memories() {
     assert!(!report.merges[0].project_row);
     assert_eq!(memory_count(&db, derived), 1);
     assert!(!db.project_exists("~/dev/norow").unwrap());
+}
+
+#[test]
+fn reconcile_never_absorbs_into_a_directory_without_a_remote() {
+    let db = Database::open_in_memory().unwrap();
+    let repo = "git:example.com/owner/repo";
+    db.reconcile_project_root(repo, "~/dev/repo").unwrap();
+    store_fact(&db, "repo-fact", repo);
+
+    // The clone moved away and an unrelated folder now sits at its old path.
+    let report = db
+        .reconcile_project_root("~/dev/repo", "~/dev/repo")
+        .unwrap();
+
+    assert!(report.is_empty());
+    assert_eq!(memory_count(&db, repo), 1);
+    assert!(db.project_aliases().unwrap().is_empty());
+}
+
+#[test]
+fn reconcile_identity_follows_an_alias_instead_of_recreating_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.get_or_create_project("old", "old").unwrap();
+    db.get_or_create_project("new", "new").unwrap();
+    db.merge_project("old", "new", true).unwrap();
+
+    let explicit = crate::project::resolve_project(Some("old".into()));
+    assert_eq!(db.reconcile_identity(&explicit), "new");
+    assert!(!db.project_exists("old").unwrap());
 }
 
 #[test]

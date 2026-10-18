@@ -309,4 +309,32 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Overwrite an existing ADR sidecar's sections, and its status when given. The
+    /// number is left alone: it is this machine's display number, not part of the
+    /// content. Returns `false` when `memory_id` has no sidecar.
+    pub fn update_adr_sidecar(
+        &self,
+        memory_id: &str,
+        status: Option<AdrStatus>,
+        sections: &AdrSections,
+        updated_at: i64,
+    ) -> Result<bool, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE adr_sections SET title = ?1, context = ?2, decision = ?3, \
+             consequences = ?4, status = COALESCE(?5, status), updated_at = ?6 \
+             WHERE memory_id = ?7",
+            params![
+                sections.title,
+                sections.context,
+                sections.decision,
+                sections.consequences,
+                status.map(AdrStatus::as_str),
+                updated_at,
+                memory_id,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
 }
