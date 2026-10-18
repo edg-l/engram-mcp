@@ -263,8 +263,8 @@ pub fn resolve_project(explicit: Option<String>) -> ProjectIdentity {
 }
 
 /// The last `/`-delimited segment of a project id, after stripping a leading
-/// `git:` or `~/` marker — `git:host/edgar/antworld` and `~/dev/antworld` both
-/// yield `antworld`. A bare verbatim id with no `/` (e.g. `smoke_test_temp`) is
+/// `git:` or `~/` marker — `git:host/owner/payments` and `~/dev/payments` both
+/// yield `payments`. A bare verbatim id with no `/` (e.g. `smoke_test_temp`) is
 /// its own last segment.
 pub fn last_path_segment(id: &str) -> &str {
     let stripped = id.strip_prefix("git:").unwrap_or(id);

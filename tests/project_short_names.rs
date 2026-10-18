@@ -33,7 +33,7 @@ fn run(db: &std::path::Path, args: &[&str]) -> Run {
 fn short_name_resolves_to_full_project_id() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
-    let full_id = "git:example.com/edgar/antworld";
+    let full_id = "git:example.com/owner/payments";
 
     // The write path creates the project verbatim under its full id, exactly
     // as if the store had received it from the MCP server.
@@ -43,7 +43,7 @@ fn short_name_resolves_to_full_project_id() {
             "-p",
             full_id,
             "store",
-            "Antworld uses a custom ECS",
+            "Payments retries failed charges three times",
             "-t",
             "fact",
         ],
@@ -52,7 +52,7 @@ fn short_name_resolves_to_full_project_id() {
 
     // A short name uniquely matching that id's last path segment resolves, and
     // the CLI's normal project-reporting output shows the expanded full id.
-    let stats = run(&db, &["-p", "antworld", "stats"]);
+    let stats = run(&db, &["-p", "payments", "stats"]);
     assert_eq!(stats.code, Some(0), "{}", stats.stderr);
     assert!(
         stats.stdout.contains(full_id),
@@ -61,7 +61,7 @@ fn short_name_resolves_to_full_project_id() {
     );
 
     // Case-insensitively too.
-    let stats_upper = run(&db, &["-p", "AntWorld", "stats"]);
+    let stats_upper = run(&db, &["-p", "Payments", "stats"]);
     assert_eq!(stats_upper.code, Some(0), "{}", stats_upper.stderr);
     assert!(
         stats_upper.stdout.contains(full_id),
@@ -78,7 +78,7 @@ fn ambiguous_short_name_is_rejected_with_only_the_candidates() {
     for full_id in [
         "git:example.com/alice/widget",
         "git:example.com/bob/widget",
-        "git:example.com/edgar/gadget",
+        "git:example.com/owner/gadget",
     ] {
         let stored = run(
             &db,

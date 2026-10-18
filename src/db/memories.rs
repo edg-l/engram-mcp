@@ -136,7 +136,7 @@ impl Database {
     /// expanded: an absolute legacy path is re-derived through
     /// [`portable_id_from_legacy`] and matched exactly, or `requested` is
     /// matched case-insensitively against each known id's last `/` segment
-    /// (`git:host/edgar/antworld` and `~/dev/antworld` both match `antworld`).
+    /// (`git:host/owner/payments` and `~/dev/payments` both match `payments`).
     /// Exactly one candidate resolves to it; several is reported as
     /// `UnknownProject` scoped to just those candidates; none resolves to
     /// `Ok(None)`, leaving the caller to decide what "unknown" means for its

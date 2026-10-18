@@ -1574,23 +1574,23 @@ fn wipe_is_recoverable() {
 #[test]
 fn resolve_known_project_matches_unique_last_segment() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("git:example.com/edgar/antworld", "antworld")
+    db.get_or_create_project("git:example.com/owner/payments", "payments")
         .unwrap();
     db.get_or_create_project("home-project", "home-project")
         .unwrap();
 
-    let resolved = db.resolve_known_project("antworld", None).unwrap();
-    assert_eq!(resolved.as_deref(), Some("git:example.com/edgar/antworld"));
+    let resolved = db.resolve_known_project("payments", None).unwrap();
+    assert_eq!(resolved.as_deref(), Some("git:example.com/owner/payments"));
 }
 
 #[test]
 fn resolve_known_project_matches_case_insensitively() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("git:example.com/edgar/antworld", "antworld")
+    db.get_or_create_project("git:example.com/owner/payments", "payments")
         .unwrap();
 
-    let resolved = db.resolve_known_project("AntWorld", None).unwrap();
-    assert_eq!(resolved.as_deref(), Some("git:example.com/edgar/antworld"));
+    let resolved = db.resolve_known_project("Payments", None).unwrap();
+    assert_eq!(resolved.as_deref(), Some("git:example.com/owner/payments"));
 }
 
 #[test]
@@ -1618,15 +1618,15 @@ fn resolve_known_project_ambiguous_short_name_lists_only_candidates() {
 #[test]
 fn resolve_known_project_expands_legacy_absolute_path() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("~/dev/antworld", "antworld")
+    db.get_or_create_project("~/dev/payments", "payments")
         .unwrap();
 
     // Not a real directory, so this falls back to folding the string itself
     // against a home prefix rather than walking a git root.
     let resolved = db
-        .resolve_known_project("/home/someoneelse/dev/antworld", None)
+        .resolve_known_project("/home/someoneelse/dev/payments", None)
         .unwrap();
-    assert_eq!(resolved.as_deref(), Some("~/dev/antworld"));
+    assert_eq!(resolved.as_deref(), Some("~/dev/payments"));
 }
 
 #[test]
@@ -1801,29 +1801,29 @@ fn adr_number_of(db: &Database, memory_id: &str) -> i64 {
 fn reconcile_merges_home_relative_id_after_remote_add() {
     let db = Database::open_in_memory().unwrap();
     // Before the remote existed, the repo's id was its home-relative directory.
-    db.get_or_create_project("~/dev/gardener", "~/dev/gardener")
+    db.get_or_create_project("~/dev/repo-a", "~/dev/repo-a")
         .unwrap();
-    store_fact(&db, "before-remote", "~/dev/gardener");
-    let derived = "git:example.com/owner/gardener";
+    store_fact(&db, "before-remote", "~/dev/repo-a");
+    let derived = "git:example.com/owner/repo-a";
     db.get_or_create_project(derived, derived).unwrap();
     store_fact(&db, "after-remote", derived);
 
     let report = db
-        .reconcile_project_root(derived, "~/dev/gardener")
+        .reconcile_project_root(derived, "~/dev/repo-a")
         .unwrap();
 
     assert_eq!(report.merges.len(), 1);
-    assert_eq!(report.merges[0].from, "~/dev/gardener");
+    assert_eq!(report.merges[0].from, "~/dev/repo-a");
     assert_eq!(report.merges[0].to, derived);
     assert_eq!(report.merges[0].memories, 1);
     assert!(report.merges[0].project_row);
     assert_eq!(memory_count(&db, derived), 2);
     assert_eq!(project_ids(&db), vec![derived.to_string()]);
-    assert_eq!(root_path(&db, derived).as_deref(), Some("~/dev/gardener"));
+    assert_eq!(root_path(&db, derived).as_deref(), Some("~/dev/repo-a"));
     assert_eq!(
         db.project_aliases()
             .unwrap()
-            .get("~/dev/gardener")
+            .get("~/dev/repo-a")
             .map(String::as_str),
         Some(derived)
     );

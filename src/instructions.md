@@ -45,7 +45,7 @@ This matters most when something is later deleted. Checking "is this recoverable
 
 # Working across projects
 
-Every tool defaults to the project the server was launched in. To read or write another project's memories, pass its ID as the `project` argument (e.g. `memory_context` with `project: "/home/me/dev/other-repo"`). Call `memory_projects` to list the available project IDs with their memory, handoff, and ADR counts; an unknown ID is rejected with the known ones listed. Since branch names are per-repository, `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
+Every tool defaults to the project the server was launched in. To read or write another project's memories, pass its ID as the `project` argument (e.g. `memory_context` with `project: "other-repo"`, a short name resolving to its full id). Call `memory_projects` to list the available project IDs with their memory, handoff, and ADR counts; an unknown ID is rejected with the known ones listed. Since branch names are per-repository, `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
 
 # When something you stored is no longer true
 
