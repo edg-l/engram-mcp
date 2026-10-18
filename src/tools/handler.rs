@@ -335,9 +335,11 @@ impl ToolHandler {
         }
     }
 
-    /// Invalidate search result cache for a project (call after memory modifications).
-    fn invalidate_search_cache(&self, project: &str) {
-        self.search_cache.invalidate_project(project);
+    /// Drop every cached search result (call after any memory modification). Not just
+    /// the written project's: a global memory appears in every project's results, and a
+    /// `project` argument lets one server write to any project.
+    fn invalidate_search_cache(&self) {
+        self.search_cache.invalidate_all();
     }
 
     pub fn handle_tool(&self, name: &str, arguments: Value) -> Result<Value, MemoryError> {
@@ -587,7 +589,7 @@ impl ToolHandler {
         )?;
 
         // Invalidate search cache since we added new data
-        self.invalidate_search_cache(&project);
+        self.invalidate_search_cache();
         // New knowledge landed, so the project's clock advanced and every other memory
         // in it is now one store-day more displaced.
         self.refresh_relevance(&project);
@@ -1023,7 +1025,9 @@ impl ToolHandler {
 
     fn memory_update(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryUpdateInput = parse_args("memory_update", arguments)?;
-        let project = self.resolve_project(input.project.as_deref())?;
+        // Validates the argument: an unknown project is an error even though the id alone
+        // names the memory.
+        self.resolve_project(input.project.as_deref())?;
 
         let request = MemoryUpdateRequest {
             id: input.id,
@@ -1033,6 +1037,7 @@ impl ToolHandler {
             tags: input.tags,
             summary: input.summary,
             pinned: input.pinned,
+            global: input.global,
             dead: input.dead,
             dead_reason: input.dead_reason,
             external_artifacts: input.external_artifacts,
@@ -1040,7 +1045,7 @@ impl ToolHandler {
         let outcome = update_memory(&self.db, &self.embedding, request)?;
 
         // Invalidate search cache since we updated data
-        self.invalidate_search_cache(&project);
+        self.invalidate_search_cache();
 
         Ok(json!({
             "success": true,
@@ -1082,7 +1087,7 @@ impl ToolHandler {
 
         if deleted {
             // Invalidate search cache since we deleted data
-            self.invalidate_search_cache(&project);
+            self.invalidate_search_cache();
             Ok(json!({
                 "success": true,
                 "message": "Memory deleted successfully",
@@ -1407,7 +1412,7 @@ impl ToolHandler {
 
         // Invalidate search cache since we added new data
         if stored > 0 {
-            self.invalidate_search_cache(&project);
+            self.invalidate_search_cache();
             self.refresh_relevance(&project);
         }
 
@@ -1468,7 +1473,7 @@ impl ToolHandler {
 
         if deleted > 0 {
             // Invalidate search cache since we deleted data
-            self.invalidate_search_cache(&project);
+            self.invalidate_search_cache();
         }
 
         Ok(json!({
@@ -1576,8 +1581,8 @@ impl ToolHandler {
         for warning in &outcome.warnings {
             tracing::warn!("memory_import: {warning}");
         }
-        for pid in &outcome.touched_projects {
-            self.invalidate_search_cache(pid);
+        if !outcome.touched_projects.is_empty() {
+            self.invalidate_search_cache();
         }
 
         let stats = &outcome.stats;
@@ -2264,7 +2269,9 @@ impl ToolHandler {
     /// Put a trashed memory back.
     fn memory_restore(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryRestoreInput = parse_args("memory_restore", arguments)?;
-        let project = self.resolve_project(input.project.as_deref())?;
+        // Validates the argument: an unknown project is an error even though the id alone
+        // names the memory.
+        self.resolve_project(input.project.as_deref())?;
 
         let entry = match (input.trash_id, input.id.as_deref()) {
             (Some(trash_id), _) => self.db.get_trash_entry(trash_id)?,
@@ -2290,7 +2297,7 @@ impl ToolHandler {
         })?;
 
         let outcome = self.db.restore_trash_entry(entry.trash_id)?;
-        self.invalidate_search_cache(&project);
+        self.invalidate_search_cache();
 
         Ok(json!({
             "success": true,
@@ -2362,7 +2369,7 @@ impl ToolHandler {
                 .delete_memories_batch_with_op(&ids, crate::db::OP_PRUNE)?;
 
             // Invalidate cache since we deleted data
-            self.invalidate_search_cache(&project);
+            self.invalidate_search_cache();
 
             Ok(json!({
                 "success": true,
@@ -2392,7 +2399,9 @@ impl ToolHandler {
 
     fn memory_promote(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryPromoteInput = parse_args("memory_promote", arguments)?;
-        let project = self.resolve_project(input.project.as_deref())?;
+        // Validates the argument: an unknown project is an error even though the id alone
+        // names the memory.
+        self.resolve_project(input.project.as_deref())?;
 
         // Get the memory first to verify it exists and get its current state
         let memory = self
@@ -2400,12 +2409,11 @@ impl ToolHandler {
             .get_memory(&input.id)?
             .ok_or_else(|| MemoryError::NotFound(input.id.clone()))?;
 
-        // Check if already global
         if memory.branch.is_none() {
             return Ok(json!({
                 "success": true,
                 "id": input.id,
-                "message": "Memory is already global",
+                "message": "Memory already has no branch: it is visible on every branch of its project",
                 "was_branch": null
             }));
         }
@@ -2417,12 +2425,15 @@ impl ToolHandler {
 
         if promoted {
             // Invalidate search cache since we changed data
-            self.invalidate_search_cache(&project);
+            self.invalidate_search_cache();
 
             Ok(json!({
                 "success": true,
                 "id": input.id,
-                "message": format!("Memory promoted from branch '{}' to global", was_branch.as_deref().unwrap_or("?")),
+                "message": format!(
+                    "Memory promoted from branch '{}' to every branch of its project",
+                    was_branch.as_deref().unwrap_or("?")
+                ),
                 "was_branch": was_branch
             }))
         } else {
@@ -2582,7 +2593,7 @@ impl ToolHandler {
                 }
             }
 
-            self.invalidate_search_cache(&project);
+            self.invalidate_search_cache();
 
             Ok(json!({
                 "success": true,
@@ -2769,7 +2780,7 @@ impl ToolHandler {
         )?;
 
         // Invalidate search cache since we added new data.
-        self.invalidate_search_cache(&project);
+        self.invalidate_search_cache();
 
         Ok(json!(result))
     }
@@ -2789,6 +2800,7 @@ impl ToolHandler {
             &self.embedding,
             &project,
             resolved_branch,
+            input.handoff_id.as_deref(),
             input.query.as_deref(),
             input.max_sections,
             input.include_off_branch,
@@ -2846,7 +2858,7 @@ impl ToolHandler {
             input.supersedes,
         )?;
 
-        self.invalidate_search_cache(&project);
+        self.invalidate_search_cache();
 
         Ok(json!(result))
     }
@@ -3454,6 +3466,7 @@ mod tests {
             &db,
             project_id,
             Some("main"),
+            None,
             Some(query_vec),
             5,
             false,
@@ -3511,6 +3524,7 @@ mod tests {
             &db,
             project_id,
             None, // branch=None → detached HEAD
+            None,
             Some(dummy_vec(0.5)),
             5,
             false,
@@ -3608,6 +3622,7 @@ mod tests {
             &db,
             project_id,
             Some("main"),
+            None,
             Some(dummy_vec(0.5)),
             5,
             false,

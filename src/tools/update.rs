@@ -28,6 +28,8 @@ pub struct MemoryUpdateRequest {
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
     pub pinned: Option<bool>,
+    /// Make the memory visible in every project (`true`) or only its own (`false`).
+    pub global: Option<bool>,
     /// Mark the memory dead (its subject no longer exists) or bring it back.
     pub dead: Option<bool>,
     /// Why it was marked dead. Recorded alongside the flag.
@@ -178,6 +180,15 @@ pub fn update_memory(
 
     if let Some(pinned) = request.pinned {
         memory.pinned = pinned;
+    }
+
+    if let Some(global) = request.global {
+        memory.global = global;
+        // A branch name belongs to one repository, so a memory every project sees
+        // cannot keep one; `memory_store` drops it on a global store for the same reason.
+        if global {
+            memory.branch = None;
+        }
     }
 
     if let Some(dead) = request.dead {

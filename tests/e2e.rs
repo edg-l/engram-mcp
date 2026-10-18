@@ -815,6 +815,55 @@ fn test_adr_content_edits_reach_the_sidecar() {
     assert_eq!(shown["decision"].as_str().unwrap(), "Postgres.");
 }
 
+/// `memory_update` can make an existing memory visible in every project, which until
+/// then only `memory_store` could, and can make it project-local again.
+#[test]
+fn test_memory_update_toggles_global() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.get_or_create_project("test-project", "test-project")
+        .unwrap();
+    db.get_or_create_project("other", "other").unwrap();
+    let h = ToolHandler::new(
+        db,
+        EmbeddingService::new().unwrap(),
+        "test-project".to_string(),
+        Some("feat/x".to_string()),
+        SearchMode::default(),
+    );
+    let stored = call(
+        &h,
+        "memory_store",
+        json!({"content": "Always run migrations inside a transaction", "type": "pattern", "branch": "auto"}),
+    );
+    let id = stored["id"].as_str().unwrap().to_string();
+    let visible_from_other = |h: &ToolHandler| {
+        let r = call(
+            h,
+            "memory_query",
+            json!({"query": "run migrations inside a transaction", "project": "other"}),
+        );
+        r.to_string().contains(&id)
+    };
+    assert!(!visible_from_other(&h));
+
+    call(&h, "memory_update", json!({"id": id, "global": true}));
+    assert!(visible_from_other(&h));
+    let exported = call(&h, "memory_export", json!({}));
+    let memory = exported["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == json!(id))
+        .unwrap()
+        .clone();
+    assert_eq!(memory["global"], json!(true));
+    assert_eq!(memory["branch"], json!(null));
+
+    call(&h, "memory_update", json!({"id": id, "global": false}));
+    assert!(!visible_from_other(&h));
+}
+
 #[test]
 fn test_memory_import_rejects_unknown_mode() {
     let (h, _dir) = setup(None);
@@ -865,6 +914,40 @@ fn test_sections_patch_keeps_chain_link_and_multi_line_items() {
     assert_eq!(sections["continues_from"], json!(first_id));
     assert_eq!(sections["tried"], json!([tried]));
     assert_eq!(sections["blockers"], json!(["waiting on review"]));
+}
+
+/// `handoff_id` resumes a chain other than the newest on the branch, which is how two
+/// efforts sharing a branch each pick up their own thread.
+#[test]
+fn test_handoff_resume_from_a_given_handoff() {
+    let (h, _dir) = setup(Some("main"));
+    let first = call(
+        &h,
+        "handoff_create",
+        json!({"sections": {"summary": "Billing export: CSV writer half done"}}),
+    );
+    let first_id = first["id"].as_str().unwrap().to_string();
+    call(
+        &h,
+        "handoff_create",
+        json!({"sections": {"summary": "Unrelated: upgraded the logging crate"}}),
+    );
+
+    let resumed = h
+        .handle_tool("handoff_resume", json!({"handoff_id": first_id}))
+        .unwrap();
+    assert_eq!(resumed["latest_handoff_id"], json!(first_id));
+    assert_eq!(resumed["chain"], json!([first_id]));
+
+    let fact = call(
+        &h,
+        "memory_store",
+        json!({"content": "not a handoff", "type": "fact"}),
+    );
+    let err = h
+        .handle_tool("handoff_resume", json!({"handoff_id": fact["id"]}))
+        .unwrap_err();
+    assert!(err.to_string().contains("not a handoff"), "{err}");
 }
 
 #[test]

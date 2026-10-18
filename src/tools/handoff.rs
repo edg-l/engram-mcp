@@ -476,10 +476,45 @@ pub fn auto_link_handoff_sections(
 /// without a real `EmbeddingService`.  Pass `query_vec=None` to skip scoring (returns
 /// no section matches); pass `Some(vec)` to score all sections.
 #[allow(clippy::too_many_arguments)]
+/// The handoff a resume walks back from: `handoff_id` when given (it must be a handoff of
+/// `project_id`), else the newest handoff on the branch, or in the project when
+/// `fetch_all`.
+fn starting_handoff(
+    db: &Database,
+    project_id: &str,
+    handoff_id: Option<&str>,
+    branch: Option<&str>,
+    fetch_all: bool,
+) -> Result<Option<Memory>, MemoryError> {
+    if let Some(id) = handoff_id {
+        return match db.get_memory(id)? {
+            Some(m) if m.memory_type == MemoryType::Handoff && m.project_id == project_id => {
+                Ok(Some(m))
+            }
+            Some(m) if m.memory_type != MemoryType::Handoff => Err(MemoryError::InvalidArguments {
+                tool: "handoff_resume".to_string(),
+                message: format!("{id} is a {}, not a handoff", m.memory_type),
+                received: "handoff_id".to_string(),
+            }),
+            _ => Err(MemoryError::NotFound(format!(
+                "handoff {id} in project {project_id}"
+            ))),
+        };
+    }
+    let latest = if fetch_all {
+        db.list_recent_handoffs(project_id, 1)?
+    } else {
+        db.query_handoffs_by_branch(project_id, branch, 1)?
+    };
+    Ok(latest.into_iter().next())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn resume_handoff_with_vec(
     db: &Database,
     project_id: &str,
     branch: Option<&str>,
+    handoff_id: Option<&str>,
     query_vec: Option<Vec<f32>>,
     max_sections: usize,
     include_off_branch: bool,
@@ -507,14 +542,15 @@ pub fn resume_handoff_with_vec(
         &store_days,
     )?;
 
-    // Step 2: fetch latest handoffs.
-    let latest_list = if fetch_all {
-        db.list_recent_handoffs(project_id, 10)?
-    } else {
-        db.query_handoffs_by_branch(project_id, resolved_branch.as_deref(), 10)?
-    };
-
-    let Some(latest) = latest_list.into_iter().next() else {
+    // Step 2: the handoff to walk back from.
+    let Some(latest) = starting_handoff(
+        db,
+        project_id,
+        handoff_id,
+        resolved_branch.as_deref(),
+        fetch_all,
+    )?
+    else {
         return Ok(HandoffResumeResult {
             branch: resolved_branch,
             latest_handoff_id: None,
@@ -728,6 +764,7 @@ pub fn resume_handoff(
     embedding: &EmbeddingService,
     project_id: &str,
     branch: Option<&str>,
+    handoff_id: Option<&str>,
     query: Option<&str>,
     max_sections: usize,
     include_off_branch: bool,
@@ -751,13 +788,14 @@ pub fn resume_handoff(
     {
         Some(embedding.embed(q)?)
     } else {
-        // Fallback: use latest handoff summary.
-        let latest_list = if fetch_all_peek {
-            db.list_recent_handoffs(project_id, 1)?
-        } else {
-            db.query_handoffs_by_branch(project_id, resolved_branch_peek.as_deref(), 1)?
-        };
-        if let Some(latest) = latest_list.into_iter().next() {
+        // Fallback: the starting handoff's summary.
+        if let Some(latest) = starting_handoff(
+            db,
+            project_id,
+            handoff_id,
+            resolved_branch_peek.as_deref(),
+            fetch_all_peek,
+        )? {
             let fallback_text = match db.get_handoff_sections(&latest.id)? {
                 Some((s, _)) => s.summary,
                 None => latest
@@ -776,6 +814,7 @@ pub fn resume_handoff(
         db,
         project_id,
         branch,
+        handoff_id,
         query_vec,
         max_sections,
         include_off_branch,

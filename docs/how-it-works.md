@@ -64,7 +64,7 @@ Deleting, pruning, merging and overwriting all put a snapshot in the trash, with
 
 A project id is the repo's git remote, normalized so that `git@github.com:me/repo.git` and `https://github.com/me/repo` are the same id (`git:github.com/me/repo`). A repo without a remote uses its path relative to the home directory (`~/dev/repo`), which matches across machines with different user names.
 
-Engram records the directory each id came from. When a repo gains a remote, or its remote changes, the next run in that directory merges the old project into the new one and prints a line saying so. Worktrees record their main checkout, so they never split a project. A directory without a remote never absorbs another project.
+Every worktree of a repo resolves to its main checkout, so all of them are one project. Engram records the directory each id came from. When a repo gains a remote, or its remote changes, the next run in that directory merges the old project into the new one and prints a line saying so. A directory without a remote never absorbs another project.
 
 ## Sync
 

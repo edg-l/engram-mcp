@@ -10,6 +10,7 @@ engram-cli handoff create --non-interactive \
   --summary "Cut the 2.0 branch" --tried "bulk UPDATE, locked the table"
 engram-cli handoff create --from-file session.md  # pre-written markdown
 engram-cli handoff resume --branch feat/x
+engram-cli handoff resume --handoff-id mem_abc123   # that handoff's chain, not the newest
 engram-cli handoff search "auth refactor" --section blockers,tried
 ```
 
@@ -46,6 +47,7 @@ engram-cli list --order created          # relevance | created | updated | acces
 engram-cli update mem_abc123 -c "Updated content" --importance 0.9
 engram-cli update mem_abc123 --sections-json '{"blockers": []}'   # patch a handoff
 engram-cli update mem_abc123 --dead --dead-reason "service retired"
+engram-cli update mem_abc123 --global    # visible in every project; --local undoes it
 engram-cli pin mem_abc123
 engram-cli link mem_abc123 mem_def456 -r relates_to
 engram-cli delete mem_abc123

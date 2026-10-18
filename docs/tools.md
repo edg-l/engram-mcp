@@ -7,7 +7,7 @@ Every tool takes an optional `project` argument; see [Project scoping](#project-
 | Tool | What it does |
 |---|---|
 | `handoff_create` | Write a handoff with sections `summary` (required), `decisions`, `blockers`, `tried`, `mental_model`, `next_steps`, `notes`. Chains to the previous handoff on the branch with `continues_from`. |
-| `handoff_resume` | The top-scoring sections across the branch's recent handoff chain, plus open todos, the newest handoff's blockers, and linked memories. |
+| `handoff_resume` | The top-scoring sections across the branch's recent handoff chain, plus open todos, the newest handoff's blockers, and linked memories. `handoff_id` resumes a given handoff's chain instead of the newest, for two efforts sharing a branch. |
 | `handoff_search` | Search handoff sections by content, optionally limited to a branch or to sections such as `tried`. |
 
 ## Todos
@@ -26,11 +26,11 @@ Every tool takes an optional `project` argument; see [Project scoping](#project-
 | `memory_context` | The memories most relevant to a description of the current task. |
 | `memory_query` | Search, with filters on type, branch and relevance, and pagination. |
 | `memory_list` | List without a query, filtered by type, tag or status (`live`, `superseded`, `dead`, `all`). |
-| `memory_update` | Change content, tags, importance, pinned or dead status; patch a handoff's `sections`. Returns the previous version. |
+| `memory_update` | Change content, tags, importance, pinned, global or dead status; patch a handoff's `sections`. Returns the previous version. |
 | `memory_delete`, `memory_delete_batch` | Delete memories. Both go to the trash. |
 | `memory_trash`, `memory_restore` | List the trash; restore a memory with its embedding and links. |
 | `memory_link`, `memory_graph` | Link two memories (`relates_to`, `supersedes`, `derived_from`); walk the links from one. |
-| `memory_promote` | Make a branch-local memory global. |
+| `memory_promote` | Make a branch-local memory visible on every branch of its project. |
 | `memory_prune`, `memory_dedup` | Remove low-relevance memories; merge duplicates. Both dry-run by default. |
 | `memory_export`, `memory_import` | Export a project to JSON; import one, merging by last write wins on `updated_at`, or replacing. |
 | `memory_stats`, `memory_projects` | Counts for one project; every project in the store. |
@@ -73,7 +73,7 @@ Every tool takes an optional `project` argument; see [Project scoping](#project-
 
 - `importance`: 0.3 minor, 0.5 normal (default), 0.7 important, 0.9 critical.
 - `pinned: true` exempts the memory from decay and pruning.
-- `global: true` makes it visible in every project.
+- `global: true` makes it visible in every project and clears its branch. `memory_update` sets or clears it on an existing memory.
 - `external_artifacts` lists files, URLs or ids the memory refers to. Local paths that no longer exist are marked `[missing]` when the memory is retrieved. Pass `[]` to `memory_update` to clear the list.
 - `supersedes: [id]` replaces an existing memory; retrieval then returns the new one in its place.
 

@@ -11,6 +11,8 @@
 - **A repo keeps one project id when its remote is added or changed.** The directory a derived id came from is recorded as `projects.root_path` (a worktree records its main checkout), and every `engram`/`engram-cli` start folds earlier ids for that directory into the current one, printing one `[engram] merged project …` line. `engram-cli projects merge <from> <to>` does the same by hand, dry run by default. Merged-away ids are kept as aliases: `-p`, `project:` and `ENGRAM_PROJECT` naming one resolve to the survivor, and an all-projects import never recreates it.
 - **Todo `detail`.** `todo_write` `add`/`edit` (CLI `--detail`) store a long finding as a linked `fact` memory and report `detail_id`; the todo stays a one-line title. A detail that cannot be stored is reported as `detail_error` on an op that otherwise succeeded, so a retry does not duplicate the todo.
 - **Stale todos.** Todos untouched for 30+ active store-days are counted in `handoff_resume` (`stale_todo_count`, `stale_todo_ids`) and `todo_list`.
+- **`memory_update` sets `global`** on an existing memory (CLI: `update --global` / `--local`), which only `memory_store` could do before. Making a memory global clears its branch, as a global store does.
+- **`handoff_resume` takes a `handoff_id`** (CLI: `handoff resume --handoff-id`) and walks that handoff's chain instead of the newest one on the branch, for two efforts sharing a branch.
 - **`memory_update` takes a partial `sections` patch for handoffs.** Fields given replace, fields omitted keep their stored value, and an unknown field is an error. CLI: `update --sections-json`.
 
 ### Changed
@@ -19,6 +21,8 @@
 - **More argument shapes accepted** (see `CLAUDE.md`, Argument tolerance). `type` on `memory_store` now defaults to `fact`, and an argument error names the tool and the fields it received. `handoff_create` refuses an empty `summary`, and section fields given both inside `sections` and at the top level.
 - **`possible_supersedes` threshold raised from 0.75 to 0.88**, measured on the live store; at 0.75 it fired on most stores.
 - **`engram-cli update` runs the same update path as `memory_update`.**
+- **Every git worktree of a repo is one project**, including repos without a remote, which used to get a separate `~/…` id per worktree. Memories already stored under a worktree's old id stay there; `engram-cli projects merge` moves them.
+- **`memory_promote` says what it does**: it clears a memory's branch, making it visible on every branch of its project, not in every project. Its messages no longer call that "global".
 - **ADRs display from the `adr_sections` sidecar** in every view, CLI `query`/`show` and `memory://` included, never from the `# NNNN.` heading stored in the content, which goes stale after a renumber.
 - **`memory_import` reports** `project`, `cleared`, `reembedded_from_model` and `warnings`; `model_warning` is gone.
 
@@ -30,6 +34,7 @@
 - **A merge keeps the provenance of a consumed composite.** Its `merged_from` entries fold into the survivor, so every absorbed id stays resolvable and its content recorded.
 - **A `sections` patch kept neither `continues_from` nor multi-line items.** The chain link was cleared and every line after an item's first was dropped. List items now keep their continuation lines through render and parse, and a plain-string section with a lead-in line before its bullets keeps that line as an item.
 - **Editing an ADR's content updates its sidecar**, which the compact views render from.
+- **A change to a global memory reaches every project's search results.** The search cache was cleared only for the project written to, so other projects kept serving stale results for up to a minute.
 - **An invalid import `mode` is an error** on both `memory_import` and `engram-cli import`, instead of falling back to merge.
 - **Handoff and ADR content parse failures name the canonical headings** and return `InvalidArguments`, suggesting `sections` for handoffs. A rejected update no longer leaves a trash snapshot.
 - **`engram-cli list` no longer panics** on content with a multi-byte character near the 60th byte.

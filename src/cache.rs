@@ -114,21 +114,9 @@ impl SearchResultCache {
         self.cache.insert(key, Arc::new(results));
     }
 
-    /// Invalidate all cached results for a project.
-    /// Call this when memories are added, updated, or deleted.
-    pub fn invalidate_project(&self, project_id: &str) {
-        // Collect keys to invalidate first, then invalidate them
-        // This is needed because invalidate_entries_if may be deferred
-        let keys_to_remove: Vec<SearchResultKey> = self
-            .cache
-            .iter()
-            .filter(|(k, _)| k.project_id == project_id)
-            .map(|(k, _)| (*k).clone())
-            .collect();
-
-        for key in keys_to_remove {
-            self.cache.invalidate(&key);
-        }
+    /// Drop every cached result.
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
     }
 }
 
@@ -175,7 +163,7 @@ mod tests {
         assert_eq!(cached.unwrap(), results);
 
         // Test invalidation
-        cache.invalidate_project("project1");
+        cache.invalidate_all();
         assert!(cache.get("project1", &embedding).is_none());
     }
 

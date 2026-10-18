@@ -188,6 +188,12 @@ enum Commands {
         /// Why it is dead.
         #[arg(long, requires = "dead")]
         dead_reason: Option<String>,
+        /// Make the memory visible in every project (clears its branch).
+        #[arg(long)]
+        global: bool,
+        /// Make the memory visible only in its own project.
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
     },
     /// List recoverable snapshots of destroyed memories
     Trash {
@@ -476,6 +482,9 @@ enum HandoffCmd {
         /// Branch to load handoffs from (defaults to current branch)
         #[arg(long)]
         branch: Option<String>,
+        /// Resume from this handoff's chain instead of the newest on the branch
+        #[arg(long)]
+        handoff_id: Option<String>,
         /// Query string for section scoring (defaults to latest handoff summary)
         #[arg(long)]
         query: Option<String>,
@@ -905,6 +914,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dead,
             alive,
             dead_reason,
+            global,
+            local,
         } => {
             // external_artifacts semantics for CLI:
             //   --clear-artifacts       -> Some([]) (clear)
@@ -939,6 +950,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 external_artifacts,
                 dead_flag,
                 dead_reason.as_deref(),
+                (global || local).then_some(global),
             )?;
         }
         Commands::Link {
@@ -1795,6 +1807,7 @@ fn cmd_update(
     external_artifacts: Option<Vec<String>>,
     dead: Option<bool>,
     dead_reason: Option<&str>,
+    global: Option<bool>,
 ) -> Result<(), MemoryError> {
     let request = tools::MemoryUpdateRequest {
         id: id.to_string(),
@@ -1804,6 +1817,7 @@ fn cmd_update(
         tags: tags.map(|tags_str| tags_str.split(',').map(|s| s.trim().to_string()).collect()),
         summary,
         pinned: None,
+        global,
         dead,
         dead_reason: dead_reason.map(str::to_string),
         external_artifacts,
@@ -3210,6 +3224,7 @@ fn cmd_handoff(
         }
         HandoffCmd::Resume {
             branch,
+            handoff_id,
             query,
             max,
             include_off_branch,
@@ -3226,6 +3241,7 @@ fn cmd_handoff(
                 embedding,
                 project_id,
                 resolved_branch,
+                handoff_id.as_deref(),
                 query.as_deref(),
                 max,
                 include_off_branch,

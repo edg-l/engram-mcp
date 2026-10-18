@@ -256,6 +256,7 @@ pub struct MemoryUpdateInput {
     pub tags: Option<Vec<String>>,
     pub summary: Option<String>,
     pub pinned: Option<bool>,
+    pub global: Option<bool>,
     /// Mark the memory dead (its subject no longer exists) or bring it back. A dead
     /// memory is excluded from retrieval with no redirect, because there is nothing
     /// current to redirect to. Use `supersedes` on a new memory instead whenever a
@@ -554,6 +555,8 @@ pub struct HandoffCreateInput {
 pub struct HandoffResumeInput {
     /// Branch to fetch handoffs for. Defaults to the current branch.
     pub branch: Option<String>,
+    /// Resume from this handoff's chain instead of the newest one on the branch.
+    pub handoff_id: Option<String>,
     /// Query string for scoring sections. Defaults to the latest handoff summary.
     pub query: Option<String>,
     /// Maximum number of top sections to return. Default 5.
@@ -777,6 +780,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces old)."},
                     "summary": {"type": "string", "description": "New summary (replaces old)."},
                     "pinned": {"type": "boolean", "description": "Pin this memory so it never decays or gets pruned. Use for critical, permanent knowledge."},
+                    "global": {"type": "boolean", "description": "true makes the memory visible in every project (and clears its branch); false makes it visible only in its own project."},
                     "dead": {"type": "boolean", "description": "Mark this memory dead: its subject no longer exists (the service was retired, the file deleted) and there is no replacement. Dead memories are excluded from search entirely. If a replacement exists, store it with `supersedes` instead so searches get redirected rather than nothing."},
                     "dead_reason": {"type": "string", "description": "Why it is dead. Recorded alongside the flag."},
                     "external_artifacts": {
@@ -954,7 +958,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_promote",
-            "Make a branch-scoped memory visible globally. Use when a branch-specific finding should be preserved across all branches.",
+            "Make a branch-scoped memory visible on every branch of its project. Use when a branch-specific finding should outlive the branch. It stays in its own project; `memory_update` with `global: true` makes a memory visible in every project.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1069,6 +1073,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "branch": {
                         "type": "string",
                         "description": "Branch to fetch handoffs for. Defaults to the current branch."
+                    },
+                    "handoff_id": {
+                        "type": "string",
+                        "description": "Resume from this handoff and the chain behind it instead of the newest handoff on the branch. Use when several efforts share a branch."
                     },
                     "query": {
                         "type": "string",

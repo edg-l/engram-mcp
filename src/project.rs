@@ -197,20 +197,20 @@ pub struct ProjectIdentity {
 /// always recorded, since the directory outlives any one remote URL.
 pub fn project_identity_for_dir(dir: &Path) -> ProjectIdentity {
     let git_root = find_git_root_from(dir);
-    let own_dir = home_relative(&git_root.as_deref().unwrap_or(dir).to_string_lossy());
+    // Every worktree of a repo resolves to the main checkout, so all of them are one
+    // project, with or without a remote. Recording the worktree's own path would also
+    // move the repo's `root_path` to whichever checkout ran last, and a later folder at
+    // a removed worktree's path would claim the repo.
+    let root = git_root
+        .as_deref()
+        .and_then(main_worktree_root)
+        .unwrap_or_else(|| git_root.clone().unwrap_or_else(|| dir.to_path_buf()));
+    let root = home_relative(&root.to_string_lossy());
     let id = git_root
         .as_deref()
         .and_then(git_remote_url)
         .and_then(|url| normalize_remote_url(&url))
-        .unwrap_or_else(|| own_dir.clone());
-    // Every worktree of a repo records the main checkout as its directory. Recording
-    // the worktree's own path would move the repo's `root_path` to whichever checkout
-    // ran last, and a later folder at a removed worktree's path would claim the repo.
-    let root = git_root
-        .as_deref()
-        .and_then(main_worktree_root)
-        .map(|main| home_relative(&main.to_string_lossy()))
-        .unwrap_or(own_dir);
+        .unwrap_or_else(|| root.clone());
     ProjectIdentity {
         id,
         root: Some(root),
@@ -351,7 +351,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worktree_records_the_main_checkout_as_its_root() {
+    fn worktrees_resolve_to_the_main_checkout() {
         let dir = tempfile::tempdir().unwrap();
         // git reports the common dir with symlinks resolved (macOS's /var is
         // /private/var), so compare from the resolved path.
@@ -370,6 +370,18 @@ mod tests {
         std::fs::create_dir(&main).unwrap();
         git(&["init", "-q"], &main);
         git(&["commit", "-q", "--allow-empty", "-m", "init"], &main);
+        let worktree = base.join("wt");
+        git(
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+            &main,
+        );
+
+        // Without a remote the id is the directory, which must be the main checkout's.
+        assert_eq!(
+            project_identity_for_dir(&worktree),
+            project_identity_for_dir(&main)
+        );
+
         git(
             &[
                 "remote",
@@ -379,17 +391,9 @@ mod tests {
             ],
             &main,
         );
-        let worktree = base.join("wt");
-        git(
-            &["worktree", "add", "-q", worktree.to_str().unwrap()],
-            &main,
-        );
-
-        let from_main = project_identity_for_dir(&main);
         let from_worktree = project_identity_for_dir(&worktree);
-
         assert_eq!(from_worktree.id, "git:example.com/owner/repo");
-        assert_eq!(from_worktree.root, from_main.root);
+        assert_eq!(from_worktree, project_identity_for_dir(&main));
     }
 
     #[test]
