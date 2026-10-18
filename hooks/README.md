@@ -13,9 +13,8 @@ which handles the `SessionStart` event separately.
 engram-cli hooks install
 ```
 
-This writes 6 managed hook entries to `~/.claude/settings.json`:
-`UserPromptSubmit`, `PostToolUse`, `Stop`, `PreCompact`, `SessionEnd`,
-`SubagentStop`. Each entry carries `"_source": "engram-cli"` so that
+This writes 3 managed hook entries to `~/.claude/settings.json`:
+`UserPromptSubmit`, `SessionEnd` and `SubagentStop`. Each entry carries `"_source": "engram-cli"` so that
 `hooks uninstall` can remove only the managed entries without touching any
 user-authored hooks. If `~/.claude/settings.json` already exists, a backup
 is created at `settings.json.bak.<timestamp>` before writing.
@@ -28,25 +27,27 @@ is created at `settings.json.bak.<timestamp>` before writing.
 | Event | Memory type | Trigger condition | Notes |
 |---|---|---|---|
 | `SessionStart` | (context load, no store) | Every session start | Handled by `scripts/engram-hook.sh`, not by `hooks install`. See [SessionStart loader](#sessionstart-loader). |
-| `UserPromptSubmit` | `Decision` | Prompt contains a cue word and is >= `ENGRAM_HOOK_MIN_CHARS` chars | Cue regex default: `let's`, `decided`, `we'll`, `going to`, `switched to`, `use`, `prefer`, `chose`, `choose`, `reason`, `because`. |
-| `PostToolUse` | (none, no-op) | Never | Tool-call outcomes are deliberately not captured — low-signal noise that bloats the store. The dispatch handler validates the payload and returns immediately. |
-| `Stop` | `handoff` (or `Fact` fallback when no git branch) | `last_assistant_message` >= 200 chars and `stop_hook_active` is not `true` | `stop_hook_active=true` means a Stop hook is already running; skipped to prevent reentrance. |
-| `PreCompact` | `handoff` (or `Fact` fallback when no git branch) | Always fires when Claude Code compacts context | Uses `custom_instructions` as the summary if present, otherwise stores a timestamp marker. |
-| `SessionEnd` | `Fact` (importance 0.3) | Session ends for any reason except `clear` or `resume` | Low importance. Skipped on `reason: "clear"` and `reason: "resume"`. |
-| `SubagentStop` | `Fact` (importance 0.55) | Subagent completes; `last_assistant_message` >= 200 chars | Off by default. Requires `ENGRAM_HOOK_SUBAGENTSTOP_ENABLED=true`. |
+| `UserPromptSubmit` | `Fact` | Prompt is >= `ENGRAM_HOOK_MIN_CHARS` bytes and contains `#remember` or a cue word | Off by default; requires `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED=true`. Cue regex default: `let's`, `decided`, `we'll`, `going to`, `switched to`, `use`, `prefer`, `chose`, `choose`, `reason`, `because`. |
+| `PostToolUse` | (none, no-op) | Never | Tool-call outcomes are deliberately not captured: they are low-signal noise that bloats the store. The dispatch handler validates the payload and returns immediately. |
+| `Stop` | (none, no-op) | Never | Fires on every agent turn; capturing each one would be volume without signal. Not installed. |
+| `PreCompact` | (none, no-op) | Never | `SessionEnd` already stores the session summary; a mid-session checkpoint would duplicate it. Not installed. |
+| `SessionEnd` | `Fact` (importance 0.4), tagged `session_summary` | Session ends for any reason except `clear` or `resume`, and the transcript has an assistant message | Stores the transcript's last assistant message. |
+| `SubagentStop` | `Fact` (importance 0.5) | Subagent completes; `last_assistant_message` >= 200 chars | Off by default. Requires `ENGRAM_HOOK_SUBAGENTSTOP_ENABLED=true`. |
 
 ## Env vars
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` | `true` | Enable/disable the UserPromptSubmit handler. |
+| `ENGRAM_HOOK_USERPROMPTSUBMIT_ENABLED` | `false` | Enable/disable the UserPromptSubmit handler. |
 | `ENGRAM_HOOK_STOP_ENABLED` | `true` | Enable/disable the Stop handler. |
 | `ENGRAM_HOOK_PRECOMPACT_ENABLED` | `true` | Enable/disable the PreCompact handler. |
 | `ENGRAM_HOOK_SESSIONEND_ENABLED` | `true` | Enable/disable the SessionEnd handler. |
 | `ENGRAM_HOOK_SUBAGENTSTOP_ENABLED` | `false` | Enable/disable the SubagentStop handler. Must be explicitly set to `true`. |
 | `ENGRAM_HOOK_SESSIONSTART_ENABLED` | `true` | Controls the SessionStart handler in dispatch. No effect on `hooks install` (SessionStart is never managed). |
 | `ENGRAM_HOOK_MIN_CHARS` | `40` | Minimum byte length for prompt content to be processed by UserPromptSubmit. |
-| `ENGRAM_HOOK_MIN_IMPORTANCE` | `0.5` | Minimum importance score for hook-stored memories. |
+| `ENGRAM_HOOK_MIN_IMPORTANCE` | `0.5` | Importance of UserPromptSubmit captures. Every hook capture is capped at 0.5, so higher values have no effect. |
+| `ENGRAM_HOOK_DEDUP_SKIP` | `0.95` | Similarity above which a capture is dropped as a near-duplicate. Clamped to 0.5–1.0. |
+| `ENGRAM_HOOK_DAILY_CAP` | `50` | Captures per project per UTC day; `0` for no limit. |
 | `ENGRAM_HOOK_PROMPT_CUE_REGEX` | (built-in regex) | Override the cue word pattern for UserPromptSubmit. Must be a valid Rust `regex` crate pattern. |
 
 Set any per-event toggle to `0`, `false`, or `no` to disable; `1`, `true`, or
@@ -57,17 +58,17 @@ Set any per-event toggle to `0`, `false`, or `no` to disable; `1`, `true`, or
 Before any content is stored, it passes through a redaction filter. The
 following six pattern classes are matched and replaced with `[REDACTED]`:
 
-- **AWS access key ID**: patterns matching `AKIA` followed by 16 uppercase
+- AWS access key ID: patterns matching `AKIA` followed by 16 uppercase
   alphanumeric characters.
-- **AWS secret access key (context-gated)**: patterns matching
+- AWS secret access key (context-gated): patterns matching
   `aws_secret_access_key` (case-insensitive) followed by a 40-char value.
-- **GitHub tokens**: fine-grained PATs, OAuth tokens, and server tokens
+- GitHub tokens: fine-grained PATs, OAuth tokens, and server tokens
   matching the `gh[pousr]_` prefix followed by 36+ alphanumeric characters.
-- **Generic env assignment**: variable names ending in `_KEY`, `_SECRET`,
+- Generic env assignment: variable names ending in `_KEY`, `_SECRET`,
   `_TOKEN`, or `PASSWORD` followed by `=value`; only the value is replaced,
   the variable name remains visible.
-- **JWTs**: three Base64url segments matching the `eyJ...eyJ...` structure.
-- **OpenAI secret keys**: strings matching `sk-` followed by 20+ alphanumeric
+- JWTs: three Base64url segments matching the `eyJ...eyJ...` structure.
+- OpenAI secret keys: strings matching `sk-` followed by 20+ alphanumeric
   characters.
 
 This is a best-effort filter, not a complete DLP solution. Do not rely on it
@@ -88,7 +89,7 @@ Use `--dry-run` to preview what would be stored without writing anything:
 echo '{"reason":"other"}' | engram-cli hook-event SessionEnd --dry-run
 ```
 
-Canned payloads for all six managed events are in `hooks/fixtures/`. Pipe any
+Canned payloads for each event are in `hooks/fixtures/`. Pipe any
 of them to test a specific handler:
 
 ```bash
