@@ -80,27 +80,23 @@ impl Database {
         Ok(exists)
     }
 
-    /// List every project in the store with its memory, handoff, and ADR counts.
-    /// Projects that only have memories and no `projects` row are included.
+    /// Every project that owns at least one memory, with its memory, handoff, and ADR
+    /// counts, most recently active first.
+    ///
+    /// A `projects` row alone does not count: one is recorded for every directory a
+    /// session or hook runs in, so listing them buries the real projects and makes short
+    /// names ambiguous. `project_exists` still accepts such a row as an exact id.
     pub fn list_projects(&self) -> Result<Vec<ProjectSummary>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT p.id,
-                    COALESCE(m.total, 0),
-                    COALESCE(m.handoffs, 0),
-                    COALESCE(m.adrs, 0),
-                    m.latest
-             FROM (SELECT id FROM projects UNION SELECT project_id FROM memories) p
-             LEFT JOIN (
-                 SELECT project_id,
-                        COUNT(*) AS total,
-                        SUM(memory_type = 'handoff') AS handoffs,
-                        SUM(memory_type = 'adr') AS adrs,
-                        MAX(updated_at) AS latest
-                 FROM memories
-                 GROUP BY project_id
-             ) m ON m.project_id = p.id
-             ORDER BY m.latest DESC NULLS LAST, p.id",
+            "SELECT project_id,
+                    COUNT(*),
+                    SUM(memory_type = 'handoff'),
+                    SUM(memory_type = 'adr'),
+                    MAX(updated_at) AS latest
+             FROM memories
+             GROUP BY project_id
+             ORDER BY latest DESC, project_id",
         )?;
 
         let rows = stmt.query_map([], |row| {

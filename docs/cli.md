@@ -71,6 +71,7 @@ engram-cli adr export --write            # docs/adr/NNNN-slug.md
 engram-cli projects                                          # every project in the store
 engram-cli projects merge ~/dev/old git:github.com/me/new    # dry run: what would move
 engram-cli projects merge ~/dev/old git:github.com/me/new --confirm
+engram-cli projects prune                                    # projects that own nothing; --confirm removes them
 engram-cli export -o backup.json
 engram-cli export --all-projects --embeddings -o full.json
 engram-cli import backup.json                                # merge; --mode replace to replace

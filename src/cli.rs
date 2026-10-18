@@ -545,6 +545,13 @@ enum ProjectsCmd {
         #[arg(long)]
         confirm: bool,
     },
+    /// Remove projects that own nothing (no memories, ADRs, trash entries or clusters);
+    /// dry run by default
+    Prune {
+        /// Delete them; without it, only list them
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Subcommands for `engram-cli adr`.
@@ -801,7 +808,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !project_was_explicit {
         project_id = canonical_id;
     }
-    db.get_or_create_project(&project_id, &project_id)?;
 
     // Initialize embedding service once, only if needed (saves ~500ms for commands that don't need it)
     let embedding_service = if needs_embedding_service(&cli.command) {
@@ -1011,6 +1017,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = cmd_projects_merge(&db, &from, &to, confirm) {
                 eprintln!("{error}");
                 std::process::exit(1);
+            }
+        }
+        Commands::Projects {
+            cmd: Some(ProjectsCmd::Prune { confirm }),
+        } => {
+            let ids = db.prune_empty_projects(confirm)?;
+            for id in &ids {
+                println!("  {id}");
+            }
+            if confirm {
+                println!("Removed {} empty project(s).", ids.len());
+            } else {
+                println!(
+                    "{} empty project(s) would be removed; pass --confirm to remove them.",
+                    ids.len()
+                );
             }
         }
         Commands::Decay => {
@@ -2557,11 +2579,11 @@ fn cmd_health(db: &Database, project_id: &str) -> Result<(), MemoryError> {
 /// makes an external timer a complete substitute -- otherwise trash retention would be
 /// reachable only from a server that happened to stay up for an hour.
 fn cmd_decay(db: &Database, project_id: &str) -> Result<(), MemoryError> {
-    let project = db
+    let decay_rate = db
         .get_project(project_id)?
-        .ok_or_else(|| MemoryError::NotFound(project_id.to_string()))?;
+        .map_or(db::DEFAULT_DECAY_RATE, |p| p.decay_rate);
 
-    let updated = db.update_relevance_scores(project_id, project.decay_rate)?;
+    let updated = db.update_relevance_scores(project_id, decay_rate)?;
     println!("Updated relevance scores for {} memories", updated);
 
     let pruned = db.auto_prune_stale_memories(project_id)?;

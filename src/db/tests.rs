@@ -1574,10 +1574,8 @@ fn wipe_is_recoverable() {
 #[test]
 fn resolve_known_project_matches_unique_last_segment() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("git:example.com/owner/payments", "payments")
-        .unwrap();
-    db.get_or_create_project("home-project", "home-project")
-        .unwrap();
+    store_fact(&db, "m1", "git:example.com/owner/payments");
+    store_fact(&db, "m2", "home-project");
 
     let resolved = db.resolve_known_project("payments", None).unwrap();
     assert_eq!(resolved.as_deref(), Some("git:example.com/owner/payments"));
@@ -1586,8 +1584,7 @@ fn resolve_known_project_matches_unique_last_segment() {
 #[test]
 fn resolve_known_project_matches_case_insensitively() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("git:example.com/owner/payments", "payments")
-        .unwrap();
+    store_fact(&db, "m3", "git:example.com/owner/payments");
 
     let resolved = db.resolve_known_project("Payments", None).unwrap();
     assert_eq!(resolved.as_deref(), Some("git:example.com/owner/payments"));
@@ -1596,12 +1593,9 @@ fn resolve_known_project_matches_case_insensitively() {
 #[test]
 fn resolve_known_project_ambiguous_short_name_lists_only_candidates() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("git:example.com/alice/widget", "widget")
-        .unwrap();
-    db.get_or_create_project("git:example.com/bob/widget", "widget")
-        .unwrap();
-    db.get_or_create_project("home-project", "home-project")
-        .unwrap();
+    store_fact(&db, "m4", "git:example.com/alice/widget");
+    store_fact(&db, "m5", "git:example.com/bob/widget");
+    store_fact(&db, "m6", "home-project");
 
     let err = db.resolve_known_project("widget", None).unwrap_err();
     match err {
@@ -1618,8 +1612,7 @@ fn resolve_known_project_ambiguous_short_name_lists_only_candidates() {
 #[test]
 fn resolve_known_project_expands_legacy_absolute_path() {
     let db = Database::open_in_memory().unwrap();
-    db.get_or_create_project("~/dev/payments", "payments")
-        .unwrap();
+    store_fact(&db, "m7", "~/dev/payments");
 
     // Not a real directory, so this falls back to folding the string itself
     // against a home prefix rather than walking a git root.
@@ -1627,6 +1620,44 @@ fn resolve_known_project_expands_legacy_absolute_path() {
         .resolve_known_project("/home/someoneelse/dev/payments", None)
         .unwrap();
     assert_eq!(resolved.as_deref(), Some("~/dev/payments"));
+}
+
+#[test]
+fn resolve_known_project_ignores_projects_that_own_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    store_fact(&db, "m1", "git:example.com/owner/payments");
+    // A row recorded for a directory a session ran in, with nothing stored there.
+    db.get_or_create_project("~/dev/payments", "~/dev/payments")
+        .unwrap();
+
+    let resolved = db.resolve_known_project("payments", None).unwrap();
+    assert_eq!(resolved.as_deref(), Some("git:example.com/owner/payments"));
+    assert_eq!(
+        db.list_projects()
+            .unwrap()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        ["git:example.com/owner/payments"]
+    );
+}
+
+#[test]
+fn prune_removes_only_projects_that_own_nothing() {
+    let db = Database::open_in_memory().unwrap();
+    store_fact(&db, "m1", "kept");
+    db.get_or_create_project("kept", "kept").unwrap();
+    db.get_or_create_project("~/dev/empty", "~/dev/empty")
+        .unwrap();
+
+    assert_eq!(db.prune_empty_projects(false).unwrap(), ["~/dev/empty"]);
+    assert!(
+        db.project_exists("~/dev/empty").unwrap(),
+        "dry run changes nothing"
+    );
+    assert_eq!(db.prune_empty_projects(true).unwrap(), ["~/dev/empty"]);
+    assert!(!db.project_exists("~/dev/empty").unwrap());
+    assert!(db.get_project("kept").unwrap().is_some());
 }
 
 #[test]

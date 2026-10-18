@@ -27,7 +27,7 @@ mod trash;
 pub use activity::{CLOCK_ADVANCING_STORE, SECONDS_PER_DAY, StoreDayIndex};
 pub use handoffs::encode_section_embeddings;
 #[allow(unused_imports)]
-pub use projects::{MergeReport, ProjectMerge};
+pub use projects::{DEFAULT_DECAY_RATE, MergeReport, ProjectMerge};
 pub use status::SupersessionMap;
 // Each binary compiles these modules separately, so a re-export used by only one of them
 // reads as unused in the other.

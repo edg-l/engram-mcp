@@ -111,6 +111,14 @@ fn branch_scoped_memory_in_another_project_is_readable() {
 #[test]
 fn unknown_project_is_rejected_with_known_projects() {
     let (h, _dir) = setup(None);
+    // The error lists projects that own memories, not every row in `projects`.
+    for project in [HOME, OTHER] {
+        h.handle_tool(
+            "memory_store",
+            json!({"content": format!("A fact about {project}"), "project": project}),
+        )
+        .unwrap();
+    }
 
     let err = h
         .handle_tool(

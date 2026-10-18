@@ -396,6 +396,7 @@ pub fn compact_tool_result(tool_name: &str, result: &Value, content_length: usiz
         "todo_write" => compact_todo_write(result),
         "todo_list" => compact_todo_list(result),
         "memory_restore" => compact_restore(result),
+        "adr_list" => compact_adr_list(result),
         _ => compact_fallback(result),
     }
 }
@@ -429,6 +430,7 @@ pub fn compact_tool_result_with_db(
         "todo_write" => compact_todo_write(result),
         "todo_list" => compact_todo_list(result),
         "memory_restore" => compact_restore(result),
+        "adr_list" => compact_adr_list(result),
         _ => compact_fallback(result),
     }
 }
@@ -1434,6 +1436,27 @@ fn compact_todo_list(result: &Value) -> String {
     out
 }
 
+/// One line per ADR, `NNNN [status] title (id)`, or a sentence saying there are none
+/// instead of an empty JSON array.
+fn compact_adr_list(result: &Value) -> String {
+    let adrs = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if adrs.is_empty() {
+        return "No ADRs. Record a formal, numbered decision with adr_create.".to_string();
+    }
+    adrs.iter()
+        .map(|adr| {
+            format!(
+                "{:04} [{}] {} ({})",
+                adr["number"].as_u64().unwrap_or(0),
+                adr["status"].as_str().unwrap_or("?"),
+                adr["title"].as_str().unwrap_or(""),
+                adr["id"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn compact_fallback(result: &Value) -> String {
     // For unhandled tools, use minimal JSON
     serde_json::to_string(result).unwrap_or_else(|_| result.to_string())
@@ -1447,6 +1470,15 @@ fn format_score(score: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn adr_list_renders_one_line_per_adr_or_says_there_are_none() {
+        assert!(compact_adr_list(&json!([])).starts_with("No ADRs."));
+        let out = compact_adr_list(&json!([
+            {"number": 3, "status": "accepted", "title": "Use SQLite", "id": "mem_a"}
+        ]));
+        assert_eq!(out, "0003 [accepted] Use SQLite (mem_a)");
+    }
 
     #[test]
     fn test_compact_projects() {

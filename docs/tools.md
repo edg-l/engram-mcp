@@ -1,6 +1,6 @@
 # MCP tools
 
-Every tool takes an optional `project` argument; see [Project scoping](#project-scoping).
+Every tool takes an optional `project` argument; see [Project scoping](#project-scoping). The server's instructions tell an agent when to use which tool; the `engram://guide` resource has the full guidance on storing, superseding and curating memories.
 
 ## Handoffs
 

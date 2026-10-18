@@ -41,9 +41,6 @@ use super::scoring::{
 use super::update::{MemoryUpdateRequest, update_memory};
 use crate::adr_export::{adr_export_target_dir, export_adr_to_disk};
 
-/// Decay rate used when a project row carries none.
-const DEFAULT_DECAY_RATE: f64 = 0.01;
-
 // ============================================
 // Per-process profile + once-warning
 // ============================================
@@ -902,7 +899,7 @@ impl ToolHandler {
             .ok()
             .flatten()
             .map(|p| p.decay_rate)
-            .unwrap_or(DEFAULT_DECAY_RATE);
+            .unwrap_or(crate::db::DEFAULT_DECAY_RATE);
         let _ = self.db.update_relevance_scores(project, decay_rate);
     }
 

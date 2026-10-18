@@ -58,6 +58,7 @@ This installs two binaries. `engram` is the MCP server, which your client starts
 - Todos live on a durable per-project list with an explicit done or dropped state, so finished work and forgotten work stay distinguishable.
 - Facts, decisions, patterns and debug findings are searched with BM25 and embeddings combined. Near-duplicates merge on store.
 - Old knowledge fades as newer knowledge about the same project arrives, not with the calendar. A project you leave for a year is as fresh as the day you left it.
+- Architecture decisions are kept as numbered ADRs that move through proposed, accepted and superseded, and export as Markdown files.
 - A memory can be superseded by a newer one, which retrieval then returns in its place. Deletions go to a trash you can restore from.
 - Project ids come from the git remote, so the same repo is the same project on every machine. `engram-cli sync user@host` keeps two machines in step over plain `ssh`.
 

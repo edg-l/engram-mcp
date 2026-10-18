@@ -695,7 +695,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Core tools (used frequently by agents) ===
         Tool::new(
             "memory_store",
-            "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Duplicates are auto-detected and merged. Use `pinned: true` for permanent knowledge that must never decay, and `global: true` for knowledge that applies across all projects.",
+            "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Duplicates are auto-detected and merged. Use `pinned: true` for permanent knowledge that must never decay, and `global: true` for knowledge that applies across all projects.\n\nWhen this replaces something already stored, pass `supersedes` with the old id instead of storing a contradicting memory. The result's `possible_supersedes` lists existing memories on the same subject: read it, and store again with `supersedes` if one of them is now wrong. When the claim lives in a committed file, put the path in `external_artifacts` and store only what the file does not say.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -794,7 +794,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "memory_delete",
-            "Remove a memory that is no longer relevant or was stored in error.",
+            "Remove a memory that was stored in error. When it is outdated rather than wrong, prefer `memory_store` with `supersedes` (a replacement exists) or `memory_update` with `dead: true` (the subject is gone): deleting returns nothing to the next search, which invites the same conclusion to be reached again. Read the memory first, including `merged_from`: one id can stand for several absorbed memories. The result returns what was deleted; `memory_restore` brings it back from the trash.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -981,7 +981,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Handoff tools ===
         Tool::new(
             "handoff_create",
-            "Create a session handoff capturing decisions, blockers, dead ends tried, mental model, and next steps. Pinned by default; bypasses dedup.\n\nThere is no `todos` section: open work lives in the todo list (`todo_write` / `todo_list`), which handoff_resume reads directly. Passing `todos` is an error rather than a silent drop.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.",
+            "Create a session handoff capturing decisions, blockers, dead ends tried, mental model, and next steps. Pinned by default; bypasses dedup.\n\nThere is no `todos` section: open work lives in the todo list (`todo_write` / `todo_list`), which handoff_resume reads directly. Passing `todos` is an error rather than a silent drop.\n\nIMPORTANT — section shape: each section is a SHORT SUMMARY, not a transcript. Hard guidance: keep each section under ~1500 chars; individual list items under ~300 chars. Do NOT paste verbatim tool output, full agent reports, file dumps, or chat logs. If long context matters, store it as a separate memory (memory_store with type=debug/pattern/decision) and rely on auto-linking — those memories surface in handoff_resume's linked_memories. Oversized sections trigger a warning in the response.\n\n`blockers`: what prevents progress right now. Restate every blocker still unresolved from the handoff this one continues; `handoff_resume` returns only the newest handoff's blockers, so an omitted one reads as resolved. `tried`: approaches abandoned and why, so the next session does not repeat them; record each once, it is found later with `handoff_search` filtered to `tried`. `next_steps`: follow-ups beyond the current thread.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {
@@ -1130,7 +1130,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === ADR tools ===
         Tool::new(
             "adr_create",
-            "Create an Architecture Decision Record (ADR) in Nygard style. ADRs are project-global (no branch scope), pinned by default, exempt from decay, and bypass dedup. Use `supersedes` to mark an existing ADR as superseded when this decision replaces it.",
+            "Create an Architecture Decision Record (ADR) in Nygard style. ADRs are project-global (no branch scope), pinned by default, exempt from decay, and bypass dedup. Use `supersedes` to mark an existing ADR as superseded when this decision replaces it.\n\nUse an ADR for a decision that shapes the project and should be findable by number with a status (proposed, accepted, deprecated, superseded, rejected): a technology choice, a structural constraint, an API contract. For a smaller choice and its reason, use `memory_store` with `type: decision`.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {

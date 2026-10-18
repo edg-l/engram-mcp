@@ -18,7 +18,8 @@ use crate::project::ProjectIdentity;
 use super::Database;
 
 /// Decay rate given to a `projects` row created here, matching `get_or_create_project`.
-const DEFAULT_DECAY_RATE: f64 = 0.01;
+/// Decay rate of a project without its own `projects` row, or created without one given.
+pub const DEFAULT_DECAY_RATE: f64 = 0.01;
 
 /// Rows one source project contributed to a merge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -415,5 +416,29 @@ impl Database {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<HashMap<String, String>>>()?;
         Ok(rows)
+    }
+
+    /// Project rows that own nothing: no memories, ADRs, trash entries or clusters. With
+    /// `apply`, delete them. They hold only the directory a run happened in; listing and
+    /// short-name resolution already ignore them, and a row is recorded again the next
+    /// time Engram runs in that directory.
+    #[allow(dead_code)] // Used by engram-cli, not the engram MCP-server binary
+    pub fn prune_empty_projects(&self, apply: bool) -> Result<Vec<String>, MemoryError> {
+        let conn = self.conn.lock().unwrap();
+        const EMPTY: &str = "NOT EXISTS (SELECT 1 FROM memories m WHERE m.project_id = p.id) \
+             AND NOT EXISTS (SELECT 1 FROM adr_sections a WHERE a.project_id = p.id) \
+             AND NOT EXISTS (SELECT 1 FROM memory_trash t WHERE t.project_id = p.id) \
+             AND NOT EXISTS (SELECT 1 FROM memory_clusters c WHERE c.project_id = p.id)";
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id FROM projects p WHERE {EMPTY} ORDER BY id"
+            ))?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if apply {
+            conn.execute(&format!("DELETE FROM projects AS p WHERE {EMPTY}"), [])?;
+        }
+        Ok(ids)
     }
 }

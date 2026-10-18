@@ -80,7 +80,7 @@ async fn run_decay_job(db_path: PathBuf, project_id: String) {
                     .ok()
                     .flatten()
                     .map(|p| p.decay_rate)
-                    .unwrap_or(0.01);
+                    .unwrap_or(db::DEFAULT_DECAY_RATE);
 
                 match db.update_relevance_scores(&project_id, decay_rate) {
                     Ok(count) => {
@@ -441,10 +441,6 @@ impl MemoryServer {
             let db = Database::open(&self.db_path)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            // Ensure project exists
-            db.get_or_create_project(&self.project_id, &self.project_id)
-                .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
-
             let embedding = EmbeddingService::shared()
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
@@ -460,6 +456,11 @@ impl MemoryServer {
         Ok(())
     }
 }
+
+/// The long-form guidance the server instructions point to. The instructions stay under
+/// the 4096 characters Claude Code passes on; anything longer is cut off unseen.
+const GUIDE_URI: &str = "engram://guide";
+const GUIDE: &str = include_str!("guide.md");
 
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
@@ -535,9 +536,15 @@ impl ServerHandler for MemoryServer {
                 .get_all_memories_for_project(&self.project_id)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            let resources: Vec<Resource> = memories
-                .into_iter()
-                .map(|m| {
+            let guide = Resource::new(GUIDE_URI, "Engram usage guide")
+                .with_description(
+                    "How to store, supersede, link and curate memories, and when to use \
+                     todos, handoffs and ADRs. The server instructions are the index to it.",
+                )
+                .with_mime_type("text/markdown")
+                .with_size(GUIDE.len() as u64);
+            let resources: Vec<Resource> = std::iter::once(guide)
+                .chain(memories.into_iter().map(|m| {
                     let description: String = m.content.chars().take(200).collect();
                     let size = m.content.len() as u64;
                     let name = m
@@ -548,7 +555,7 @@ impl ServerHandler for MemoryServer {
                         .with_description(description)
                         .with_mime_type("text/plain")
                         .with_size(size)
-                })
+                }))
                 .collect();
 
             Ok(ListResourcesResult::with_all_items(resources))
@@ -580,9 +587,15 @@ impl ServerHandler for MemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move {
+            let uri = &request.uri;
+            if uri == GUIDE_URI {
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    GUIDE,
+                    uri.clone(),
+                )]));
+            }
             // Parse URI: memory://{project_id}/{memory_id}. Any project in the
             // store is readable, not just the server's own.
-            let uri = &request.uri;
             let (uri_project, memory_id) = uri
                 .strip_prefix("memory://")
                 .and_then(|rest| rest.rsplit_once('/'))
