@@ -1808,9 +1808,7 @@ fn reconcile_merges_home_relative_id_after_remote_add() {
     db.get_or_create_project(derived, derived).unwrap();
     store_fact(&db, "after-remote", derived);
 
-    let report = db
-        .reconcile_project_root(derived, "~/dev/repo-a")
-        .unwrap();
+    let report = db.reconcile_project_root(derived, "~/dev/repo-a").unwrap();
 
     assert_eq!(report.merges.len(), 1);
     assert_eq!(report.merges[0].from, "~/dev/repo-a");
