@@ -5,6 +5,7 @@ mod adr_export;
 mod cache;
 mod db;
 mod decay;
+mod embed_server;
 mod embedding;
 mod error;
 mod export;
@@ -733,6 +734,7 @@ fn reset_sigpipe() {
 fn reset_sigpipe() {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    embed_server::run_if_requested();
     reset_sigpipe();
 
     let cli = Cli::parse();
@@ -803,7 +805,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize embedding service once, only if needed (saves ~500ms for commands that don't need it)
     let embedding_service = if needs_embedding_service(&cli.command) {
-        Some(EmbeddingService::new()?)
+        Some(EmbeddingService::shared()?)
     } else {
         None
     };

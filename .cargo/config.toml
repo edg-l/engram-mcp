@@ -1,0 +1,6 @@
+# Binaries started by `cargo test` (the CLI tests run `engram-cli` directly) would
+# otherwise start a shared embedding process in the user's runtime directory and leave it
+# running until it idles out. Installed binaries never read this file.
+# tests/embed_server.rs turns sharing back on for itself, in a scratch directory.
+[env]
+ENGRAM_EMBED_SHARED = "0"

@@ -4,6 +4,7 @@ mod adr_export;
 mod cache;
 mod db;
 mod decay;
+mod embed_server;
 mod embedding;
 mod error;
 mod export;
@@ -444,7 +445,7 @@ impl MemoryServer {
             db.get_or_create_project(&self.project_id, &self.project_id)
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
-            let embedding = EmbeddingService::new()
+            let embedding = EmbeddingService::shared()
                 .map_err(|e: MemoryError| McpError::internal_error(e.to_string(), None))?;
 
             let mode = parse_search_mode(std::env::var("ENGRAM_SEARCH_MODE").ok().as_deref());
@@ -835,6 +836,7 @@ fn reset_sigpipe() {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    embed_server::run_if_requested();
     reset_sigpipe();
 
     use std::io::IsTerminal;

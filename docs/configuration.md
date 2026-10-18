@@ -14,6 +14,8 @@ Engram reads environment variables only; there is no config file. The MCP server
 | `ENGRAM_RECLUSTER_INTERVAL` | `21600` | Seconds between re-clustering passes. |
 | `ENGRAM_TRASH_RETENTION_DAYS` | `30` | Days a deleted memory stays restorable. `0` keeps it forever. |
 | `ENGRAM_ADR_DIR` | `docs/adr` | Where `adr_export` writes files, unless the call passes `dir`. |
+| `ENGRAM_EMBED_SHARED` | on | `0` loads the embedding model in every process instead of sharing one background process. |
+| `ENGRAM_EMBED_IDLE_SECS` | `900` | Seconds without a request before the shared embedding process exits. |
 | `ENGRAM_MCP_TOOL_PROFILE` | `full` | How many tools the server advertises: `full`, `core` or `minimal`. See [tool profiles](tools.md#tool-profiles). |
 
 Both maintenance passes wait one interval before they first run, so a server that lives less than an hour never runs one. `engram-cli decay` runs the same pass on demand, for example from a timer.

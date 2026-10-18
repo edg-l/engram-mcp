@@ -23,7 +23,11 @@ recency = exp(−0.02 × elapsed)
 
 For a project with 10 or more memories, `memory_context` scores cluster centroids first and draws from the best clusters, which spreads results across topics instead of returning five near-copies. It scores at most `ENGRAM_MAX_CANDIDATES` memories, the most recently accessed, plus every pinned one.
 
-Embeddings come from [mdbr-leaf-ir](https://huggingface.co/onnx-community/mdbr-leaf-ir-ONNX), quantized, cut to 256 dimensions. It runs in-process through ONNX Runtime.
+Embeddings come from [mdbr-leaf-ir](https://huggingface.co/onnx-community/mdbr-leaf-ir-ONNX), quantized, cut to 256 dimensions, and run through ONNX Runtime.
+
+The model is loaded once per user, not once per process. The first `engram` or `engram-cli` that needs an embedding starts a background copy of itself that holds the model and answers the others over a Unix socket in `$XDG_RUNTIME_DIR/engram` (or `~/.cache/engram`); it exits after 15 minutes without a request, and the next process starts it again.
+
+Each client then peaks at about 14 MB instead of 93 MB, and the shared process holds about 53 MB. If the shared process cannot be reached, a process loads the model itself (about 54 MB) and carries on. Windows has no shared process and always loads in-process.
 
 ### Benchmark
 

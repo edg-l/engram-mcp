@@ -2,6 +2,7 @@ pub mod adr_export;
 pub mod cache;
 pub mod db;
 pub mod decay;
+pub mod embed_server;
 pub mod embedding;
 pub mod error;
 pub mod export;
