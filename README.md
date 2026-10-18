@@ -26,7 +26,7 @@ End of session, capture state on the current branch:
 
 ```bash
 engram-cli handoff create
-# Prompts for: summary, decisions, todos, blockers, mental_model, next_steps, notes
+# Prompts for: summary, decisions, blockers, tried, mental_model, next_steps, notes
 ```
 
 Or invoke the MCP prompt from inside Claude Code: `/mcp__engram__handoff`.
@@ -36,8 +36,9 @@ Next session (same or different branch), restore context:
 ```bash
 engram-cli handoff resume
 # Resuming `feat/auth`, 3 handoffs in chain, latest from mem_xyz
-# Top sections (summary, blockers, todos)
+# Open todos: 4, then blockers and the top sections
 # Linked decisions/patterns/debug memories
+# The open todo checklist, last
 ```
 
 Or: `/mcp__engram__resume` from Claude Code.
@@ -201,22 +202,27 @@ Handoffs are the lead workflow, but Engram is a full memory system underneath:
 
 | Tool | Description |
 |------|-------------|
-| `handoff_create` | Capture a session handoff with structured sections (summary, decisions, todos, blockers, mental_model, next_steps, notes) |
-| `handoff_resume` | Retrieve top sections from recent handoffs on the current branch, plus linked memories |
+| `handoff_create` | Capture a session handoff with structured sections (summary, decisions, blockers, tried, mental_model, next_steps, notes) |
+| `handoff_resume` | Retrieve top sections from recent handoffs on the current branch, plus linked memories, open todos and the latest blockers |
 | `handoff_search` | Search handoff sections by content; filter by branch or section name |
 | `memory_store` | Store a memory with embedding, auto-dedup, auto-cluster |
 | `memory_query` | Semantic search with hybrid scoring, pagination, branch filtering |
 | `memory_context` | Load relevant memories for a task (hierarchical retrieval via clusters) |
-| `memory_update` | Update content, tags, importance, pinned status |
-| `memory_delete` | Remove a memory and its relationships |
+| `memory_update` | Update content, tags, importance, pinned or dead status; patch a handoff's `sections`. Returns the previous version |
+| `memory_delete` | Remove a memory and its relationships (recoverable from the trash) |
 | `memory_link` | Create typed relationships between memories |
 | `memory_graph` | Traverse relationship graph from a root memory |
 | `memory_store_batch` | Store up to 100 memories atomically |
 | `memory_delete_batch` | Delete multiple memories by ID |
 | `memory_export` | Export project memories to JSON |
-| `memory_import` | Import from JSON (merge or replace modes) |
+| `memory_import` | Import from JSON: merge (last-write-wins on `updated_at`) or replace |
 | `memory_stats` | Project statistics (counts, types, pinned, global, clusters) |
 | `memory_projects` | List every project in the store with memory, handoff, and ADR counts |
+| `memory_list` | List memories without a query; filter by type, tag or status (live, superseded, dead) |
+| `memory_trash` | List recoverable snapshots of deleted, pruned or merged memories |
+| `memory_restore` | Restore a memory from the trash with its embedding and relationships |
+| `todo_write` | Add, close, drop (with a reason), reopen or edit todos on the durable per-project list |
+| `todo_list` | List todos by state and branch |
 | `memory_prune` | Remove low-relevance memories (dry run by default) |
 | `memory_dedup` | Find and merge duplicate memories (dry run by default) |
 | `memory_promote` | Promote a branch-local memory to global scope |
@@ -233,11 +239,11 @@ Every tool above defaults to the project the server was launched in. Pass a `pro
 ```json
 {
   "context": "how does the payments service handle retries",
-  "project": "/home/me/dev/payments"
+  "project": "payments"
 }
 ```
 
-Use `memory_projects` to discover project IDs. An unknown ID is rejected with the known IDs listed, so a typo cannot silently return an empty result. Two branch-related caveats, since branch names belong to a repository: `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
+A project ID is the repo's normalized git remote (`git:github.com/me/payments`), else its `~/`-relative path (`~/dev/payments`). A short name matching one ID's last segment, like `payments` above, resolves to it; an ambiguous one fails listing only the candidates. Use `memory_projects` to discover project IDs. An unknown ID is rejected with the known IDs listed, so a typo cannot silently return an empty result. Two branch-related caveats, since branch names belong to a repository: `branch_mode: "current"` covers all branches when the target is another project, and `handoff_create` for another project requires an explicit `branch`.
 
 The `engram-cli` equivalent is the global `-p/--project` flag, and `engram-cli projects` lists the same information.
 
@@ -280,10 +286,16 @@ Branch modes: `current` (global + current branch), `global` (global only), `all`
 # Handoffs
 engram-cli handoff create                        # interactive section prompts
 engram-cli handoff create --non-interactive \
-  --summary "Cut the 2.0 branch" --todos "Tag the release"   # never prompts
+  --summary "Cut the 2.0 branch" --tried "bulk UPDATE, locked the table"   # never prompts
 engram-cli handoff create --from-file session.md # ingest pre-written markdown
 engram-cli handoff resume --branch feat/x        # load context from recent handoffs
-engram-cli handoff search "auth refactor" --section blockers,todos
+engram-cli handoff search "auth refactor" --section blockers,tried
+
+# Todos
+engram-cli todo add "Tag the 2.0 release" --detail "CI must be green on the release branch first"
+engram-cli todo list                              # titles; --full for the whole text
+engram-cli todo done mem_abc123
+engram-cli todo drop mem_abc123 --reason "superseded by the 2.1 plan"
 
 # Search
 engram-cli query "how does authentication work"
@@ -301,6 +313,7 @@ engram-cli list
 engram-cli update mem_abc123 -c "Updated content" --importance 0.9
 engram-cli update mem_abc123 --artifact /new/path.md          # replace artifact list
 engram-cli update mem_abc123 --clear-artifacts                # clear artifact list
+engram-cli update mem_abc123 --sections-json '{"blockers": []}'  # patch a handoff's sections
 engram-cli delete mem_abc123
 
 # Pinning
@@ -322,7 +335,9 @@ engram-cli sync user@host --dry-run       # preview transfer sizes, no import/pu
 
 # Projects
 engram-cli projects                              # list all projects in the store
-engram-cli -p /home/me/dev/other query "auth"    # scope any command to a project
+engram-cli -p other query "auth"                 # scope any command to a project (short names resolve)
+engram-cli projects merge ~/dev/old git:github.com/me/new           # dry run: what would move
+engram-cli projects merge ~/dev/old git:github.com/me/new --confirm
 
 # Machine-readable output (for scripts and agents)
 engram-cli --json stats
@@ -463,7 +478,7 @@ Cap is configurable via `ENGRAM_MAX_CANDIDATES`. `memory_query` always does a fu
 
 ### Handoff internals
 
-Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blockers`, `mental_model`, `next_steps`, `notes`. Stored in a `handoff_sections` sidecar table with per-section embeddings (256-dim f32 LE, prefix-free) alongside the rendered markdown in the main `memories` row.
+Each handoff has seven named sections: `summary`, `decisions`, `blockers`, `tried`, `mental_model`, `next_steps`, `notes`. Open work lives on the durable todo list (`todo_write`), not in a handoff section, so finishing a todo and forgetting one stay distinguishable. Stored in a `handoff_sections` sidecar table with per-section embeddings (256-dim f32 LE, prefix-free) alongside the rendered markdown in the main `memories` row.
 
 - **Branch chaining** via `continues_from` in the sidecar (no graph edge). `handoff_resume` walks the chain up to depth 5 with cycle detection.
 - **Auto-linking**: each section is scored against existing `decision` / `pattern` / `debug` memories. Matches at cosine ≥ 0.75 get a `derived_from` edge, capped at 10 links per handoff.
@@ -471,7 +486,7 @@ Each handoff has seven named sections: `summary`, `decisions`, `todos`, `blocker
 
 ## Status and limits
 
-- 100+ tests across 8 binaries; clippy clean; fmt clean.
+- 400+ tests; clippy clean; fmt clean.
 - Single-node, single-user. No auth (it's a local MCP server).
 - Embedding model: mdbr-leaf-ir, 256-dim MRL.
 - Hybrid retrieval: SQLite FTS5 keyword + cosine.

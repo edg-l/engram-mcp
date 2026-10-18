@@ -496,7 +496,7 @@ enum HandoffCmd {
         /// Limit results to this branch (omit for all branches)
         #[arg(long)]
         branch: Option<String>,
-        /// Only show these sections (comma-separated, e.g. blockers,todos)
+        /// Only show these sections (comma-separated, e.g. blockers,tried)
         #[arg(long, value_delimiter = ',')]
         section: Vec<String>,
         /// Maximum results (default 10)
