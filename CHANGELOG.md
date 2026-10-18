@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.12.2] - 2026-10-18
 
 ### Fixed
 - **Most of the server instructions never reached the agent.** Claude Code passes on only the first 4096 characters of an MCP server's instructions, and they were 10,547: guidance on other projects, supersession, deletion, handoffs, todos and ADRs was cut off unseen. The instructions are now a 2,800-character index of when to use which tool; per-tool detail moved into the tool descriptions, which arrive in full, and the long-form guidance is the `engram://guide` resource. A test keeps the instructions under the limit.
