@@ -6,6 +6,8 @@
 cargo install engram_mcp
 ```
 
+Prebuilt archives for Linux x86_64, macOS arm64 and Windows x86_64 are on the [releases page](https://github.com/edg-l/engram-mcp/releases); each holds both binaries.
+
 Or from source:
 
 ```bash
