@@ -666,6 +666,77 @@ fn test_batch_store_and_export_import() {
     );
 }
 
+/// `memory_import` merges last-write-wins on `updated_at`, the same rule as
+/// `engram-cli import` and `sync`: a newer incoming copy overwrites and keeps the
+/// source's timestamp, and an older or equal one is skipped.
+#[test]
+fn test_memory_import_last_write_wins() {
+    let (h, _dir) = setup(None);
+    call(
+        &h,
+        "memory_store",
+        json!({"content": "The billing worker retries failed charges three times", "type": "fact"}),
+    );
+    let exported = call(&h, "memory_export", json!({"include_embeddings": true}));
+
+    let (h2, _dir2) = setup(None);
+    let r = call(&h2, "memory_import", json!({"data": exported.clone()}));
+    assert_eq!(r["stats"]["memories_imported"].as_u64().unwrap(), 1);
+
+    let mut newer = exported.clone();
+    let updated_at = newer["memories"][0]["updated_at"].as_i64().unwrap() + 60;
+    newer["memories"][0]["content"] = json!("The billing worker retries failed charges five times");
+    newer["memories"][0]["updated_at"] = json!(updated_at);
+    let r = call(&h2, "memory_import", json!({"data": newer}));
+    assert_eq!(r["stats"]["memories_updated"].as_u64().unwrap(), 1);
+
+    let r = call(&h2, "memory_import", json!({"data": exported}));
+    assert_eq!(r["stats"]["memories_skipped"].as_u64().unwrap(), 1);
+
+    let local = call(&h2, "memory_export", json!({}));
+    let memory = &local["memories"][0];
+    assert!(memory["content"].as_str().unwrap().contains("five times"));
+    assert_eq!(memory["updated_at"].as_i64().unwrap(), updated_at);
+}
+
+/// An imported ADR whose number is already taken by a different ADR takes the next
+/// free number instead of being dropped.
+#[test]
+fn test_memory_import_renumbers_colliding_adr() {
+    let adr = |title: &str| {
+        json!({
+            "title": title,
+            "context": "Context for the decision.",
+            "decision": "The decision itself.",
+            "consequences": "What follows from it."
+        })
+    };
+    let (h, _dir) = setup(None);
+    call(&h, "adr_create", adr("Use SQLite for local storage"));
+    let exported = call(&h, "memory_export", json!({"include_embeddings": true}));
+
+    let (h2, _dir2) = setup(None);
+    call(&h2, "adr_create", adr("Ship releases from tags only"));
+    let r = call(&h2, "memory_import", json!({"data": exported}));
+    assert_eq!(r["stats"]["memories_imported"].as_u64().unwrap(), 1);
+
+    let shown = call(&h2, "adr_show", json!({"number": 2}));
+    assert_eq!(
+        shown["title"].as_str().unwrap(),
+        "Use SQLite for local storage"
+    );
+}
+
+#[test]
+fn test_memory_import_rejects_unknown_mode() {
+    let (h, _dir) = setup(None);
+    let exported = call(&h, "memory_export", json!({}));
+    let err = h
+        .handle_tool("memory_import", json!({"data": exported, "mode": "replce"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid import mode"), "{err}");
+}
+
 #[test]
 fn test_prune_low_relevance_memories() {
     let (h, _dir) = setup(None);

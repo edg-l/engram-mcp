@@ -23,6 +23,7 @@ use super::curation::{
     CurationView, MatchedVia, Resolution, SupersessionCandidate, supersession_candidates,
 };
 use super::handoff::{create_handoff, resume_handoff, search_handoffs};
+use super::import::{ImportOptions, import_payload};
 use super::links::{Redirect, resolve_link_target};
 use super::schemas::{
     AdrCreateInput, AdrExportInput, AdrListInput, AdrShowInput, AdrUpdateStatusInput,
@@ -1543,236 +1544,57 @@ impl ToolHandler {
     fn memory_import(&self, arguments: Value) -> Result<Value, MemoryError> {
         let input: MemoryImportInput = parse_args("memory_import", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
-
+        let mode: ImportMode =
+            input
+                .mode
+                .parse()
+                .map_err(|message| MemoryError::InvalidArguments {
+                    tool: "memory_import".to_string(),
+                    message,
+                    received: format!("mode: {}", input.mode),
+                })?;
         let export_data: ExportData = serde_json::from_value(input.data)?;
 
-        // Validate version
-        export::validate_import(&export_data).map_err(MemoryError::Embedding)?;
-
-        // This path re-homes every imported memory under the resolved `project`
-        // unconditionally (below), unlike `engram-cli import`'s scope-aware routing.
-        // Feeding it an all-projects payload (from `engram-cli export --all-projects` or
-        // a `sync` pull) would silently collapse every project it carries into one, and
-        // nothing stops it — `memories.project_id` has no foreign-key constraint.
+        // An all-projects payload writes to every project it carries, which is a
+        // whole-store operation; the `project` argument scopes this tool to one.
         if export_data.scope == export::ExportScope::AllProjects {
-            return Err(MemoryError::Embedding(
-                "memory_import cannot accept an all-projects payload (scope: all_projects); \
-                 import it with `engram-cli import` instead."
+            return Err(MemoryError::InvalidArguments {
+                tool: "memory_import".to_string(),
+                message: "cannot accept an all-projects payload; import it with \
+                          `engram-cli import` instead"
                     .to_string(),
-            ));
-        }
-
-        // Warn about embedding model version mismatch
-        let model_warning: Option<String> =
-            export_data.model_version.as_ref().and_then(|imported_model| {
-                if imported_model != self.embedding.model_version() {
-                    Some(format!(
-                        "Warning: embeddings were generated with '{}' but current model is '{}'. Re-embedding recommended.",
-                        imported_model,
-                        self.embedding.model_version()
-                    ))
-                } else {
-                    None
-                }
+                received: "data.scope: all_projects".to_string(),
             });
-
-        let mode: ImportMode = input.mode.parse().unwrap_or(ImportMode::Merge);
-
-        let mut stats = ImportStats::default();
-
-        // In replace mode, clear existing data first
-        if mode == ImportMode::Replace {
-            self.db.delete_project_data(&project)?;
         }
 
-        let now = chrono::Utc::now().timestamp();
-
-        // Import memories
-        for exported in export_data.memories {
-            let ExportedMemory {
-                mut memory,
-                embedding: encoded_embedding,
-                sections,
-                section_embedding_keys,
-                section_embeddings: encoded_section_embeddings,
-                adr_number,
-                adr_status: adr_status_str,
-                adr_sections: adr_sections_data,
-                ..
-            } = exported;
-
-            let mem_created_at = memory.created_at;
-            let mem_updated_at = memory.updated_at;
-
-            // Update project_id to the target project
-            memory.project_id = project.clone();
-            memory.updated_at = now;
-
-            // Check if memory already exists (in merge mode)
-            if mode == ImportMode::Merge && self.db.get_memory(&memory.id)?.is_some() {
-                stats.memories_skipped += 1;
-                continue;
-            }
-
-            // For ADR memories with a known number, pre-check the number BEFORE storing
-            // the memory row.  If the number is already taken, skip the entire memory
-            // (memory row + embedding + sidecar) to keep them consistent.
-            if memory.memory_type == MemoryType::Adr
-                && let Some(num) = adr_number
-                && self.db.get_adr_by_number(&project, num)?.is_some()
-            {
-                stats.memories_skipped += 1;
-                tracing::warn!(
-                    "skipping imported ADR {} — number {} already exists in project",
-                    memory.id,
-                    num
-                );
-                continue;
-            }
-
-            self.db.store_memory(&memory)?;
-            stats.memories_imported += 1;
-
-            // Import embedding if provided
-            if let Some(encoded) = encoded_embedding {
-                if let Ok(vector) = export::decode_embedding(&encoded) {
-                    self.db
-                        .store_embedding(&memory.id, &vector, self.embedding.model_version())?;
-                    stats.embeddings_imported += 1;
-                }
-            } else {
-                // Generate new embedding
-                let embedding = self
-                    .embedding
-                    .embed_memory(memory.memory_type, &memory.content)?;
-                self.db
-                    .store_embedding(&memory.id, &embedding, self.embedding.model_version())?;
-                stats.embeddings_imported += 1;
-            }
-
-            // Import handoff sidecar if present (Handoff memories only).
-            // Old exports that lack sidecar fields are still imported as memory rows;
-            // the sidecar is simply skipped (a subsequent handoff_resume will notice
-            // no sections are available).
-            if memory.memory_type == MemoryType::Handoff {
-                match (sections, section_embedding_keys, encoded_section_embeddings) {
-                    (Some(sections_data), Some(keys), Some(encoded_bytes)) => {
-                        match export::decode_section_embedding_bytes(&encoded_bytes) {
-                            Ok(bytes) => {
-                                // Validate byte length before inserting.
-                                let key_count = if keys.is_empty() {
-                                    0
-                                } else {
-                                    keys.split(',').count()
-                                };
-                                if bytes.len() == key_count * 256 * 4 {
-                                    if let Err(e) = self.db.insert_handoff_sections(
-                                        &memory.id,
-                                        &sections_data,
-                                        &keys,
-                                        &bytes,
-                                    ) {
-                                        // Log but don't fail the import.
-                                        tracing::warn!(
-                                            "failed to import handoff sidecar for {}: {}",
-                                            memory.id,
-                                            e
-                                        );
-                                    }
-                                } else {
-                                    tracing::warn!(
-                                        "skipping handoff sidecar for {} — section_embeddings byte length mismatch ({} bytes, expected {})",
-                                        memory.id,
-                                        bytes.len(),
-                                        key_count * 256 * 4
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "skipping handoff sidecar for {} — could not decode section_embeddings: {}",
-                                    memory.id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        // Old export without sidecar fields — skip sidecar, import memory row only.
-                        tracing::info!(
-                            "handoff {} imported without sidecar (old export format; sections not available)",
-                            memory.id
-                        );
-                    }
-                }
-            }
-
-            // Import ADR sidecar if present (ADR memories only).
-            // Number-conflict check above guarantees the number is free at this point.
-            if memory.memory_type == MemoryType::Adr
-                && let (Some(num), Some(status_str), Some(adr_sec)) =
-                    (adr_number, adr_status_str, adr_sections_data)
-            {
-                match status_str.parse::<AdrStatus>() {
-                    Ok(status) => {
-                        if let Err(e) = self.db.insert_adr_sidecar(
-                            &memory.id,
-                            &project,
-                            num,
-                            status,
-                            &adr_sec,
-                            mem_created_at,
-                            mem_updated_at,
-                        ) {
-                            tracing::warn!(
-                                "failed to insert ADR sidecar for {} (number {}): {}",
-                                memory.id,
-                                num,
-                                e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "skipping ADR sidecar for {} — invalid status '{}': {}",
-                            memory.id,
-                            status_str,
-                            e
-                        );
-                    }
-                }
-            }
+        let options = ImportOptions {
+            mode,
+            target_project: &project,
+            origin_remote: None,
+        };
+        let outcome = import_payload(&self.db, &self.embedding, export_data, &options)?;
+        for warning in &outcome.warnings {
+            tracing::warn!("memory_import: {warning}");
+        }
+        for pid in &outcome.touched_projects {
+            self.invalidate_search_cache(pid);
         }
 
-        // Import relationships
-        for rel in export_data.relationships {
-            // Verify both memories exist
-            let source_exists = self.db.get_memory(&rel.source_id)?.is_some();
-            let target_exists = self.db.get_memory(&rel.target_id)?.is_some();
-
-            if source_exists && target_exists {
-                self.db.create_relationship(&rel)?;
-                stats.relationships_imported += 1;
-            } else {
-                stats.relationships_skipped += 1;
-            }
-        }
-
-        // Invalidate search cache since we imported data
-        if stats.memories_imported > 0 {
-            self.invalidate_search_cache(&project);
-        }
-
+        let stats = &outcome.stats;
         Ok(json!({
             "success": true,
+            "project": project,
             "stats": stats,
+            "cleared": outcome.cleared,
             "message": format!(
-                "Imported {} memories, {} relationships ({} skipped)",
+                "Imported {} memories, {} updated, {} relationships ({} skipped)",
                 stats.memories_imported,
+                stats.memories_updated,
                 stats.relationships_imported,
                 stats.memories_skipped + stats.relationships_skipped
             ),
-            "model_warning": model_warning,
+            "reembedded_from_model": outcome.foreign_model,
+            "warnings": outcome.warnings,
         }))
     }
 

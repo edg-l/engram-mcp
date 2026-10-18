@@ -11,6 +11,7 @@ pub mod cluster;
 pub mod curation;
 mod handler;
 mod handoff;
+pub mod import;
 pub mod links;
 pub mod schemas;
 pub mod scoring;
@@ -26,6 +27,7 @@ pub use cluster::{assign_to_cluster, compute_cluster_centroid, generate_cluster_
 pub use curation::{CurationView, MatchedVia, Resolution};
 pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
+pub use import::{ImportOptions, ImportOutcome, import_payload};
 pub use links::{Redirect, resolve_link_target};
 pub use schemas::{
     MemoryUpdateInput, ToolProfile, dedup_threshold, get_tool_definitions, get_tool_definitions_for,

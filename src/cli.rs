@@ -27,6 +27,7 @@ use memory::{
 use summarize::{generate_summary, should_auto_summarize};
 use tools::TodoOp;
 use tools::curation::{CurationView, MatchedVia, Resolution, supersession_candidates};
+use tools::import::{ImportOptions, ImportOutcome, import_payload};
 use tools::links::resolve_link_target;
 
 #[derive(Parser)]
@@ -2021,338 +2022,6 @@ fn cmd_export(
     Ok(())
 }
 
-/// Counts from `import_export_data`, reported by both `cmd_import` (as prose) and
-/// `cmd_sync`'s pull half.
-struct ImportSummary {
-    imported: usize,
-    updated: usize,
-    rel_imported: usize,
-    skipped: usize,
-}
-
-/// The memory/relationship/sidecar merge loop, shared by `cmd_import` (a payload read
-/// from a file or stdin) and `cmd_sync`'s pull half (a payload already parsed from a
-/// remote's `export` stdout, always `ImportMode::Merge`). `project_id` only matters when
-/// `export_data.scope` is `Project`; an `AllProjects` payload re-homes nothing and keeps
-/// each memory's own `project_id`, ignoring this argument entirely.
-fn import_export_data(
-    db: &Database,
-    project_id: &str,
-    embedding_service: &EmbeddingService,
-    export_data: export::ExportData,
-    import_mode: export::ImportMode,
-    origin_remote: Option<&str>,
-) -> Result<ImportSummary, MemoryError> {
-    let all_projects = export_data.scope == export::ExportScope::AllProjects;
-
-    // A payload from a different embedding model is not comparable to locally-stored
-    // vectors in cosine search: ignore it and re-embed locally instead of trusting
-    // foreign vectors under this store's model label.
-    let reembed_due_to_model_mismatch = export_data
-        .model_version
-        .as_deref()
-        .is_some_and(|v| v != embedding_service.model_version());
-
-    let mut imported = 0;
-    let mut updated = 0;
-    let mut skipped = 0;
-    // Every distinct project touched by this import, so relevance scores are recomputed
-    // once per project rather than only for the CLI's own `-p`/cwd project. Also doubles
-    // as the "already ensured" set for `get_or_create_project` in all-projects mode.
-    let mut touched_projects: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Projects merged away on this machine. The sending machine may not have merged them
-    // (merges are local), so its payload can still carry the old id; landing those rows
-    // under it would recreate the project the merge folded away.
-    let project_aliases = db.project_aliases()?;
-
-    for exported in export_data.memories {
-        let mut memory = exported.memory;
-        let encoded_embedding = exported.embedding;
-        let sections = exported.sections;
-        let section_embedding_keys = exported.section_embedding_keys;
-        let encoded_section_embeddings = exported.section_embeddings;
-        let adr_number = exported.adr_number;
-        let adr_status_str = exported.adr_status;
-        let adr_sections_data = exported.adr_sections;
-        let status_sidecar = exported.status;
-        let todo_sidecar = exported.todo;
-        let mem_created_at = memory.created_at;
-        let mem_updated_at = memory.updated_at;
-        let incoming_updated_at = memory.updated_at;
-        // All-projects payloads keep each memory's own project_id and ignore the CLI's
-        // resolved `-p`/cwd project entirely; a single-project payload is re-homed to it,
-        // matching the pre-4.4 behavior.
-        let alias_target = all_projects
-            .then(|| project_aliases.get(&memory.project_id))
-            .flatten();
-        let target_project_id = match alias_target {
-            Some(survivor) => survivor.clone(),
-            None if all_projects => memory.project_id.clone(),
-            None => project_id.to_string(),
-        };
-        memory.project_id = target_project_id.clone();
-        if all_projects && touched_projects.insert(target_project_id.clone()) {
-            db.get_or_create_project(&target_project_id, &target_project_id)?;
-        }
-        // Preserve the source machine's updated_at rather than stamping "now": overwriting
-        // it would make the importer's copy look newest on every import and defeat
-        // last-write-wins convergence (it would ping-pong forever between two machines).
-
-        // Merge mode is last-write-wins on `updated_at`, ties keep the local copy. Replace
-        // mode has already cleared the project, so it never looks the id up at all — the
-        // existence check below is Merge-only, matching the pre-LWW behavior for Replace.
-        let mut content_differs = false;
-        let is_update = if import_mode == export::ImportMode::Merge {
-            match db.get_memory(&memory.id)? {
-                Some(existing_memory) if incoming_updated_at <= existing_memory.updated_at => {
-                    skipped += 1;
-                    continue;
-                }
-                Some(existing_memory) => {
-                    content_differs = existing_memory.content != memory.content;
-                    if content_differs {
-                        db.trash_memory(&memory.id, db::OP_UPDATE)?;
-                    }
-                    // access_count/last_accessed_at take the max of both sides rather than
-                    // LWW — they are usage counters, not a single machine's claim.
-                    memory.access_count = memory.access_count.max(existing_memory.access_count);
-                    memory.last_accessed_at = memory
-                        .last_accessed_at
-                        .max(existing_memory.last_accessed_at);
-                    true
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
-
-        // For ADR memories with a known number, pre-check the number BEFORE storing
-        // the memory row. Only applies to brand-new ADRs; an existing ADR being updated
-        // (`is_update`) already owns its number and is left alone.
-        //
-        // A collision here is always against a *different* memory: `is_update` is false,
-        // so this memory's own id was not found locally, meaning whatever already holds
-        // this number belongs to someone else. That happens two ways — an ADR redirected
-        // into a merge survivor was numbered in the merged-away project's sequence, which
-        // the survivor has already renumbered past (`alias_target.is_some()`); or two
-        // machines independently created an ADR with the same number in a project neither
-        // side ever merged. Either way the incoming number carries no meaning in the
-        // target project, so the row takes the next free one rather than being dropped —
-        // ADR numbers are a per-machine display convenience, not a synced identity.
-        let mut adr_number = adr_number;
-        if !is_update
-            && memory.memory_type == MemoryType::Adr
-            && let Some(num) = adr_number
-            && db.get_adr_by_number(&target_project_id, num)?.is_some()
-        {
-            adr_number = Some(db.next_adr_number(&target_project_id)?);
-        }
-
-        if is_update {
-            db.update_memory(&memory)?;
-            updated += 1;
-        } else {
-            db.store_memory(&memory)?;
-            imported += 1;
-        }
-        touched_projects.insert(target_project_id.clone());
-        // Pin this memory's origin so sync's push half never echoes it straight back to
-        // the remote it just arrived from (see `origin_unchanged_since_pull`). Only set
-        // during sync's own in-process pull import; a plain `engram-cli import` passes
-        // `None` and does no origin tracking, since there is no "remote" to attribute it to.
-        if let Some(remote) = origin_remote {
-            db.set_memory_origin(&memory.id, remote, memory.updated_at)?;
-        }
-
-        // Handle embedding
-        let stored_vector: Option<Vec<f32>> = if reembed_due_to_model_mismatch {
-            None
-        } else {
-            encoded_embedding
-                .as_deref()
-                .and_then(|e| export::decode_embedding(e).ok())
-        };
-        let final_vector = match stored_vector {
-            Some(vector) => vector,
-            None => embedding_service.embed_memory(memory.memory_type, &memory.content)?,
-        };
-        db.store_embedding(&memory.id, &final_vector, embedding_service.model_version())?;
-
-        // Assign to a cluster for every inserted or content-updated memory, matching the
-        // per-store call shape `memory_store` uses — the background re-clustering job
-        // amortizes the full pairwise merge/split pass separately and on its own schedule.
-        // ADR and Todo memories are exempt: `store_adr_atomic`/`store_todo_atomic` never
-        // route them through clustering either (ADRs are project-global reference
-        // documents, and a task list clustered by topic serves no retrieval purpose).
-        if (!is_update || content_differs)
-            && memory.memory_type != MemoryType::Adr
-            && memory.memory_type != MemoryType::Todo
-        {
-            // A content-changed update may already belong to a cluster whose centroid no
-            // longer represents it. Vacate that membership first — mirroring memory_delete's
-            // pattern in handler.rs — so re-assignment can't leave the memory in two
-            // clusters at once with a stale, unrecomputed centroid left behind in the old one.
-            if is_update
-                && content_differs
-                && let Ok(Some(old_cluster_id)) = db.remove_from_cluster(&memory.id)
-            {
-                let member_ids = db.get_cluster_member_ids(&old_cluster_id)?;
-                if member_ids.is_empty() {
-                    let _ = db.delete_empty_clusters(&target_project_id);
-                } else {
-                    let new_centroid = tools::cluster::compute_cluster_centroid(db, &member_ids)?;
-                    let summary = tools::cluster::generate_cluster_summary(db, &member_ids)?;
-                    if let Some(centroid) = new_centroid {
-                        let _ = db.update_cluster_centroid(&old_cluster_id, &centroid, &summary);
-                    }
-                }
-            }
-
-            tools::cluster::assign_to_cluster(
-                db,
-                &target_project_id,
-                &memory.id,
-                &final_vector,
-                &memory.content,
-                memory.importance,
-            )?;
-        }
-
-        // Import handoff sidecar if present. Only for brand-new handoffs: handoff and ADR
-        // sidecars are not among the LWW-governed mutable fields, so an update leaves the
-        // local sidecar row alone.
-        // Old exports without sidecar fields skip this step silently.
-        if !is_update && memory.memory_type == MemoryType::Handoff {
-            match (sections, section_embedding_keys, encoded_section_embeddings) {
-                (Some(sections_data), Some(keys), Some(encoded_bytes)) => {
-                    match export::decode_section_embedding_bytes(&encoded_bytes) {
-                        Ok(bytes) => {
-                            let key_count = if keys.is_empty() {
-                                0
-                            } else {
-                                keys.split(',').count()
-                            };
-                            if bytes.len() == key_count * 256 * 4 {
-                                if let Err(e) = db.insert_handoff_sections(
-                                    &memory.id,
-                                    &sections_data,
-                                    &keys,
-                                    &bytes,
-                                ) {
-                                    eprintln!(
-                                        "Warning: failed to import handoff sidecar for {}: {}",
-                                        memory.id, e
-                                    );
-                                }
-                            } else {
-                                eprintln!(
-                                    "Warning: skipping handoff sidecar for {} — byte length mismatch",
-                                    memory.id
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: skipping handoff sidecar for {} — decode error: {}",
-                                memory.id, e
-                            );
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "Notice: handoff {} imported without sidecar (old export format).",
-                        memory.id
-                    );
-                }
-            }
-        }
-
-        // Import ADR sidecar if present (brand-new ADRs only; see note above).
-        // Number-conflict check above guarantees the number is free at this point.
-        if !is_update
-            && memory.memory_type == MemoryType::Adr
-            && let (Some(num), Some(status_str), Some(adr_sec)) =
-                (adr_number, adr_status_str, adr_sections_data)
-        {
-            use std::str::FromStr;
-            match AdrStatus::from_str(&status_str) {
-                Ok(status) => {
-                    if let Err(e) = db.insert_adr_sidecar(
-                        &memory.id,
-                        &target_project_id,
-                        num,
-                        status,
-                        &adr_sec,
-                        mem_created_at,
-                        mem_updated_at,
-                    ) {
-                        eprintln!(
-                            "Warning: failed to insert ADR sidecar for {} (number {}): {}",
-                            memory.id, num, e
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: skipping ADR sidecar for {} — invalid status '{}': {}",
-                        memory.id, status_str, e
-                    );
-                }
-            }
-        }
-
-        // Apply retrieval-status and todo sidecars for both new and updated memories: both
-        // are LWW-governed fields (see the Convergence rule), and `set_dead_at`/
-        // `upsert_todo_item` are upsert-safe.
-        if let Some(status) = status_sidecar {
-            db.set_dead_at(
-                &memory.id,
-                status.dead,
-                status.reason.as_deref(),
-                status.marked_at,
-            )?;
-        }
-        if let Some(todo) = todo_sidecar {
-            db.upsert_todo_item(
-                &memory.id,
-                todo.status,
-                todo.reason.as_deref(),
-                todo.closed_at,
-            )?;
-        }
-    }
-
-    // Import relationships
-    let mut rel_imported = 0;
-    for rel in export_data.relationships {
-        let source_exists = db.get_memory(&rel.source_id)?.is_some();
-        let target_exists = db.get_memory(&rel.target_id)?.is_some();
-        if source_exists && target_exists {
-            db.create_relationship(&rel)?;
-            rel_imported += 1;
-        }
-    }
-
-    // New or changed knowledge advanced each touched project's clock, so relevance needs
-    // recomputing there — matches what a store does. Looping `touched_projects` (rather
-    // than the single CLI `-p`/cwd project) is what makes an all-projects import recompute
-    // every project it actually wrote to, not just the one the command happened to run in.
-    for pid in &touched_projects {
-        if let Some(project) = db.get_project(pid)? {
-            db.update_relevance_scores(pid, project.decay_rate)?;
-        }
-    }
-
-    Ok(ImportSummary {
-        imported,
-        updated,
-        rel_imported,
-        skipped,
-    })
-}
-
 fn cmd_import(
     db: &Database,
     project_id: &str,
@@ -2369,40 +2038,42 @@ fn cmd_import(
     };
     let export_data: export::ExportData = serde_json::from_str(&json)?;
 
-    export::validate_import(&export_data).map_err(MemoryError::Embedding)?;
+    let options = ImportOptions {
+        mode: mode
+            .parse()
+            .map_err(|message| MemoryError::InvalidArguments {
+                tool: "import".to_string(),
+                message,
+                received: format!("--mode {mode}"),
+            })?,
+        target_project: project_id,
+        origin_remote: None,
+    };
+    let outcome = import_payload(db, embedding_service, export_data, &options)?;
 
-    let import_mode: export::ImportMode = mode.parse().unwrap_or(export::ImportMode::Merge);
-    let all_projects = export_data.scope == export::ExportScope::AllProjects;
-
-    if all_projects && import_mode == export::ImportMode::Replace {
-        return Err(MemoryError::Embedding(
-            "--mode replace cannot be used with an all-projects payload (scope: all_projects): \
-             replace would wipe every project in this store, not just the one the payload came \
-             from. Re-export a single project's scope, or import this payload with --mode merge."
-                .to_string(),
-        ));
-    }
-
-    if import_mode == export::ImportMode::Replace {
-        db.delete_project_data(project_id)?;
+    print_import_warnings(&outcome);
+    if options.mode == export::ImportMode::Replace {
         println!("Cleared existing data.");
     }
-
-    let summary = import_export_data(
-        db,
-        project_id,
-        embedding_service,
-        export_data,
-        import_mode,
-        None,
-    )?;
-
+    let stats = &outcome.stats;
     println!(
         "Imported {} memories, {} updated, {} relationships ({} skipped)",
-        summary.imported, summary.updated, summary.rel_imported, summary.skipped
+        stats.memories_imported,
+        stats.memories_updated,
+        stats.relationships_imported,
+        stats.memories_skipped
     );
 
     Ok(())
+}
+
+fn print_import_warnings(outcome: &ImportOutcome) {
+    if let Some(model) = &outcome.foreign_model {
+        eprintln!("Notice: payload embeddings came from '{model}'; re-embedded locally.");
+    }
+    for warning in &outcome.warnings {
+        eprintln!("Warning: {warning}");
+    }
 }
 
 /// The greatest `memories[].updated_at` in a payload, or `None` if it carried no
@@ -2417,8 +2088,8 @@ fn max_memory_updated_at(data: &export::ExportData) -> Option<i64> {
 /// Order matters: the push payload is built from the *local* store before the pull half
 /// imports anything, so rows that just arrived from the remote are not immediately
 /// bounced back to it in the same invocation. The pull half runs in-process (the remote
-/// only exports; this binary does the merge, reusing `import_export_data` — the same
-/// re-embedding and cluster-assignment path a file-based `import` takes). The push half
+/// only exports; this binary does the merge through `import_payload`, the same path a
+/// file-based `import` and the `memory_import` tool take). The push half
 /// is a genuine subprocess: the remote's own `import --mode merge -` does that side's
 /// merge, on its own store.
 ///
@@ -2537,17 +2208,20 @@ fn cmd_sync(
     }
 
     if let Some((data, _bytes, count, max_updated_at)) = pull_payload {
-        let summary = import_export_data(
-            db,
-            "",
-            embedding_service,
-            data,
-            export::ImportMode::Merge,
-            Some(target),
-        )?;
+        let options = ImportOptions {
+            mode: export::ImportMode::Merge,
+            target_project: "",
+            origin_remote: Some(target),
+        };
+        let outcome = import_payload(db, embedding_service, data, &options)?;
+        print_import_warnings(&outcome);
+        let stats = &outcome.stats;
         println!(
             "pull: {} memories, {} updated, {} relationships ({} skipped) from {count} received",
-            summary.imported, summary.updated, summary.rel_imported, summary.skipped
+            stats.memories_imported,
+            stats.memories_updated,
+            stats.relationships_imported,
+            stats.memories_skipped
         );
         let new_pull_wm = match max_updated_at {
             Some(m) => pull_wm.max(m),

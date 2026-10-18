@@ -117,7 +117,7 @@ pub struct ExportedTodo {
 /// Import mode for handling existing memories
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImportMode {
-    /// Merge with existing data, skip duplicates
+    /// Merge with existing data, last-write-wins on `updated_at` (ties keep local)
     #[default]
     Merge,
     /// Replace all data in the project
@@ -138,11 +138,13 @@ impl std::str::FromStr for ImportMode {
 
 /// Statistics from an import operation
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[allow(dead_code)] // Used by MCP server tools
 pub struct ImportStats {
     /// Number of memories imported
     pub memories_imported: usize,
-    /// Number of memories skipped (duplicates in merge mode)
+    /// Existing memories overwritten because the incoming copy was newer (merge mode)
+    #[serde(default)]
+    pub memories_updated: usize,
+    /// Memories skipped because the local copy was as new or newer (merge mode)
     pub memories_skipped: usize,
     /// Number of relationships imported
     pub relationships_imported: usize,

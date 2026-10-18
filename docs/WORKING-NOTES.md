@@ -3,7 +3,7 @@
 ## Current state
 
 `master` holds a set of usability fixes driven by 30 days of Claude Code session logs
-(2,221 engram calls, ~150 failures), from `d4bdf75` through `f741bbc`. Each commit passed
+(2,221 engram calls, ~150 failures), from `d4bdf75` through the import-path commit. Each commit passed
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`. The
 installed binaries and any running `engram` servers predate all of it.
 
@@ -22,39 +22,24 @@ What each commit is meant to contain, for checking completeness:
 | `3023f67` | `resolve_known_project`: short names (`antworld`) and legacy absolute paths resolve; ambiguous names list candidates |
 | `7ee358b` | project identity: `root_path` recorded, `reconcile_identity` merges a repo's old id into its new one on startup/CLI run, `projects merge`, `project_aliases`, import redirects aliased projects |
 | `f741bbc` | aliases followed on resolve; ADR numbers rendered from the sidecar; import renumbers colliding ADRs |
+| "Route memory_import through the shared import path" | one import path, `import_payload` (`src/tools/import.rs`), for MCP `memory_import`, `engram-cli import` and `sync`; MCP import now merges LWW, preserves source `updated_at`, renumbers colliding ADRs, re-embeds foreign-model vectors; invalid `mode` is an error on both paths |
 
 ## Next steps
 
-1. **Unify the import paths.** The MCP `memory_import` tool (`src/tools/handler.rs`,
-   `fn memory_import`) is a separate implementation from `cmd_import` (`src/cli.rs`,
-   used by `import` and `sync`). It skips ADRs whose number collides, ignores
-   `project_aliases`, and likely diverges from the Sync rules in CLAUDE.md (LWW on
-   `updated_at` with ties kept local, source `updated_at` preserved, max access
-   counts, status/todo sidecars, model-mismatch re-embed, cluster re-assignment).
-   Move the logic into one function in `src/tools/import.rs` taking db, embedding
-   service, `ExportData` and a typed options struct (mode, target project,
-   all-projects handling, sync origin). `cmd_import`, sync's pull, and the MCP
-   handler all call it; delete the duplicate. List every behaviour difference and
-   resolve each per CLAUDE.md. Existing import/sync tests must pass unchanged; add
-   MCP-path tests for ADR renumbering, alias redirection, and LWW. Opus executor:
-   this touches sync convergence.
-   A partial attempt is in `git stash list` ("E2 partial …"): `cmd_import` moved
-   into `src/tools/import.rs`, MCP handler not yet routed. Inspect with
-   `git stash show -p stash@{0}`; apply it or drop it and start fresh.
-2. **Final review.** One `code-reviewer` run on Opus over `70bb160..HEAD`, scoped to
+1. **Final review.** One `code-reviewer` run on Opus over `70bb160..HEAD`, scoped to
    cross-commit seams (e.g. todo `detail` vs link resolution, argument tolerance vs
    the `sections` patch, aliases vs short-name resolution vs reconcile) and to the
    table above as the completeness checklist.
-3. **Install and restart.** `cargo build --release`, install both binaries, restart
+2. **Install and restart.** `cargo build --release`, install both binaries, restart
    every running `engram` server (it resolves its project once at startup).
-4. **Check on the live store.** Run `engram-cli stats` inside `~/dev/Gardener` and
+3. **Check on the live store.** Run `engram-cli stats` inside `~/dev/Gardener` and
    confirm the one-line merge note (`~/dev/Gardener` → `git:github.com/XivHub/Gardener`,
    12 memories). Run `handoff_resume` in antworld and confirm the output fits inline
    (it was ~62 KB, 55 KB of it todos).
-5. **Update the `read-handoffs` skill** (`~/.claude/skills/read-handoffs/SKILL.md`):
+4. **Update the `read-handoffs` skill** (`~/.claude/skills/read-handoffs/SKILL.md`):
    `open_todos` is now `{id, title}` with `open_todo_count` and `stale_todo_count` /
    `stale_todo_ids`; step 5 should say to offer closing or dropping the stale ones.
-6. **Release.** Bump the version and write the release commit once 1–4 are done.
+5. **Release.** Bump the version and write the release commit once 1–3 are done.
 
 ## How to work here
 
