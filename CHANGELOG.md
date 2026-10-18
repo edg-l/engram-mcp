@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.12.1] - 2026-10-18
+
+### Changed
+- **Generic example names** in the `project` argument's description, the changelog and the docs, in place of names from a real store.
+
 ## [0.12.0] - 2026-10-18
 
 ### Upgrading
