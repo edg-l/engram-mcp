@@ -3,9 +3,11 @@ name = "engram_mcp"
 version = "0.12.0"
 edition = "2024"
 description = "MCP server for AI agent persistent memory with SQLite and local embeddings"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/edg-l/engram-mcp"
 homepage = "https://github.com/edg-l/engram-mcp"
+# Development-only cargo settings (tests keep the shared embedding process off).
+exclude = [".cargo"]
 
 [[bin]]
 name = "engram"

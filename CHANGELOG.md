@@ -3,6 +3,7 @@
 ## [0.12.0] - 2026-10-18
 
 ### Upgrading
+- **The license is Apache-2.0**, matching the repository's `LICENSE` file. The crate metadata of earlier versions said MIT.
 - **Restart every running `engram` server after installing.** A server resolves its project once at startup, and that is also when a repo's earlier ids are folded into its current one.
 - **A directory reused for an unrelated repo with a remote is merged into it.** Delete `~/dev/foo`, clone a different repo there, and the two count as one project; the stderr merge line names both ids, and there is no unmerge. A directory without a remote never absorbs anything.
 
