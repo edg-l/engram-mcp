@@ -1,9 +1,8 @@
 /// Verifies that the direct db-tier insert path used by the longmemeval
 /// harness does NOT auto-dedup or merge near-identical memories.
 ///
-/// The ToolHandler::memory_store path fires find_duplicates (>= 0.90
-/// cosine) and then silently merges them. This test bypasses that handler
-/// and asserts both rows survive, confirming the harness ingest is safe.
+/// This test asserts both rows survive the db-tier inserts the harness
+/// uses, so recall numbers never depend on what the tool handler does.
 #[tokio::test]
 async fn ingest_does_not_auto_dedup_near_identical_turn_pairs() {
     use engram_mcp::db::Database;

@@ -32,7 +32,7 @@ use super::schemas::{
     MemoryGraphInput, MemoryImportInput, MemoryLinkInput, MemoryListInput, MemoryPromoteInput,
     MemoryPruneInput, MemoryQueryInput, MemoryRestoreInput, MemoryStatsInput,
     MemoryStoreBatchInput, MemoryStoreInput, MemoryTrashInput, MemoryUpdateInput, TodoListInput,
-    TodoWriteInput, ToolProfile, dedup_threshold, get_tool_definitions_for,
+    TodoWriteInput, ToolProfile, get_tool_definitions_for,
 };
 use super::scoring::{
     SearchMode, apply_tag_and_relevance, compute_context_score, compute_hybrid_score,
@@ -89,13 +89,6 @@ fn warn_unavailable_once(tool: &str, profile: ToolProfile) {
 // ============================================
 
 #[derive(Debug, Serialize)]
-pub struct MergeInfo {
-    pub merged_with: String,
-    pub similarity: f64,
-    pub old_content_preview: String,
-}
-
-#[derive(Debug, Serialize)]
 pub struct MemoryStoreResult {
     pub id: String,
     pub message: String,
@@ -104,13 +97,11 @@ pub struct MemoryStoreResult {
     pub project: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub merge_info: Option<MergeInfo>,
     /// Memories this store superseded, as requested via `supersedes`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<String>,
-    /// Existing memories close enough to be about the same subject but not close enough
-    /// to merge. Reported so the caller can supersede one deliberately; never automatic.
+    /// Existing memories close enough to be about the same subject, near-duplicates
+    /// included. Reported so the caller can supersede one deliberately; never automatic.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub possible_supersedes: Vec<SupersessionCandidate>,
     /// `related_to`/`supersedes` ids that named a memory a dedup merge had since
@@ -380,8 +371,6 @@ impl ToolHandler {
     }
 
     fn memory_store(&self, arguments: Value) -> Result<Value, MemoryError> {
-        use super::store::{StoreOutcome, store_with_dedup_exempting};
-
         let input: MemoryStoreInput = parse_args("memory_store", arguments)?;
         let project = self.resolve_project(input.project.as_deref())?;
 
@@ -456,73 +445,11 @@ impl ToolHandler {
             global: input.global,
         };
 
-        // Generate embedding locally — needed for dedup.
         let embedding = self.embedding.embed_memory(memory_type, &input.content)?;
-
-        // Fetch memories now so we can build a content preview if a dedup merge occurs.
-        // (store_with_dedup will re-fetch internally for dedup; that's acceptable here.)
-        let pre_store_memories_list = self.db.get_all_memories_for_project(&project)?;
-        let pre_store_memories: std::collections::HashMap<String, Memory> = pre_store_memories_list
-            .into_iter()
-            .map(|m| (m.id.clone(), m))
-            .collect();
-
-        // Handoffs are session snapshots; bypass dedup.
-        // Pass None for embedding_service to skip dedup for handoffs.
-        let dedup_thr = dedup_threshold();
-        // Memories the caller has explicitly tied to this one are distinct from it by
-        // assertion, so dedup must not collapse them together. Exempt the resolved ids:
-        // a merged-away id's survivor is the one that would actually be a dedup
-        // candidate.
-        let dedup_exempt: HashSet<String> = related_to
-            .iter()
-            .chain(supersedes.iter())
-            .cloned()
-            .collect();
-        let outcome = if memory_type != MemoryType::Handoff {
-            store_with_dedup_exempting(
-                &self.db,
-                Some(&self.embedding),
-                &project,
-                memory,
-                Some(&embedding),
-                dedup_thr,
-                None, // MCP path never skips — always merges duplicates
-                &dedup_exempt,
-            )?
-        } else {
-            // Handoff: store directly, bypassing dedup.
-            self.db.store_memory(&memory)?;
-            self.db
-                .store_embedding(&id, &embedding, self.embedding.model_version())?;
-            StoreOutcome::Stored(id.clone())
-        };
-
-        // Map store outcome to MergeInfo.
-        let (final_id, merge_info) = match outcome {
-            StoreOutcome::Stored(stored_id) => (stored_id, None),
-            StoreOutcome::Merged {
-                id: stored_id,
-                merged_with,
-                similarity,
-            } => {
-                let old_preview: String = pre_store_memories
-                    .get(&merged_with)
-                    .map(|m| m.content.chars().take(100).collect())
-                    .unwrap_or_default();
-                (
-                    stored_id,
-                    Some(MergeInfo {
-                        merged_with,
-                        similarity,
-                        old_content_preview: old_preview,
-                    }),
-                )
-            }
-            StoreOutcome::SkippedSimilar { .. } => {
-                unreachable!("MCP path passes skip_above=None; SkippedSimilar cannot occur")
-            }
-        };
+        self.db.store_memory(&memory)?;
+        self.db
+            .store_embedding(&id, &embedding, self.embedding.model_version())?;
+        let final_id = id;
 
         // Create relationships to related memories
         for related_id in related_to {
@@ -554,23 +481,16 @@ impl ToolHandler {
             superseded.push(old_id.clone());
         }
 
-        // Surface near-duplicates that were too far apart to merge but close enough to be
-        // about the same thing. The similarities are already computed for dedup and
-        // otherwise thrown away; a caller storing "X is now Y" has no other way to learn
-        // that a months-old memory says "X is Z", because that memory never surfaced.
-        // A memory the store just merged with is reported as a merge, not as something
-        // that might need superseding.
-        let mut candidate_exclusions: Vec<&str> = vec![final_id.as_str()];
-        if let Some(info) = &merge_info {
-            candidate_exclusions.push(info.merged_with.as_str());
-        }
+        // A caller storing "X is now Y" has no other way to learn that a months-old
+        // memory says "X is Z", because that memory never surfaced. Near-duplicates land
+        // here too: the caller, not cosine, decides whether one repeats or replaces another.
         let possible_supersedes = if superseded.is_empty() {
             supersession_candidates(
                 &self.db,
                 &project,
                 &embedding,
                 memory_type,
-                &candidate_exclusions,
+                &[final_id.as_str()],
             )?
         } else {
             Vec::new()
@@ -591,18 +511,11 @@ impl ToolHandler {
         // in it is now one store-day more displaced.
         self.refresh_relevance(&project);
 
-        let message = if merge_info.is_some() {
-            "Memory stored and merged with duplicate".to_string()
-        } else {
-            "Memory stored successfully".to_string()
-        };
-
         Ok(json!(MemoryStoreResult {
             id: final_id,
-            message,
+            message: "Memory stored successfully".to_string(),
             project,
             branch,
-            merge_info,
             superseded,
             possible_supersedes,
             redirected_links,

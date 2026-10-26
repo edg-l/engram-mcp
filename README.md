@@ -56,7 +56,7 @@ This installs two binaries. `engram` is the MCP server, which your client starts
 
 - Handoffs are structured into sections and chained per git branch, so context from `feat/auth` does not leak into `fix/billing`.
 - Todos live on a durable per-project list with an explicit done or dropped state, so finished work and forgotten work stay distinguishable.
-- Facts, decisions, patterns and debug findings are searched with BM25 and embeddings combined. Near-duplicates merge on store.
+- Facts, decisions, patterns and debug findings are searched with BM25 and embeddings combined. A store reports existing memories it may repeat or replace.
 - Old knowledge fades as newer knowledge about the same project arrives, not with the calendar. A project you leave for a year is as fresh as the day you left it.
 - Architecture decisions are kept as numbered ADRs that move through proposed, accepted and superseded, and export as Markdown files.
 - A memory can be superseded by a newer one, which retrieval then returns in its place. Deletions go to a trash you can restore from.

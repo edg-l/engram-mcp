@@ -9,7 +9,6 @@ Engram reads environment variables only; there is no config file. The MCP server
 | `ENGRAM_BRANCH` | detected from git | What "current branch" means, for a server or shell started in a different checkout than the work. |
 | `ENGRAM_SEARCH_MODE` | `hybrid` | Retrieval for the MCP server's `memory_query` and `memory_context`: `hybrid`, `bm25` or `vector`. |
 | `ENGRAM_MAX_CANDIDATES` | `500` | Memories `memory_context` scores, most recently accessed first. Pinned memories are always included. |
-| `ENGRAM_DEDUP_THRESHOLD` | `0.90` | Cosine similarity at which a new memory merges into an existing one of the same type. Clamped to 0.5–1.0. |
 | `ENGRAM_DECAY_INTERVAL` | `3600` | Seconds between the server's maintenance passes: relevance, auto-prune, trash sweep. |
 | `ENGRAM_RECLUSTER_INTERVAL` | `21600` | Seconds between re-clustering passes. |
 | `ENGRAM_TRASH_RETENTION_DAYS` | `30` | Days a deleted memory stays restorable. `0` keeps it forever. |

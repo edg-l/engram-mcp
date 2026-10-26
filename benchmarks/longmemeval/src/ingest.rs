@@ -1,16 +1,9 @@
 //! INGEST PATH BYPASSES THE TOOL HANDLER.
 //!
-//! The MCP tool's memory_store and memory_store_batch fire auto-dedup
-//! (similarity >= 0.90) and contradiction detection (>= 0.85) which would
-//! silently merge our ~260 topically-similar turn-pairs per session,
-//! corrupting recall numbers. We call Database::store_memory at
-//! src/db/memories.rs:60 and Database::store_embedding at
-//! src/db/embeddings.rs:9 directly to skip both.
-//!
-//! Verified bypass: confirmed by reading handler.rs lines 301-314 that
-//! find_duplicates and the contradiction loop are only called inside
-//! memory_store (the ToolHandler method), not in the db-tier methods we
-//! invoke here.
+//! We call Database::store_memory and Database::store_embedding directly,
+//! so recall numbers measure retrieval over exactly the ~260 turn-pairs per
+//! session that were ingested, independent of whatever the MCP tool handler
+//! does on store (clustering, relevance refresh).
 
 use chrono::Utc;
 use engram_mcp::{

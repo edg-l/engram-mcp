@@ -56,9 +56,9 @@ Pinned memories stay at 1.0. A memory at the 0.1 floor that was never accessed, 
 
 ## Deduplication and supersession
 
-A new memory at cosine ≥ 0.90 to an existing memory of the same type merges into it: tags combine, the higher importance wins, and the absorbed text is kept in `merged_from`. Between a global and a local memory, the global one survives. The server also merges duplicates within each cluster on its re-clustering pass.
+Storing never merges. A new memory at cosine ≥ 0.88 to an existing memory of the same type is returned as `possible_supersedes`, near-identical ones included, and the caller decides whether it replaces, repeats or elaborates the old one. Similarity cannot tell those apart: on this embedding model, two long memories about one subject but different claims score 0.90 to 0.91, as high as a rephrasing of the same claim.
 
-Some pairs never merge: memories of different types, a memory into one that has already absorbed others, and any memory the caller linked through `related_to` or `supersedes`. A near-match that is not merged is returned as `possible_supersedes`, because similarity cannot tell "contradicts" from "elaborates"; the caller decides.
+`memory_dedup` merges on request, dry run first: tags combine, the higher importance wins, and the absorbed text is kept in `merged_from`. Between a global and a local memory, the global one survives. It skips pairs joined by a `supersedes` or `derived_from` edge.
 
 Superseding a memory keeps it. Retrieval returns its successor in its place, marked with what it replaced, so a question answered once does not get re-derived from the stale answer. A memory marked dead, whose subject is gone with no successor, is left out of retrieval entirely.
 

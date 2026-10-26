@@ -114,10 +114,8 @@ fn first_line(content: &str) -> String {
 /// callers stopped reading it; 0.88 fires on about a third and still catches 13 of 17 real
 /// supersessions. 0.90 would halve recall for little further quiet.
 ///
-/// There is no upper bound: a pair can sit above the dedup threshold and still not have
-/// merged, because dedup refuses composites and caller-exempted memories. Those are the
-/// *most* likely supersessions, not the least, so capping the band at the dedup threshold
-/// would hide exactly the pairs worth asking about.
+/// There is no upper bound: a store never merges, so a near-identical memory is reported
+/// here too, and the caller decides whether the new one repeats or replaces it.
 pub const SUPERSESSION_CANDIDATE_MIN: f32 = 0.88;
 
 /// Most supersession candidates reported per store, highest similarity first.
@@ -135,10 +133,9 @@ pub struct SupersessionCandidate {
 }
 
 /// Existing same-type memories similar enough to be about the same subject as
-/// `embedding`, excluding the new memory itself and anything it already merged with.
+/// `embedding`, excluding the ids in `exclude` (the new memory itself).
 ///
-/// These similarities are computed for dedup anyway and otherwise discarded. Reporting
-/// them is the only way a caller storing "X is now Y" learns that a memory from months
+/// Reporting them is the only way a caller storing "X is now Y" learns that a memory from months
 /// ago says "X is Z": that memory never surfaced, so it never became a candidate for
 /// anything. Never acted on automatically — cosine cannot separate "contradicts" from
 /// "elaborates", and at this range it frequently means the latter.

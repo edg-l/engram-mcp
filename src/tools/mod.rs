@@ -15,7 +15,6 @@ pub mod import;
 pub mod links;
 pub mod schemas;
 pub mod scoring;
-pub mod store;
 pub mod todo;
 pub mod update;
 
@@ -29,11 +28,8 @@ pub use handler::{ToolHandler, parse_search_mode};
 pub use handoff::{create_handoff, resume_handoff, score_handoff_sections, search_handoffs};
 pub use import::{ImportOptions, ImportOutcome, import_payload};
 pub use links::{Redirect, resolve_link_target};
-pub use schemas::{
-    MemoryUpdateInput, ToolProfile, dedup_threshold, get_tool_definitions, get_tool_definitions_for,
-};
+pub use schemas::{MemoryUpdateInput, ToolProfile, get_tool_definitions, get_tool_definitions_for};
 pub use scoring::{SearchMode, compute_hybrid_score, compute_tag_boost};
-pub use store::{StoreOutcome, store_with_dedup};
 pub use todo::{
     OpenTodoItem, STALE_TODO_STORE_DAYS, TODO_TEXT_MAX, TodoListResult, TodoOp, TodoWriteResult,
     list_todos, open_todo_titles, stale_todos, todo_title, write_todos,

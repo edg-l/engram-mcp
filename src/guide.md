@@ -57,21 +57,20 @@ Do not store a second, contradicting memory. Two memories that disagree both kee
 - **The subject is gone entirely** (service retired, file deleted, approach abandoned with nothing in its place) -> `memory_update` with `dead: true`. Dead memories are excluded from retrieval outright. Prefer supersession whenever there is something to point at: returning nothing reads as "nobody looked into this", which invites the same wrong conclusion to be reached again.
 - **It is simply wrong or badly worded** -> `memory_update` with new content. This replaces the content wholesale rather than patching it; the result hands back the previous version, and the old one stays recoverable.
 
-Every `memory_store` result may include `possible_supersedes`: existing memories close enough to be about the same subject but not close enough to have been merged. Read it. That is usually the only way you will learn that a memory from months ago contradicts what you just stored, because a memory that never surfaces in search never becomes a candidate for anything.
+Every `memory_store` result may include `possible_supersedes`: existing memories close enough to be about the same subject, near-duplicates included. Nothing is merged automatically. Read it: if the new memory replaces one, store again with `supersedes`; if it repeats one, delete the new one. That is usually the only way you will learn that a memory from months ago contradicts what you just stored, because a memory that never surfaces in search never becomes a candidate for anything.
 
 # Memory maintenance
 
 - Relevance fades as newer memories about the same project arrive, not with the calendar: a project nobody touches does not age. Important and pinned memories hold up longest.
-- Duplicates are automatically detected and merged when stored.
 - Use `memory_list` to see what is actually in the store. Search only shows what a query matches, so the memories most in need of attention are the ones it never surfaces. `status: "superseded"` and `status: "dead"` show what retrieval is hiding.
 - Use `memory_prune` periodically to clean up low-relevance memories.
-- Use `memory_dedup` to find and merge similar memories that weren't caught automatically.
+- Use `memory_dedup` to find and merge duplicate memories. Read its dry run first: similarity also pairs different claims about one subject.
 
 ## Deleting is a last resort, and it is not free
 
 Prefer supersession or `dead` over deletion. A memory is often carrying more than the claim it appears to be about: a lesson, a count of how often something has happened, context that exists nowhere else. Verifying "this conclusion is in git" does not verify the rest of it.
 
-Before deleting, read the whole memory, including `merged_from`: dedup may have folded several other memories into it, and one id can stand for several distinct claims.
+Before deleting, read the whole memory, including `merged_from`: a dedup merge may have folded several other memories into it, and one id can stand for several distinct claims.
 
 `memory_delete`, `memory_delete_batch`, `memory_prune`, and dedup merges all return what they destroyed and keep a recoverable snapshot. `memory_trash` lists them; `memory_restore` puts one back with its embedding and relationships. Snapshots expire, so recovering something is only possible for as long as the retention window.
 

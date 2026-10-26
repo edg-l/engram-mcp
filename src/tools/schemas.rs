@@ -659,15 +659,6 @@ pub struct AdrExportInput {
 // Utility fns used by schemas and tool definitions
 // ============================================
 
-/// Read dedup threshold from ENGRAM_DEDUP_THRESHOLD env var, clamped to [0.5, 1.0].
-pub fn dedup_threshold() -> f32 {
-    std::env::var("ENGRAM_DEDUP_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .map(|v| v.clamp(0.5, 1.0))
-        .unwrap_or(0.90)
-}
-
 pub fn make_input_schema(schema: Value) -> Arc<Map<String, Value>> {
     match schema {
         Value::Object(map) => Arc::new(map),
@@ -695,7 +686,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // === Core tools (used frequently by agents) ===
         Tool::new(
             "memory_store",
-            "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Duplicates are auto-detected and merged. Use `pinned: true` for permanent knowledge that must never decay, and `global: true` for knowledge that applies across all projects.\n\nWhen this replaces something already stored, pass `supersedes` with the old id instead of storing a contradicting memory. The result's `possible_supersedes` lists existing memories on the same subject: read it, and store again with `supersedes` if one of them is now wrong. When the claim lives in a committed file, put the path in `external_artifacts` and store only what the file does not say.",
+            "Save a piece of knowledge for later recall. Use this whenever you learn something worth remembering: project facts, architectural decisions, user preferences, recurring patterns, or debug findings. Nothing is merged automatically. Use `pinned: true` for permanent knowledge that must never decay, and `global: true` for knowledge that applies across all projects.\n\nWhen this replaces something already stored, pass `supersedes` with the old id instead of storing a contradicting memory. The result's `possible_supersedes` lists existing memories on the same subject: read it, and store again with `supersedes` if one of them is now wrong. When the claim lives in a committed file, put the path in `external_artifacts` and store only what the file does not say.",
             project_scoped_schema(json!({
                 "type": "object",
                 "properties": {

@@ -1695,32 +1695,9 @@ fn cmd_store(
 
     let embedding = embedding_service.embed_memory(memory_type, content)?;
 
-    // Same path as the MCP `memory_store`, so a memory stored from the CLI gets the same
-    // dedup, provenance, and recoverability as one stored by an agent. Memories this one
-    // supersedes are exempt: they are distinct by assertion.
-    let exempt: std::collections::HashSet<String> = supersedes.iter().cloned().collect();
-    let outcome = tools::store::store_with_dedup_exempting(
-        db,
-        Some(embedding_service),
-        project_id,
-        memory,
-        Some(&embedding),
-        tools::schemas::dedup_threshold(),
-        None,
-        &exempt,
-    )?;
-
-    let (id, merged_with) = match outcome {
-        tools::store::StoreOutcome::Stored(id) => (id, None),
-        tools::store::StoreOutcome::Merged {
-            id,
-            merged_with,
-            similarity,
-        } => (id, Some((merged_with, similarity))),
-        tools::store::StoreOutcome::SkippedSimilar { .. } => {
-            unreachable!("skip_above is None, so nothing can be skipped")
-        }
-    };
+    let id = memory.id.clone();
+    db.store_memory(&memory)?;
+    db.store_embedding(&id, &embedding, embedding_service.model_version())?;
 
     for old_id in supersedes {
         let rel = Relationship {
@@ -1745,12 +1722,6 @@ fn cmd_store(
     } else {
         println!("Memory stored: {} (global)", id);
     }
-    if let Some((merged_with, similarity)) = &merged_with {
-        println!(
-            "Merged with near-duplicate {merged_with} (similarity {similarity:.2}); its full \
-             content is kept in this memory's provenance and in the trash."
-        );
-    }
     for redirect in &redirects {
         println!(
             "Note: {} was merged away; supersedes now points at its survivor {}.",
@@ -1764,12 +1735,8 @@ fn cmd_store(
     // Nothing else tells you that a memory from months ago is about the same subject:
     // it never surfaced, so it never became a candidate for anything.
     if supersedes.is_empty() {
-        let mut exclusions: Vec<&str> = vec![id.as_str()];
-        if let Some((merged_with, _)) = &merged_with {
-            exclusions.push(merged_with.as_str());
-        }
         let candidates =
-            supersession_candidates(db, project_id, &embedding, memory_type, &exclusions)?;
+            supersession_candidates(db, project_id, &embedding, memory_type, &[id.as_str()])?;
         if !candidates.is_empty() {
             println!("\nExisting memories on what looks like the same subject:");
             for candidate in &candidates {
@@ -1780,7 +1747,7 @@ fn cmd_store(
             }
             println!(
                 "If this replaces one of them, store again with --supersedes <id> instead of \
-                 keeping both."
+                 keeping both. If it repeats one, delete this one."
             );
         }
     }

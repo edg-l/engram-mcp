@@ -447,23 +447,6 @@ fn compact_store(result: &Value) -> String {
         out.push_str(&format!(" (branch: {})", branch));
     }
 
-    if let Some(merge) = result.get("merge_info")
-        && !merge.is_null()
-    {
-        let merged_with = merge
-            .get("merged_with")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let sim = merge
-            .get("similarity")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        out.push_str(&format!(
-            "\nMerged with duplicate {} (similarity: {:.2})",
-            merged_with, sim
-        ));
-    }
-
     if let Some(superseded) = result.get("superseded").and_then(|v| v.as_array())
         && !superseded.is_empty()
     {
@@ -495,7 +478,7 @@ fn compact_store(result: &Value) -> String {
         }
         out.push_str(
             "\nIf this replaces one of them, store again with `supersedes` rather than keeping \
-             both. If it merely elaborates, ignore this.",
+             both. If it repeats one, delete this one. If it merely elaborates, ignore this.",
         );
     }
 

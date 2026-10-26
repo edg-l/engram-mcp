@@ -167,64 +167,42 @@ fn test_store_and_query_realistic_memories() {
 }
 
 #[test]
-fn test_dedup_triggers_on_rephrased_memory() {
+fn test_store_keeps_a_near_duplicate_and_reports_it() {
     let (h, _dir) = setup(None);
 
-    // Agent stores a fact
     let r1 = call(
         &h,
         "memory_store",
         json!({
             "content": "The CI pipeline runs on GitHub Actions with a matrix build for Linux and macOS",
             "type": "fact",
-            "tags": ["ci"],
-            "importance": 0.6
+            "tags": ["ci"]
         }),
     );
     let id1 = r1["id"].as_str().unwrap().to_string();
 
-    // Later, agent stores essentially the same fact rephrased
+    // The same claim, verbatim: as similar as two memories can be.
     let r2 = call(
         &h,
         "memory_store",
         json!({
-            "content": "CI runs on GitHub Actions, using matrix builds targeting Linux and macOS platforms",
+            "content": "The CI pipeline runs on GitHub Actions with a matrix build for Linux and macOS",
             "type": "fact",
-            "tags": ["ci", "github-actions"],
-            "importance": 0.7
+            "tags": ["ci"]
         }),
     );
-    let id2 = r2["id"].as_str().unwrap().to_string();
 
-    // Check if dedup fired (depends on model similarity -- may or may not trigger)
-    if r2.get("merge_info").is_some() && !r2["merge_info"].is_null() {
-        // Dedup fired: old memory merged into new one
-        let merge_info = &r2["merge_info"];
-        assert_eq!(merge_info["merged_with"].as_str().unwrap(), id1);
-        assert!(merge_info["similarity"].as_f64().unwrap() >= 0.90);
+    assert!(r2.get("merge_info").is_none());
+    let candidates: Vec<&str> = r2["possible_supersedes"]
+        .as_array()
+        .expect("a near-duplicate must be reported")
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(candidates, vec![id1.as_str()]);
 
-        // Old memory should be gone
-        let r = call(&h, "memory_query", json!({"query": ""}));
-        let ids: Vec<&str> = r["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["memory"]["id"].as_str().unwrap())
-            .collect();
-        assert!(
-            !ids.contains(&id1.as_str()),
-            "Old memory should be merged away"
-        );
-        assert!(ids.contains(&id2.as_str()), "New memory should exist");
-
-        // Merged memory should have union of tags
-        let stats = call(&h, "memory_stats", json!({}));
-        assert_eq!(stats["memory_count"].as_u64().unwrap(), 1);
-    } else {
-        // Similarity was below 0.90 -- both memories coexist
-        let stats = call(&h, "memory_stats", json!({}));
-        assert_eq!(stats["memory_count"].as_u64().unwrap(), 2);
-    }
+    let stats = call(&h, "memory_stats", json!({}));
+    assert_eq!(stats["memory_count"].as_u64().unwrap(), 2);
 }
 
 #[test]

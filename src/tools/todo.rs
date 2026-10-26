@@ -6,8 +6,6 @@ use crate::db::{Database, StoreDayIndex};
 use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::memory::{Memory, MemoryType, RelationType, Relationship, TodoItem, TodoStatus};
-use crate::tools::schemas::dedup_threshold;
-use crate::tools::store::{StoreOutcome, store_with_dedup_exempting};
 
 /// Similarity at or above which an existing open todo is reported as a possible duplicate
 /// of one being added. Never merged automatically: two todos that read alike can still be
@@ -479,28 +477,9 @@ fn store_todo_detail(
         global: false,
     };
 
-    // A todo is a different memory_type, so type-matched dedup would never fold into it
-    // anyway; exempting it here just applies the same "caller declared this connected"
-    // rule store_with_dedup_exempting already applies to related_to/supersedes targets.
-    let exempt: HashSet<String> = [todo_id.to_string()].into_iter().collect();
-    let outcome = store_with_dedup_exempting(
-        db,
-        Some(embedding),
-        project_id,
-        memory,
-        Some(&vector),
-        dedup_threshold(),
-        None, // never skip: a detail is always worth recording, merged or not
-        &exempt,
-    )?;
-
-    let detail_id = match outcome {
-        StoreOutcome::Stored(id) => id,
-        StoreOutcome::Merged { id, .. } => id,
-        StoreOutcome::SkippedSimilar { .. } => {
-            unreachable!("skip_above=None; SkippedSimilar cannot occur")
-        }
-    };
+    let detail_id = memory.id.clone();
+    db.store_memory(&memory)?;
+    db.store_embedding(&detail_id, &vector, embedding.model_version())?;
 
     db.create_relationship(&Relationship {
         id: format!("rel_{}", uuid::Uuid::new_v4().simple()),

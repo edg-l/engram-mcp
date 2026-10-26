@@ -1,5 +1,7 @@
+use std::collections::HashSet;
+
 use crate::db::Database;
-use crate::embedding::EmbeddingService;
+use crate::embedding::{EmbeddingService, cosine_similarity};
 use crate::error::MemoryError;
 use crate::hooks::HookEvent;
 use crate::hooks::filter;
@@ -11,7 +13,6 @@ use crate::hooks::redact;
 use crate::hooks::transcript::extract_last_assistant_text;
 use crate::memory::{Memory, MemoryType};
 use crate::summarize::{generate_summary, should_auto_summarize};
-use crate::tools::{StoreOutcome, dedup_threshold, store_with_dedup};
 
 #[derive(Debug)]
 #[allow(dead_code)] // Fields read by callers via Debug formatting and pattern matching
@@ -97,7 +98,7 @@ pub fn dispatch(
                 )));
             }
 
-            let outcome = store_memory(
+            store_memory(
                 db,
                 embedding_service,
                 project_id,
@@ -108,8 +109,7 @@ pub fn dispatch(
                 branch.as_deref(),
                 false,
                 false,
-            )?;
-            Ok(outcome_to_dispatch(outcome))
+            )
         }
 
         HookEvent::PostToolUse => {
@@ -183,7 +183,7 @@ pub fn dispatch(
                 )));
             }
 
-            let outcome = store_memory(
+            store_memory(
                 db,
                 embedding_service,
                 project_id,
@@ -194,8 +194,7 @@ pub fn dispatch(
                 branch.as_deref(),
                 false,
                 false,
-            )?;
-            Ok(outcome_to_dispatch(outcome))
+            )
         }
 
         HookEvent::SubagentStop => {
@@ -221,7 +220,7 @@ pub fn dispatch(
                 )));
             }
 
-            let outcome = store_memory(
+            store_memory(
                 db,
                 embedding_service,
                 project_id,
@@ -232,8 +231,7 @@ pub fn dispatch(
                 branch.as_deref(),
                 false,
                 false,
-            )?;
-            Ok(outcome_to_dispatch(outcome))
+            )
         }
     }
 }
@@ -249,36 +247,11 @@ fn hook_importance_cap(raw: f64) -> f64 {
     raw.clamp(0.0, 0.5)
 }
 
-/// Convert a `StoreOutcome` to a `DispatchOutcome`.
+/// Build and store a `Memory`, unless it repeats one already stored.
 ///
-/// For `Stored` and `Merged`, the uuid is extracted from the `"mem_<uuid>"` id by
-/// stripping the `"mem_"` prefix and parsing. Failures fall back to a new random UUID.
-fn outcome_to_dispatch(outcome: StoreOutcome) -> DispatchOutcome {
-    match outcome {
-        StoreOutcome::Stored(full_id) | StoreOutcome::Merged { id: full_id, .. } => {
-            let uuid = full_id
-                .strip_prefix("mem_")
-                .and_then(|s| s.parse::<uuid::Uuid>().ok())
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "hook store returned non-standard memory id {:?}; emitting random uuid",
-                        full_id
-                    );
-                    uuid::Uuid::new_v4()
-                });
-            DispatchOutcome::Stored(uuid)
-        }
-        StoreOutcome::SkippedSimilar { .. } => DispatchOutcome::Skipped("dedup_similar"),
-    }
-}
-
-/// Build and store a `Memory`, routing through `store_with_dedup`.
-///
-/// When `embedding_service` is `Some`, the embedding is computed and dedup is applied:
-/// - the hook-specific skip threshold suppresses storage of near-identical memories.
-/// - the MCP dedup threshold controls when two memories are merged.
-///
-/// When `embedding_service` is `None`, the memory is stored without dedup or embedding.
+/// When `embedding_service` is `Some`, a capture whose cosine to an existing same-type
+/// memory reaches the hook skip threshold is dropped. When it is `None`, nothing can be
+/// compared and the memory is stored without an embedding.
 #[allow(clippy::too_many_arguments)]
 fn store_memory(
     db: &Database,
@@ -291,8 +264,9 @@ fn store_memory(
     branch: Option<&str>,
     pinned: bool,
     global: bool,
-) -> Result<StoreOutcome, MemoryError> {
-    let id = format!("mem_{}", uuid::Uuid::new_v4().simple());
+) -> Result<DispatchOutcome, MemoryError> {
+    let uuid = uuid::Uuid::new_v4();
+    let id = format!("mem_{}", uuid.simple());
     let now = chrono::Utc::now().timestamp();
 
     let summary = if should_auto_summarize(content, None) {
@@ -321,18 +295,30 @@ fn store_memory(
         global,
     };
 
-    if let Some(es) = embedding_service {
-        let embedding = es.embed_memory(memory_type, content)?;
-        store_with_dedup(
-            db,
-            Some(es),
-            project_id,
-            memory,
-            Some(&embedding),
-            dedup_threshold(),
-            Some(filter::hook_dedup_skip_threshold()),
-        )
-    } else {
-        store_with_dedup(db, None, project_id, memory, None, 0.0, None)
+    let Some(es) = embedding_service else {
+        db.store_memory(&memory)?;
+        return Ok(DispatchOutcome::Stored(uuid));
+    };
+
+    let embedding = es.embed_memory(memory_type, content)?;
+    let same_type: HashSet<String> = db
+        .get_all_memories_for_project(project_id)?
+        .into_iter()
+        .filter(|m| m.memory_type == memory_type)
+        .map(|m| m.id)
+        .collect();
+    let skip_above = filter::hook_dedup_skip_threshold();
+    let repeats_one = db
+        .get_all_embeddings_for_project_and_global(project_id)?
+        .iter()
+        .any(|(id, vec)| {
+            same_type.contains(id) && cosine_similarity(&embedding, vec) >= skip_above
+        });
+    if repeats_one {
+        return Ok(DispatchOutcome::Skipped("dedup_similar"));
     }
+
+    db.store_memory(&memory)?;
+    db.store_embedding(&id, &embedding, es.model_version())?;
+    Ok(DispatchOutcome::Stored(uuid))
 }

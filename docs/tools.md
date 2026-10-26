@@ -21,7 +21,7 @@ Every tool takes an optional `project` argument; see [Project scoping](#project-
 
 | Tool | What it does |
 |---|---|
-| `memory_store` | Store a memory. Merges into a near-duplicate of the same type (cosine ≥ 0.90), and lists existing memories it may supersede. |
+| `memory_store` | Store a memory, and list existing memories of the same type it may repeat or supersede (cosine ≥ 0.88). Never merges. |
 | `memory_store_batch` | Store up to 100 memories in one transaction. |
 | `memory_context` | The memories most relevant to a description of the current task. |
 | `memory_query` | Search, with filters on type, branch and relevance, and pagination. |

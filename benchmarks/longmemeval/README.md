@@ -58,7 +58,7 @@ The "session id" of a retrieved memory is extracted from its `session:{id}` tag 
 
 ## Ingest bypass
 
-The harness calls `Database::store_memory` + `Database::store_embedding` directly, NOT the MCP tool handler. The tool handler fires auto-dedup at cosine similarity ≥ 0.90 and contradiction detection at ≥ 0.85, which would silently merge topically-similar turn-pairs and corrupt recall numbers. The bypass is documented in `src/ingest.rs:1-17` and guarded by the regression test `tests/longmemeval_ingest_bypass.rs`.
+The harness calls `Database::store_memory` + `Database::store_embedding` directly, NOT the MCP tool handler, so recall numbers measure retrieval over exactly the ingested turn-pairs, independent of what the handler does on store. The bypass is documented at the top of `src/ingest.rs` and guarded by the regression test `tests/longmemeval_ingest_bypass.rs`.
 
 ## Dataset license
 
