@@ -94,7 +94,7 @@ pub fn update_memory(
             let existing = stored_sections.clone().ok_or_else(|| {
                 MemoryError::NotFound(format!("handoff sections for {}", request.id))
             })?;
-            let merged = existing.merge_patch(patch);
+            let merged = existing.merge_patch(patch).without_blank_items();
             (Some(merged.render_markdown()), Some(merged))
         }
         None => (request.content, None),

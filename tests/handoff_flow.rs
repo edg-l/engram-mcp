@@ -479,3 +479,56 @@ fn resume_returns_open_work_outside_the_ranking() {
         section_vecs.iter().map(|(k, _)| k).collect::<Vec<_>>()
     );
 }
+
+/// A blank blocker (`--blockers ""`, or `[""]` from a caller with nothing to report) is
+/// not stored: resume returns blockers verbatim, so it would read as an open blocker.
+#[test]
+fn blank_list_items_are_not_stored() {
+    let db = Database::open_in_memory().expect("in-memory DB must open");
+    let project_id = "handoff-blank-items";
+    db.get_or_create_project(project_id, project_id)
+        .expect("project creation must succeed");
+    let embedding = EmbeddingService::new().expect("embedding model must be available");
+
+    let sections = make_sections(
+        "Session with nothing blocking",
+        vec![
+            String::new(),
+            "  ".to_string(),
+            "Waiting on access".to_string(),
+        ],
+        None,
+    );
+    let created = create_handoff(
+        &db,
+        &embedding,
+        project_id,
+        Some("main"),
+        sections,
+        0.85,
+        true,
+        false,
+    )
+    .expect("create handoff must succeed");
+
+    let stored = db
+        .get_handoff_sections(&created.id)
+        .expect("sidecar read must succeed")
+        .expect("sidecar must exist")
+        .0;
+    assert_eq!(stored.blockers, vec!["Waiting on access".to_string()]);
+
+    let resumed = resume_handoff(
+        &db,
+        &embedding,
+        project_id,
+        Some("main"),
+        None,
+        None,
+        5,
+        false,
+        None,
+    )
+    .expect("resume must succeed");
+    assert_eq!(resumed.open_blockers, vec!["Waiting on access".to_string()]);
+}

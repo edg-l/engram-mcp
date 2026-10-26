@@ -133,6 +133,7 @@ pub fn create_handoff(
     };
 
     // Step 2: render markdown for the main memory content.
+    let sections = sections.without_blank_items();
     let content = sections.render_markdown();
 
     // Step 3: build the Memory struct.

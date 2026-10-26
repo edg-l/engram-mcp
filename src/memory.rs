@@ -592,6 +592,22 @@ impl HandoffSections {
         Ok(out)
     }
 
+    /// Drop list items that are empty or whitespace. A blank item (`--blockers ""`, or
+    /// `[""]` from a caller with nothing to report) would otherwise render as a bare
+    /// bullet, and resume returns blockers verbatim, so it reads as an open blocker.
+    pub fn without_blank_items(mut self) -> HandoffSections {
+        for list in [
+            &mut self.decisions,
+            &mut self.todos,
+            &mut self.blockers,
+            &mut self.tried,
+            &mut self.next_steps,
+        ] {
+            list.retain(|item| !item.trim().is_empty());
+        }
+        self
+    }
+
     /// Apply a partial section update: fields present in `patch` replace, fields absent
     /// keep the value already in `self`. `continues_from` is a sidecar chain link set at
     /// creation, not a content field, so it always carries over from `self` untouched.
