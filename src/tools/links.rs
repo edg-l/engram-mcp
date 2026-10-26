@@ -53,7 +53,7 @@ pub fn resolve_link_target(
     seen.insert(current.clone());
 
     for _ in 0..MAX_MERGE_DEPTH {
-        let Some(next) = db.find_merge_survivor(project_id, &current)? else {
+        let Some(next) = db.find_merge_survivor(Some(project_id), &current)? else {
             break;
         };
         if !seen.insert(next.clone()) {

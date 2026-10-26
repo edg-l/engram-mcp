@@ -2529,7 +2529,20 @@ impl ToolHandler {
         }
     }
 
-    fn todo_write(&self, arguments: Value) -> Result<Value, MemoryError> {
+    fn todo_write(&self, mut arguments: Value) -> Result<Value, MemoryError> {
+        // One operation sent bare, without the `ops` list around it, is that list of one.
+        if let Some(obj) = arguments.as_object_mut()
+            && obj.contains_key("op")
+            && !obj.contains_key("ops")
+        {
+            let project = obj.remove("project");
+            let op = std::mem::take(obj);
+            obj.insert("ops".to_string(), Value::Array(vec![Value::Object(op)]));
+            if let Some(project) = project {
+                obj.insert("project".to_string(), project);
+            }
+        }
+
         // A caller sending `todos` instead of `ops` gets a generic "missing field `ops`"
         // from serde otherwise, which does not say what shape is expected.
         if let Some(obj) = arguments.as_object()
@@ -4690,6 +4703,85 @@ mod tests {
             .unwrap();
         assert_eq!(done["results"][0]["error"], json!(null));
         assert_eq!(db.get_todo(&id).unwrap().unwrap().status, TodoStatus::Done);
+    }
+
+    /// Updating an id a dedup merge consumed fails, naming the survivor, instead of
+    /// applying the change to a memory that also holds other claims.
+    #[test]
+    fn update_of_a_merged_away_id_names_the_survivor() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "update-merged-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+        let store = |content: &str| {
+            handler
+                .handle_tool("memory_store", json!({"content": content, "type": "fact"}))
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let consumed = store("Pending: log Sunday's buffet once Edgar says what he ate");
+        let survivor = store("Sunday's buffet is logged as six estimated entries");
+        db.merge_memories(&survivor, &consumed).unwrap();
+
+        let err = handler.handle_tool("memory_update", json!({"id": consumed, "dead": true}));
+        match err {
+            Err(MemoryError::NotFound(msg)) => {
+                assert!(msg.contains(&survivor), "must name the survivor: {msg}")
+            }
+            other => panic!("expected NotFound naming the survivor, got {other:?}"),
+        }
+        assert!(
+            !db.is_dead(&survivor).unwrap(),
+            "the survivor must be left alone"
+        );
+    }
+
+    /// A single op sent at the top level, without the `ops` list, is applied as a list
+    /// of one; a `project` beside it still scopes the call.
+    #[test]
+    fn todo_write_accepts_a_bare_op() {
+        let db = Database::open_in_memory().unwrap();
+        let project_id = "todo-bare-op-proj";
+        db.get_or_create_project(project_id, "Test").unwrap();
+
+        let embedding = EmbeddingService::new().expect("model must be available");
+        let handler = ToolHandler::new(
+            db.clone(),
+            embedding,
+            project_id.to_string(),
+            None,
+            SearchMode::default(),
+        );
+
+        let added = handler
+            .handle_tool(
+                "todo_write",
+                json!({"op": "add", "text": "do it", "project": project_id}),
+            )
+            .unwrap();
+        let id = added["results"][0]["id"].as_str().unwrap().to_string();
+
+        let dropped = handler
+            .handle_tool(
+                "todo_write",
+                json!({"op": "drop", "id": id, "reason": "no longer needed"}),
+            )
+            .unwrap();
+        assert_eq!(dropped["results"][0]["error"], json!(null));
+        assert_eq!(
+            db.get_todo(&id).unwrap().unwrap().status,
+            TodoStatus::Dropped
+        );
     }
 
     /// Arguments carrying `todos` instead of `ops` fail with a message naming the `ops`

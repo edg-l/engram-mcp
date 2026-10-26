@@ -959,20 +959,20 @@ impl Database {
     ///
     /// `merged_from` is a JSON array of [`crate::memory::MergeSource`], one per consumed
     /// memory; `instr()` does a plain substring search rather than `LIKE`, so the `_` in
-    /// every `mem_` id is not treated as a single-character wildcard. Scoped to
-    /// `project_id` plus global memories — the same visibility `store_with_dedup` itself
-    /// uses when finding candidates to merge, so a project can never resolve into a
-    /// survivor it could not otherwise see.
+    /// every `mem_` id is not treated as a single-character wildcard. With a
+    /// `project_id`, scoped to that project plus global memories, the visibility a merge
+    /// itself has, so a link can never resolve into a survivor the project could not
+    /// otherwise see. Without one, any project's survivor is returned.
     pub fn find_merge_survivor(
         &self,
-        project_id: &str,
+        project_id: Option<&str>,
         consumed_id: &str,
     ) -> Result<Option<String>, MemoryError> {
         let conn = self.conn.lock().unwrap();
         let needle = format!("\"id\":\"{consumed_id}\"");
         conn.query_row(
             "SELECT id FROM memories
-             WHERE (project_id = ?1 OR global = 1)
+             WHERE (?1 IS NULL OR project_id = ?1 OR global = 1)
                AND merged_from IS NOT NULL
                AND instr(merged_from, ?2) > 0
              LIMIT 1",

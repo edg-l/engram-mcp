@@ -8,6 +8,8 @@
 ### Fixed
 - **Errors said "Invalid memory type" for problems unrelated to types**: a todo title over the cap, a handoff without a branch, a forbidden ADR status transition, a missing required field. They now state only the problem. A todo op given an id that names nothing, such as the todo's text, reports `Memory not found` instead of "is not a todo".
 - **A blank handoff item is no longer stored.** `handoff create --blockers ""` (or `[""]` over MCP) saved an empty blocker, which resume printed as `- ` under open blockers and ranked as a top section. Blank items are dropped on create and on a `sections` update.
+- **`todo_write` accepts one op sent bare**, `{"op":"drop","id":…,"reason":…}` without the `ops` list around it, as a list of one.
+- **`memory_update` on an id a dedup merge consumed** now names the memory that absorbed it, instead of a bare `Memory not found`. The change is not applied to that memory, since it also holds other claims.
 
 ## [0.12.2] - 2026-10-18
 

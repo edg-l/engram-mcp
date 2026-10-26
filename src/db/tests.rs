@@ -395,7 +395,7 @@ fn merging_a_composite_carries_its_provenance_forward() {
         .collect();
     assert_eq!(sources, vec!["mem_a".to_string(), "mem_b".to_string()]);
     assert_eq!(
-        db.find_merge_survivor("merge-chain", "mem_a")
+        db.find_merge_survivor(Some("merge-chain"), "mem_a")
             .unwrap()
             .as_deref(),
         Some("mem_c")

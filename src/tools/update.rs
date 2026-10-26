@@ -64,9 +64,19 @@ pub fn update_memory(
         });
     }
 
-    let mut memory = db
-        .get_memory(&request.id)?
-        .ok_or_else(|| MemoryError::NotFound(request.id.clone()))?;
+    // An id a dedup merge consumed is not followed to its survivor: the survivor holds
+    // other claims too, and a change meant for one of them (`dead`, new content) would
+    // hit them all. Name it so the caller can decide.
+    let Some(mut memory) = db.get_memory(&request.id)? else {
+        return Err(match db.find_merge_survivor(None, &request.id)? {
+            Some(survivor) => MemoryError::NotFound(format!(
+                "{} (a dedup merge folded it into {survivor}; read that memory and update \
+                 it only if the change applies to all of it)",
+                request.id
+            )),
+            None => MemoryError::NotFound(request.id.clone()),
+        });
+    };
 
     if request.sections.is_some() && memory.memory_type != MemoryType::Handoff {
         return Err(MemoryError::InvalidArguments {
