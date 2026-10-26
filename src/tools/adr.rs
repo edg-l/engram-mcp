@@ -67,7 +67,7 @@ pub fn create_adr(
             Some((old_id, false))
         } else {
             if !old_status.can_transition_to(AdrStatus::Superseded) {
-                return Err(MemoryError::InvalidType(format!(
+                return Err(MemoryError::Invalid(format!(
                     "invalid ADR status transition: {} -> superseded",
                     old_status
                 )));

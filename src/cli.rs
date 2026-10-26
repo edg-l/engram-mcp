@@ -2959,7 +2959,7 @@ fn cmd_todo(
 ) -> Result<(), MemoryError> {
     let embedding = || -> Result<&EmbeddingService, MemoryError> {
         embedding_service
-            .ok_or_else(|| MemoryError::InvalidType("embedding service required".to_string()))
+            .ok_or_else(|| MemoryError::Invalid("embedding service required".to_string()))
     };
 
     // Every mutation goes through the same `write_todos` batch path the MCP tool uses, so
@@ -2974,7 +2974,7 @@ fn cmd_todo(
             let status_filter = match status.as_str() {
                 "all" => None,
                 other => Some(other.parse().map_err(|_| {
-                    MemoryError::InvalidType(format!(
+                    MemoryError::Invalid(format!(
                         "unknown todo status '{other}'; expected open, done, dropped, or all"
                     ))
                 })?),
@@ -3088,9 +3088,8 @@ fn cmd_handoff(
             from_file,
             non_interactive,
         } => {
-            let embedding = embedding_service.ok_or_else(|| {
-                MemoryError::InvalidType("embedding service required".to_string())
-            })?;
+            let embedding = embedding_service
+                .ok_or_else(|| MemoryError::Invalid("embedding service required".to_string()))?;
 
             let interactive = is_interactive(non_interactive);
 
@@ -3108,14 +3107,14 @@ fn cmd_handoff(
                     None if interactive => {
                         let s = prompt_line("Summary");
                         if s.is_empty() {
-                            return Err(MemoryError::InvalidType(
+                            return Err(MemoryError::Invalid(
                                 "handoff: summary is required".to_string(),
                             ));
                         }
                         s
                     }
                     None => {
-                        return Err(MemoryError::InvalidType(
+                        return Err(MemoryError::Invalid(
                             "handoff: summary is required (pass --summary or --from-file)"
                                 .to_string(),
                         ));
@@ -3221,9 +3220,8 @@ fn cmd_handoff(
             include_off_branch,
             max_chars_per_section,
         } => {
-            let embedding = embedding_service.ok_or_else(|| {
-                MemoryError::InvalidType("embedding service required".to_string())
-            })?;
+            let embedding = embedding_service
+                .ok_or_else(|| MemoryError::Invalid("embedding service required".to_string()))?;
 
             let resolved_branch = branch.as_deref().or(current_branch);
 
@@ -3310,9 +3308,8 @@ fn cmd_handoff(
             section,
             limit,
         } => {
-            let embedding = embedding_service.ok_or_else(|| {
-                MemoryError::InvalidType("embedding service required".to_string())
-            })?;
+            let embedding = embedding_service
+                .ok_or_else(|| MemoryError::Invalid("embedding service required".to_string()))?;
 
             let section_filter: Option<Vec<String>> = if section.is_empty() {
                 None
@@ -3416,9 +3413,8 @@ fn cmd_adr(
             from_file,
             non_interactive,
         } => {
-            let embedding = embedding_service.ok_or_else(|| {
-                MemoryError::InvalidType("embedding service required".to_string())
-            })?;
+            let embedding = embedding_service
+                .ok_or_else(|| MemoryError::Invalid("embedding service required".to_string()))?;
 
             let interactive = is_interactive(non_interactive);
 
@@ -3431,14 +3427,12 @@ fn cmd_adr(
                     None if interactive => {
                         let t = prompt_line("Title");
                         if t.is_empty() {
-                            return Err(MemoryError::InvalidType(
-                                "adr: title is required".to_string(),
-                            ));
+                            return Err(MemoryError::Invalid("adr: title is required".to_string()));
                         }
                         t
                     }
                     None => {
-                        return Err(MemoryError::InvalidType(
+                        return Err(MemoryError::Invalid(
                             "adr: title is required (pass --title or --from-file)".to_string(),
                         ));
                     }
@@ -3455,14 +3449,14 @@ fn cmd_adr(
                     None if interactive => {
                         let d = prompt_line("Decision");
                         if d.is_empty() {
-                            return Err(MemoryError::InvalidType(
+                            return Err(MemoryError::Invalid(
                                 "adr: decision is required".to_string(),
                             ));
                         }
                         d
                     }
                     None => {
-                        return Err(MemoryError::InvalidType(
+                        return Err(MemoryError::Invalid(
                             "adr: decision is required (pass --decision or --from-file)"
                                 .to_string(),
                         ));
@@ -3483,8 +3477,8 @@ fn cmd_adr(
                 }
             };
 
-            let parsed_status = AdrStatus::from_str(&status)
-                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+            let parsed_status =
+                AdrStatus::from_str(&status).map_err(|e| MemoryError::Invalid(e.to_string()))?;
 
             let result = tools::create_adr(
                 db,
@@ -3508,11 +3502,11 @@ fn cmd_adr(
         }
 
         AdrCmd::UpdateStatus { number, status } => {
-            let target_status = AdrStatus::from_str(&status)
-                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+            let target_status =
+                AdrStatus::from_str(&status).map_err(|e| MemoryError::Invalid(e.to_string()))?;
 
             if target_status == AdrStatus::Superseded {
-                return Err(MemoryError::InvalidType(
+                return Err(MemoryError::Invalid(
                     "use adr create --supersedes to mark an ADR superseded".to_string(),
                 ));
             }
@@ -3526,7 +3520,7 @@ fn cmd_adr(
                 .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", id)))?;
 
             if !current_status.can_transition_to(target_status) {
-                return Err(MemoryError::InvalidType(format!(
+                return Err(MemoryError::Invalid(format!(
                     "invalid ADR status transition: {} -> {}",
                     current_status, target_status
                 )));
@@ -3541,7 +3535,7 @@ fn cmd_adr(
                 .as_deref()
                 .map(AdrStatus::from_str)
                 .transpose()
-                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+                .map_err(|e| MemoryError::Invalid(e.to_string()))?;
 
             let rows = db.list_adrs(project_id, status_filter)?;
 

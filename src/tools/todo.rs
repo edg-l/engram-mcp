@@ -359,7 +359,7 @@ fn apply_op(
                 return fail(
                     "drop",
                     id,
-                    MemoryError::InvalidType(
+                    MemoryError::Invalid(
                         "drop requires a non-empty reason; a todo closed without one is \
                          indistinguishable from one that was forgotten"
                             .to_string(),
@@ -397,6 +397,16 @@ fn fail(op: &str, id: String, e: MemoryError) -> TodoOpResult {
     }
 }
 
+/// The error for an id that names no todo: `NotFound` when it names nothing at all, so a
+/// caller who passed a todo's text instead of its id is told the id is wrong.
+fn not_a_todo(db: &Database, id: &str) -> MemoryError {
+    match db.get_memory(id) {
+        Ok(Some(_)) => MemoryError::Invalid(format!("{id} is not a todo")),
+        Ok(None) => MemoryError::NotFound(format!("{id} (todo ops take a todo id: mem_…)")),
+        Err(e) => e,
+    }
+}
+
 fn transition(
     db: &Database,
     op: &str,
@@ -416,11 +426,10 @@ fn transition(
             },
             Err(e) => fail(op, id, e),
         },
-        Ok(None) => fail(
-            op,
-            id.clone(),
-            MemoryError::InvalidType(format!("{id} is not a todo")),
-        ),
+        Ok(None) => {
+            let e = not_a_todo(db, &id);
+            fail(op, id, e)
+        }
         Err(e) => fail(op, id, e),
     }
 }
@@ -429,7 +438,7 @@ fn transition(
 fn check_text_len(text: &str) -> Result<(), MemoryError> {
     let len = text.chars().count();
     if len > TODO_TEXT_MAX {
-        return Err(MemoryError::InvalidType(format!(
+        return Err(MemoryError::Invalid(format!(
             "todo text is {len} chars, over the {TODO_TEXT_MAX}-char cap; keep it a \
              one-line title and put findings, measurements, or dead ends in `detail`"
         )));
@@ -507,7 +516,7 @@ fn add_todo(
 ) -> Result<(String, Vec<TodoDuplicate>, DetailResult), MemoryError> {
     let text = text.trim();
     if text.is_empty() {
-        return Err(MemoryError::InvalidType(
+        return Err(MemoryError::Invalid(
             "todo text must not be empty".to_string(),
         ));
     }
@@ -576,13 +585,13 @@ fn edit_todo(
 ) -> Result<DetailResult, MemoryError> {
     let text = text.trim();
     if text.is_empty() {
-        return Err(MemoryError::InvalidType(
+        return Err(MemoryError::Invalid(
             "todo text must not be empty".to_string(),
         ));
     }
     check_text_len(text)?;
     let Some(todo) = db.get_todo(id)? else {
-        return Err(MemoryError::InvalidType(format!("{id} is not a todo")));
+        return Err(not_a_todo(db, id));
     };
     let vector = embedding.embed_memory(MemoryType::Todo, text)?;
     db.update_todo_text(id, text)?;

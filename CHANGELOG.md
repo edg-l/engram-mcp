@@ -5,6 +5,9 @@
 ### Changed
 - **A store never merges.** `memory_store`, `engram-cli store` and a todo's `detail` used to fold an existing same-type memory at cosine ≥ 0.90 into the new one, and the background re-clustering pass did the same within each cluster. Only the new text stayed searchable; the absorbed one lived on in `merged_from` alone. On this embedding model, long memories about one subject but different claims score 0.90 to 0.91, so unrelated findings disappeared from retrieval: a profiling result absorbed a months-old bug fix, a pending task absorbed its own reminder notes. Near-duplicates are now reported in `possible_supersedes` with the rest, and `memory_dedup` merges on request. `merge_info` is gone from the store result, and `ENGRAM_DEDUP_THRESHOLD` is no longer read. Hook captures still skip a near-identical repeat (`ENGRAM_HOOK_DEDUP_SKIP`).
 
+### Fixed
+- **Errors said "Invalid memory type" for problems unrelated to types**: a todo title over the cap, a handoff without a branch, a forbidden ADR status transition, a missing required field. They now state only the problem. A todo op given an id that names nothing, such as the todo's text, reports `Memory not found` instead of "is not a todo".
+
 ## [0.12.2] - 2026-10-18
 
 ### Fixed

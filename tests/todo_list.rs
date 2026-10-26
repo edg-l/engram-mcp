@@ -166,7 +166,14 @@ fn a_failing_op_does_not_abort_the_batch() {
 
     assert_eq!(result.results.len(), 3);
     assert!(result.results[0].error.is_none());
-    assert!(result.results[1].error.is_some(), "unknown id must report");
+    let unknown = result.results[1]
+        .error
+        .as_deref()
+        .expect("unknown id must report");
+    assert!(
+        unknown.starts_with("Memory not found: mem_does_not_exist"),
+        "an id that names nothing is not found, got: {unknown}"
+    );
     assert!(result.results[2].error.is_none());
     assert_eq!(result.open_count, 2, "both valid adds must have landed");
 }
@@ -593,8 +600,8 @@ fn add_text_over_the_cap_is_refused() {
         .as_ref()
         .expect("oversized text must be refused");
     assert!(
-        error.contains("detail"),
-        "the error must point the caller at `detail`, got: {error}"
+        error.starts_with("todo text is") && error.contains("detail"),
+        "the error must state the cap and point the caller at `detail`, got: {error}"
     );
     assert_eq!(result.open_count, 0, "a refused add must not create a todo");
 

@@ -2564,7 +2564,7 @@ impl ToolHandler {
         let status = match input.status.as_str() {
             "all" => None,
             other => Some(other.parse().map_err(|_| {
-                MemoryError::InvalidType(format!(
+                MemoryError::Invalid(format!(
                     "unknown todo status '{other}'; expected open, done, dropped, or all"
                 ))
             })?),
@@ -2657,7 +2657,7 @@ impl ToolHandler {
         // but accepting it here would give the caller two homes for one concept and lose
         // whichever one nobody read. Rejecting beats dropping it silently.
         if !sections.todos.is_empty() {
-            return Err(MemoryError::InvalidType(
+            return Err(MemoryError::Invalid(
                 "handoff_create no longer accepts a `todos` section; open work belongs in \
                  the todo list. Add the items with todo_write instead — handoff_resume \
                  returns them as open_todos."
@@ -2673,7 +2673,7 @@ impl ToolHandler {
             .as_deref()
             .or_else(|| self.current_branch_for(&project));
         if resolved_branch.is_none() && project != self.project_id {
-            return Err(MemoryError::InvalidType(format!(
+            return Err(MemoryError::Invalid(format!(
                 "handoff for project '{project}' requires an explicit branch"
             )));
         }
@@ -2748,7 +2748,7 @@ impl ToolHandler {
         let status = input
             .status
             .parse::<AdrStatus>()
-            .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+            .map_err(|e| MemoryError::Invalid(e.to_string()))?;
 
         let sections = AdrSections {
             title: input.title,
@@ -2784,11 +2784,11 @@ impl ToolHandler {
             .get_adr_by_number(&project, input.number)?
             .ok_or_else(|| MemoryError::NotFound(format!("ADR-{:04} not found", input.number)))?;
 
-        let target_status = AdrStatus::from_str(&input.status)
-            .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+        let target_status =
+            AdrStatus::from_str(&input.status).map_err(|e| MemoryError::Invalid(e.to_string()))?;
 
         if target_status == AdrStatus::Superseded {
-            return Err(MemoryError::InvalidType(
+            return Err(MemoryError::Invalid(
                 "use adr_create with the 'supersedes' field to mark an ADR superseded".to_string(),
             ));
         }
@@ -2799,7 +2799,7 @@ impl ToolHandler {
             .ok_or_else(|| MemoryError::NotFound(format!("ADR sidecar missing for {}", old_id)))?;
 
         if !current_status.can_transition_to(target_status) {
-            return Err(MemoryError::InvalidType(format!(
+            return Err(MemoryError::Invalid(format!(
                 "invalid ADR status transition: {} -> {}",
                 current_status, target_status
             )));
@@ -2825,7 +2825,7 @@ impl ToolHandler {
             .as_deref()
             .map(AdrStatus::from_str)
             .transpose()
-            .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+            .map_err(|e| MemoryError::Invalid(e.to_string()))?;
 
         let rows = self.db.list_adrs(&project, status_filter)?;
 
@@ -3258,7 +3258,7 @@ mod tests {
     }
 
     /// 3A.8 test 2: handoff_create_rejects_detached_head
-    /// When branch=None is passed to create_handoff, it must return InvalidType.
+    /// When branch=None is passed to create_handoff, it must return Invalid.
     #[test]
     fn handoff_create_rejects_detached_head() {
         let db = Database::open_in_memory().unwrap();
@@ -3283,8 +3283,8 @@ mod tests {
         let result = create_handoff(&db, &embedding, "proj", None, sections, 0.85, true, false);
 
         assert!(
-            matches!(result, Err(MemoryError::InvalidType(ref msg)) if msg.contains("handoff requires a branch")),
-            "Expected InvalidType error for detached HEAD, got: {:?}",
+            matches!(result, Err(MemoryError::Invalid(ref msg)) if msg.contains("handoff requires a branch")),
+            "Expected Invalid error for detached HEAD, got: {:?}",
             result
         );
     }
@@ -4281,7 +4281,7 @@ mod tests {
     }
 
     /// 5.1 test 3: adr_update_status_valid_and_invalid
-    /// proposed->accepted succeeds; accepted->proposed is rejected (InvalidType);
+    /// proposed->accepted succeeds; accepted->proposed is rejected (Invalid);
     /// a direct update to superseded is rejected with the "use ... supersede" message.
     #[test]
     fn adr_update_status_valid_and_invalid() {
@@ -4325,8 +4325,8 @@ mod tests {
             json!({"number": 1, "status": "proposed"}),
         );
         assert!(
-            matches!(err, Err(MemoryError::InvalidType(_))),
-            "accepted->proposed must be InvalidType, got {:?}",
+            matches!(err, Err(MemoryError::Invalid(_))),
+            "accepted->proposed must be Invalid, got {:?}",
             err
         );
 
@@ -4336,7 +4336,7 @@ mod tests {
             json!({"number": 1, "status": "superseded"}),
         );
         assert!(
-            matches!(err_super, Err(MemoryError::InvalidType(ref msg)) if msg.contains("supersede")),
+            matches!(err_super, Err(MemoryError::Invalid(ref msg)) if msg.contains("supersede")),
             "direct superseded transition must be rejected with 'supersede' message, got {:?}",
             err_super
         );
@@ -4489,8 +4489,8 @@ mod tests {
             }),
         );
         assert!(
-            matches!(err2, Err(MemoryError::InvalidType(_))),
-            "superseding a proposed ADR must return InvalidType, got {:?}",
+            matches!(err2, Err(MemoryError::Invalid(_))),
+            "superseding a proposed ADR must return Invalid, got {:?}",
             err2
         );
         let count_after_failed = db.list_adrs(project_id, None).unwrap().len();

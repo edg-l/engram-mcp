@@ -109,7 +109,7 @@ pub struct HandoffSearchResult {
 /// Create a session handoff memory with per-section embeddings and optional auto-linking.
 ///
 /// The `branch` parameter should be the resolved current branch (or an explicit override).
-/// If `None`, the function returns `MemoryError::InvalidType` — handoffs require a branch.
+/// If `None`, the function returns `MemoryError::Invalid` — handoffs require a branch.
 #[allow(clippy::too_many_arguments)]
 pub fn create_handoff(
     db: &Database,
@@ -125,7 +125,7 @@ pub fn create_handoff(
     let resolved_branch = match branch {
         Some(b) => b.to_string(),
         None => {
-            return Err(MemoryError::InvalidType(
+            return Err(MemoryError::Invalid(
                 "handoff requires a branch; detached HEAD or non-git workspace not supported"
                     .to_string(),
             ));

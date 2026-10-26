@@ -145,7 +145,7 @@ impl Database {
             let number: i64 = row.get(0)?;
             let status_str: String = row.get(1)?;
             let status = AdrStatus::from_str(&status_str)
-                .map_err(|e| MemoryError::InvalidType(e.to_string()))?;
+                .map_err(|e| MemoryError::Invalid(e.to_string()))?;
             let sections = AdrSections {
                 title: row.get(2)?,
                 context: row.get(3)?,
@@ -240,7 +240,7 @@ impl Database {
                 .into_iter()
                 .map(|(number, status_str, title, memory_id)| {
                     AdrStatus::from_str(&status_str)
-                        .map_err(|e| MemoryError::InvalidType(e.to_string()))
+                        .map_err(|e| MemoryError::Invalid(e.to_string()))
                         .map(|status| (number as u32, status, title, memory_id))
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -263,7 +263,7 @@ impl Database {
                 .into_iter()
                 .map(|(number, status_str, title, memory_id)| {
                     AdrStatus::from_str(&status_str)
-                        .map_err(|e| MemoryError::InvalidType(e.to_string()))
+                        .map_err(|e| MemoryError::Invalid(e.to_string()))
                         .map(|status| (number as u32, status, title, memory_id))
                 })
                 .collect::<Result<Vec<_>, _>>()?

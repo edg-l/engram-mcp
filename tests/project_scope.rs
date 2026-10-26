@@ -291,10 +291,10 @@ fn cross_project_handoff_requires_explicit_branch() {
         .expect_err("cross-project handoff without a branch must be rejected");
 
     match err {
-        MemoryError::InvalidType(msg) => {
+        MemoryError::Invalid(msg) => {
             assert!(msg.contains("explicit branch"), "message was: {msg}");
         }
-        other => panic!("expected InvalidType, got {other:?}"),
+        other => panic!("expected Invalid, got {other:?}"),
     }
 }
 

@@ -46,6 +46,7 @@ fn mcp_error(e: MemoryError) -> McpError {
     match e {
         MemoryError::Json(_)
         | MemoryError::InvalidType(_)
+        | MemoryError::Invalid(_)
         | MemoryError::InvalidRelation(_)
         | MemoryError::UnknownTool(_)
         | MemoryError::UnknownProject { .. }

@@ -17,6 +17,11 @@ pub enum MemoryError {
     #[error("Invalid memory type: {0}")]
     InvalidType(String),
 
+    /// A well-formed request the operation refuses, such as a todo title over the cap or
+    /// a forbidden ADR status transition. The message says why on its own.
+    #[error("{0}")]
+    Invalid(String),
+
     #[error("Invalid relation type: {0}")]
     InvalidRelation(String),
 
